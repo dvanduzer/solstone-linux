@@ -7,7 +7,7 @@
 //! the `browser` source.
 //!
 //! The whole path is compiled in every build so the routine gate exercises it, but it
-//! is reachable only in builds with the `browser` feature: without it there is no host
+//! is reachable with the default `browser` feature: without it there is no host
 //! mode, no endpoint and no browser registration.
 
 pub mod argv;
