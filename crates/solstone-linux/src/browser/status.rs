@@ -12,6 +12,14 @@ use std::{
 };
 
 const RUNNING_FILE: &str = "status.json";
+
+/// Where an owner gets the solstone extension, by the browsers each store page
+/// serves. Edge installs from the Chrome Web Store item. Firefox joins once its
+/// listing is public.
+pub const STORE_LINKS: &[(&str, &str)] = &[(
+    "Chrome or Edge",
+    "https://chromewebstore.google.com/detail/solstone/eibbeeoifjoabddfmgeggnageolkcnim",
+)];
 /// The running app rewrites its status every five seconds.
 const RUNNING_STALE_MS: i64 = 30_000;
 
@@ -63,11 +71,16 @@ pub fn status_lines(base_dir: &Path, now_ms: i64) -> Vec<String> {
             let mut browsers = running.browsers.clone();
             browsers.sort();
             browsers.dedup();
-            lines.push(if browsers.is_empty() {
-                "Browser: no browser connected".to_owned()
+            if browsers.is_empty() {
+                lines.push("Browser: no browser connected".to_owned());
+                for (served, url) in STORE_LINKS {
+                    lines.push(format!(
+                        "        if you haven't yet, add the solstone extension to {served}: {url}"
+                    ));
+                }
             } else {
-                format!("Browser: {} connected", browsers.join(", "))
-            });
+                lines.push(format!("Browser: {} connected", browsers.join(", ")));
+            }
             if running.full {
                 lines.push(
                     "        the room for browser pages on this computer is full, so no new pages are taken in until some go into your journal"
@@ -258,6 +271,16 @@ mod tests {
                     .to_owned(),
             ]
         );
+        // With no browser connected, every store link is offered, and only then.
+        let mut none = read_running(&layout, 1_005_000).unwrap();
+        none.browsers.clear();
+        none.held_bytes = 0;
+        write_running(&layout, &none).unwrap();
+        let lines = status_lines(temp.path(), 1_005_000);
+        assert_eq!(lines.len(), 1 + STORE_LINKS.len());
+        for (line, (_, url)) in lines[1..].iter().zip(STORE_LINKS) {
+            assert!(line.ends_with(url));
+        }
         // A status file the app stopped refreshing is not a running app.
         assert_eq!(
             status_lines(temp.path(), 1_000_000 + RUNNING_STALE_MS)[0],
