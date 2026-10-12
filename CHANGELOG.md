@@ -6,6 +6,8 @@ and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+## [2.0.19] - 2026-10-12
+
 ## [2.0.18] - 2026-10-10
 
 ## [2.0.17] - 2026-10-09
