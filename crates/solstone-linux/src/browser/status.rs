@@ -62,6 +62,16 @@ fn size(bytes: u64) -> String {
     }
 }
 
+/// A browser's own name, in its own case, for the brand id it sends.
+fn brand_name(brand: &str) -> &str {
+    match brand {
+        "chrome" => "Chrome",
+        "edge" => "Edge",
+        "firefox" => "Firefox",
+        other => other,
+    }
+}
+
 /// Lines for `solstone-linux status`.
 pub fn status_lines(base_dir: &Path, now_ms: i64) -> Vec<String> {
     let layout = Layout::new(base_dir);
@@ -79,7 +89,8 @@ pub fn status_lines(base_dir: &Path, now_ms: i64) -> Vec<String> {
                     ));
                 }
             } else {
-                lines.push(format!("Browser: {} connected", browsers.join(", ")));
+                let names: Vec<&str> = browsers.iter().map(|b| brand_name(b)).collect();
+                lines.push(format!("Browser: {} connected", names.join(", ")));
             }
             if running.full {
                 lines.push(
@@ -266,7 +277,7 @@ mod tests {
         assert_eq!(
             status_lines(temp.path(), 1_005_000),
             vec![
-                "Browser: chrome, firefox connected".to_owned(),
+                "Browser: Chrome, Firefox connected".to_owned(),
                 "        2 KB of browser pages on this computer, waiting to go into your journal"
                     .to_owned(),
             ]
