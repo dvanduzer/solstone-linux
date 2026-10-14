@@ -14,12 +14,17 @@ use std::{
 const RUNNING_FILE: &str = "status.json";
 
 /// Where an owner gets the solstone extension, by the browsers each store page
-/// serves. Edge installs from the Chrome Web Store item. Firefox joins once its
-/// listing is public.
-pub const STORE_LINKS: &[(&str, &str)] = &[(
-    "Chrome or Edge",
-    "https://chromewebstore.google.com/detail/solstone/eibbeeoifjoabddfmgeggnageolkcnim",
-)];
+/// serves. Edge installs from the Chrome Web Store item.
+pub const STORE_LINKS: &[(&str, &str)] = &[
+    (
+        "Chrome or Edge",
+        "https://chromewebstore.google.com/detail/solstone/eibbeeoifjoabddfmgeggnageolkcnim",
+    ),
+    (
+        "Firefox",
+        "https://addons.mozilla.org/firefox/addon/solstone/",
+    ),
+];
 /// The running app rewrites its status every five seconds.
 const RUNNING_STALE_MS: i64 = 30_000;
 
@@ -289,6 +294,11 @@ mod tests {
         write_running(&layout, &none).unwrap();
         let lines = status_lines(temp.path(), 1_005_000);
         assert_eq!(lines.len(), 1 + STORE_LINKS.len());
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.ends_with("https://addons.mozilla.org/firefox/addon/solstone/"))
+        );
         for (line, (_, url)) in lines[1..].iter().zip(STORE_LINKS) {
             assert!(line.ends_with(url));
         }
