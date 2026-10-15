@@ -884,7 +884,8 @@ mod tests {
         assert_eq!(reply["type"], "local_discard_result");
         assert_eq!(reply["ok"], true);
         let facts = rig.handle.shared.facts();
-        assert!(facts.held_bytes > 0);
+        assert_eq!(facts.held_bytes, 0);
+        assert_eq!(facts.delivery, "unknown");
         assert!(!pending_pages.exists());
         rig.handle.shutdown().await;
     }

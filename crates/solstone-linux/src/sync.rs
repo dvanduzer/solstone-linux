@@ -6997,18 +6997,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_browser_period_goes_into_the_journal_as_the_browser_source() {
+    async fn a_browser_period_goes_into_the_journal_and_returns_to_idle() {
         let temp = tempfile::tempdir().unwrap();
         let (server, mut worker) = test_worker(&temp, Vec::new()).await;
         persist_test_credential(&temp, &server);
         let segment = browser_period(&temp);
-        worker.browser_custody = Some(Arc::new(Mutex::new(
+        let custody = Arc::new(Mutex::new(
             crate::browser::custody::Custody::open(
                 crate::browser::custody::Layout::new(temp.path()),
                 chrono::Local::now(),
             )
             .unwrap(),
-        )));
+        ));
+        let before = custody.lock().unwrap().facts(Some("g1"), false);
+        assert_eq!(
+            (before.capture, before.delivery),
+            ("permitted", "kept_locally")
+        );
+        assert!(before.held_bytes > 0);
+        worker.browser_custody = Some(Arc::clone(&custody));
         let pages = segment.join(crate::browser::PAGES_FILENAME);
         server.enqueue_response(
             200,
@@ -7039,6 +7046,19 @@ mod tests {
         assert!(!body.contains(crate::browser::custody::PERIOD_FILE));
         // Confirmed by the journal, so nothing of the period is left on this computer.
         assert!(!segment.exists());
+        let after = custody.lock().unwrap().facts(Some("g1"), false);
+        assert_eq!((after.capture, after.delivery), ("permitted", "idle"));
+        assert_eq!(after.held_bytes, 0);
+
+        // Replay evidence survives delivery without becoming pending journal text.
+        let layout = crate::browser::custody::Layout::new(temp.path());
+        assert!(fs::metadata(layout.evidence()).unwrap().len() > 0);
+        assert_eq!(crate::browser::custody::held_bytes(&layout), 0);
+        let recovered =
+            crate::browser::custody::Custody::open(layout, chrono::Local::now()).unwrap();
+        let after_restart = recovered.facts(Some("g1"), false);
+        assert_eq!(after_restart.delivery, "idle");
+        assert_eq!(after_restart.held_bytes, 0);
     }
 
     #[tokio::test]

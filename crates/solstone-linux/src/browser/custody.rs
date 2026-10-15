@@ -213,7 +213,7 @@ impl Custody {
 
     pub fn facts(&self, generation: Option<&str>, paused: bool) -> Facts {
         let held = self.held_bytes > 0;
-        let full = self.held_bytes >= self.bound;
+        let full = self.storage_bytes() >= self.bound;
         let Some(generation) = generation else {
             return Facts {
                 capture: "not_paired",
@@ -386,7 +386,9 @@ impl Custody {
                 .map_or(0, |line| line.len() as u64)
             }
         });
-        if self.held_bytes + bytes + evidence_growth + receipt_growth + period_growth > self.bound {
+        if self.storage_bytes() + bytes + evidence_growth + receipt_growth + period_growth
+            > self.bound
+        {
             return (reject("queue_full"), rotated);
         }
         match self.commit(&payload, inst, batch_id, now_ms) {
@@ -587,6 +589,11 @@ impl Custody {
     /// segments not yet released by the sync service.
     pub fn refresh_held(&mut self) {
         self.held_bytes = held_bytes(&self.layout);
+    }
+
+    /// Replay evidence uses storage but is not waiting to go into the journal.
+    fn storage_bytes(&self) -> u64 {
+        self.held_bytes + file_len(&self.layout.evidence())
     }
 
     fn period_for_identity(&self, key: &(String, String)) -> Option<String> {
@@ -821,12 +828,11 @@ pub fn held_bytes(layout: &Layout) -> u64 {
     let dirs = sorted_dirs(&layout.open())
         .into_iter()
         .chain(browser_segments(&layout.captures));
-    let segments = dirs.fold(0_u64, |sum, directory| {
+    dirs.fold(0_u64, |sum, directory| {
         sum + file_len(&directory.join(super::PAGES_FILENAME))
             + file_len(&directory.join(PERIOD_FILE))
             + file_len(&directory.join(RECEIPTS_FILE))
-    });
-    segments + file_len(&layout.evidence())
+    })
 }
 
 fn new_period(now: &DateTime<Local>) -> Period {
@@ -1672,8 +1678,8 @@ mod tests {
         let now = at(10, 1, 0);
         let mut custody = Custody::open(layout(&temp), now).unwrap();
         accepted(custody.accept(&batch(&custody, 1, snapshot("c1", "first"), now), now));
-        let held = custody.facts(Some("g1"), false).held_bytes;
-        custody = custody.with_bound(held + 50);
+        let stored = custody.storage_bytes();
+        custody = custody.with_bound(stored + 50);
         assert_eq!(
             custody
                 .accept(
@@ -1684,7 +1690,7 @@ mod tests {
             reject("queue_full")
         );
         assert_eq!(custody.facts(Some("g1"), false).capture, "permitted");
-        custody = custody.with_bound(held);
+        custody = custody.with_bound(stored);
         let facts = custody.facts(Some("g1"), false);
         assert!(facts.full);
         assert_eq!(
@@ -1692,6 +1698,32 @@ mod tests {
             ("intake_off", "kept_locally", Some("queue_full"))
         );
         assert_eq!(custody.facts(Some("g1"), true).capture, "paused");
+    }
+
+    #[test]
+    fn replay_evidence_uses_storage_bound_without_reporting_pending_pages() {
+        let temp = tempfile::tempdir().unwrap();
+        let now = at(10, 1, 0);
+        let mut custody = Custody::open(layout(&temp), now).unwrap();
+        let first = batch(&custody, 1, snapshot("c1", "first"), now);
+        accepted(custody.accept(&first, now));
+        custody.discard_pending().unwrap();
+        let evidence_bytes = file_len(&custody.layout.evidence());
+        assert!(evidence_bytes > 0);
+        custody = custody.with_bound(evidence_bytes);
+        let facts = custody.facts(Some("g1"), false);
+        assert_eq!(facts.held_bytes, 0);
+        assert!(facts.full);
+        assert_eq!(
+            (facts.capture, facts.delivery, facts.failure),
+            ("intake_off", "idle", Some("queue_full"))
+        );
+        assert!(matches!(
+            custody.accept(&first, now).0,
+            Outcome::Duplicate { .. }
+        ));
+        let next = batch(&custody, 2, snapshot("c2", "next"), now);
+        assert_eq!(custody.accept(&next, now).0, reject("queue_full"));
     }
 
     #[test]
