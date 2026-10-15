@@ -6,6 +6,10 @@ and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- fixed a check that could resend files already in your journal after pairing again.
+
 ## [2.0.20] - 2026-10-14
 
 ## [2.0.19] - 2026-10-12

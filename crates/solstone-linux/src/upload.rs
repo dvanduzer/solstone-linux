@@ -848,7 +848,7 @@ fn parse_listing_items(values: &[Value]) -> Option<Vec<ListingEntry>> {
     for value in values {
         let object = value.as_object()?;
         let key = object.get("key")?.as_str()?.to_owned();
-        if !keys.insert(key.clone()) || !object.get("observed")?.is_boolean() {
+        if !keys.insert(key.clone()) {
             return None;
         }
         let files_value = object.get("files")?.as_array()?;
@@ -1702,6 +1702,25 @@ mod tests {
         assert!(result.day_present);
         assert!(!result.proof_available);
         assert_eq!(result.error_type, Some(ErrorType::Incompatible));
+    }
+
+    #[test]
+    fn v3_listing_accepts_current_journal_items_without_observed() {
+        let sha256 = "a".repeat(64);
+        let parsed = parse_segments_envelope(
+            json!({"protocol_version":3,"total":1,"items":[{
+                "key":"120000_60","files":[{
+                    "name":"screen.webm","size":4,"sha256":sha256,"status":"present"
+                }]
+            }]}),
+            200,
+        );
+        assert!(parsed.proof_available);
+        assert_eq!(parsed.error_type, None);
+        let file = &parsed.items[0].files.as_ref().unwrap()[0];
+        assert_eq!(file.sha256.as_deref(), Some(sha256.as_str()));
+        assert_eq!(file.size, Some(4));
+        assert_eq!(file.status.as_deref(), Some("present"));
     }
 
     #[test]
