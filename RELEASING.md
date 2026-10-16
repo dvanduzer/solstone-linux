@@ -340,7 +340,14 @@ unchanged.
 
 ## Release transparency
 
-After delivery, publish the retained candidate with `make publish-transparency
+Transparency publication is not active for this product, and a release has no
+transparency step. The v2 release record (see `solpbc/solstone-transparency`)
+covers the journal only, and this product has no transparency adapter yet.
+`make publish-transparency` and `make resign-transparency-pointer` exit 2 unless
+`TRANSPARENCY_ACTIVATED=1`, and that flag does not by itself authorize a
+publish. The rest of this section describes the dormant publisher.
+
+When active, publication runs after delivery with `make publish-transparency
 RELEASE_DIR=<retained-candidate>`. This env-driven, retryable step never gates
 delivery; see the retained candidate paths above rather than reconstructing its
 inventory. Minisign is a development prerequisite. Version keys are one-shot and
