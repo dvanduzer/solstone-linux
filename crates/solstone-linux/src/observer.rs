@@ -7,6 +7,7 @@ use crate::{
     capture_stats::{CaptureStats, compute_capture_stats},
     chunking::{DrainedChunk, HitGate},
     config::Config,
+    desktop_session::SessionPresence,
     encoding::{AudioOutputPlan, audio_output_plan},
     pause_hold::{self, HeldPause, StartingPause},
     recovery::{
@@ -73,6 +74,11 @@ pub struct ActivityState {
     pub power_save: bool,
     pub user_idle: bool,
     pub power_unreadable: bool,
+    /// Whether capture has a live desktop session to follow. Anything but `Live`
+    /// captures nothing at all, screen or audio, until one is back.
+    pub session: SessionPresence,
+    /// Changes whenever the followed session changes; a change closes the segment.
+    pub session_epoch: u64,
 }
 pub trait ActivityProbe {
     fn probe(&mut self) -> Result<ActivityState, String>;
@@ -159,6 +165,7 @@ pub struct StateSnapshot {
     pub pause_until: Option<f64>,
     pub segment_start_mono: Option<f64>,
     pub process_start_mono: f64,
+    pub session: SessionPresence,
 }
 pub trait StateSink {
     fn publish(&mut self, snapshot: StateSnapshot);
@@ -226,6 +233,14 @@ pub struct ObserverState {
     pub frames: Vec<f32>,
     pub capture_stats: CaptureStats,
     pub last_stats_refresh: f64,
+    /// The session epoch the open segment was started under.
+    pub segment_session_epoch: u64,
+    /// Set while capture waits for a session, so the first live tick discards the
+    /// sound gathered before the session came back.
+    pub waited_for_session: bool,
+    /// Until this monotonic time, a video start that fails right after a session
+    /// change takes in sound only and retries, rather than stopping the app.
+    pub session_settle_until: f64,
 }
 
 pub struct Observer<V, A, P, M, W, E, C, Q, N> {
@@ -299,6 +314,9 @@ where
                     total_size_mb: 0,
                 },
                 last_stats_refresh: -CAPTURE_STATS_REFRESH_INTERVAL,
+                segment_session_epoch: 0,
+                waited_for_session: false,
+                session_settle_until: f64::NEG_INFINITY,
             },
         }
     }
@@ -308,8 +326,10 @@ where
         self.state.segment_is_muted = self.state.cached_is_muted;
         self.state.cached_is_active = target == Mode::Screencast;
         self.state.mode = target;
-        if !self.state.paused {
+        if !self.state.paused && self.session_live() {
             self.start_capture(target)?;
+        } else if !self.session_live() {
+            self.state.mode = Mode::Idle;
         }
         self.publish();
         Ok(())
@@ -371,6 +391,14 @@ where
         if self.state.segment_dir.is_none() {
             // Deliberate reference parity: resume-reopen ticks do not drain audio.
             let target = self.probe_status().unwrap_or(self.state.mode);
+            if !self.session_live() {
+                self.wait_for_session()?;
+                return Ok(());
+            }
+            if std::mem::take(&mut self.state.waited_for_session) {
+                // Sound gathered while no session was live never goes into a segment.
+                let _ = self.backends.audio.drain();
+            }
             self.state.segment_is_muted = self.state.cached_is_muted;
             self.state.mode = target;
             match self.start_capture(target) {
@@ -399,6 +427,12 @@ where
             );
         }
         let target = self.probe_status().unwrap_or(self.state.mode);
+        if !self.session_live() {
+            // The session in front of the seat stopped being this owner's: keep what
+            // was taken in while it was, then take in nothing until one is back.
+            self.wait_for_session()?;
+            return Ok(());
+        }
         if self.state.mode == Mode::Screencast && !self.backends.video.is_healthy() {
             self.stop_video()?;
             self.state.mode = Mode::Idle;
@@ -407,12 +441,25 @@ where
         let screen_transition =
             mode_changed && (self.state.mode == Mode::Screencast || target == Mode::Screencast);
         let mute_transition = self.state.cached_is_muted != self.state.segment_is_muted;
+        let session_transition =
+            self.state.cached_activity.session_epoch != self.state.segment_session_epoch;
         let chunk = self.backends.audio.drain();
         self.state.frames.extend_from_slice(chunk.interleaved());
         self.state.hit_gate.observe(&chunk);
         let elapsed = now - self.state.segment_start_mono;
-        if elapsed >= self.config.segment_interval as f64 || screen_transition || mute_transition {
-            self.handle_boundary(target)?;
+        if elapsed >= self.config.segment_interval as f64
+            || screen_transition
+            || mute_transition
+            || session_transition
+        {
+            match self.handle_boundary(target) {
+                Err(ObserverError::VideoStart(error)) if now < self.state.session_settle_until => {
+                    // A desktop that just came to the front can refuse the first start;
+                    // keep the segment open for sound and retry on the next tick.
+                    tracing::warn!(%error, "video did not start right after a session change; retrying");
+                }
+                other => other?,
+            }
         }
         self.publish();
         Ok(())
@@ -450,6 +497,22 @@ where
         Ok(())
     }
 
+    fn session_live(&self) -> bool {
+        self.state.cached_activity.session.is_live()
+    }
+
+    /// No live session: close any open segment with what it already holds, discard
+    /// audio as it arrives, and stay idle until a session is live again.
+    fn wait_for_session(&mut self) -> Result<(), ObserverError> {
+        self.finish_paused_segment()?;
+        let _ = self.backends.audio.drain();
+        self.state.mode = Mode::Idle;
+        self.state.cached_is_active = false;
+        self.state.waited_for_session = true;
+        self.publish();
+        Ok(())
+    }
+
     fn finish_paused_segment(&mut self) -> Result<(), ObserverError> {
         if self.state.segment_dir.is_none() {
             return Ok(());
@@ -479,6 +542,7 @@ where
     }
     fn start_capture(&mut self, target: Mode) -> Result<(), ObserverError> {
         let dir = self.start_segment()?;
+        self.state.segment_session_epoch = self.state.cached_activity.session_epoch;
         if target == Mode::Screencast && !self.state.cached_activity.screen_locked {
             let streams = self
                 .backends
@@ -632,6 +696,10 @@ where
     fn probe_status(&mut self) -> Result<Mode, String> {
         let activity = self.backends.activity.probe()?;
         let muted = self.backends.mute.probe_muted()?;
+        if activity.session_epoch != self.state.cached_activity.session_epoch {
+            self.state.session_settle_until =
+                self.backends.clock.monotonic_seconds() + SESSION_SETTLE_SECONDS;
+        }
         self.state.cached_activity = activity;
         self.state.cached_is_muted = muted;
         let target = mode(activity);
@@ -654,9 +722,13 @@ where
                 .as_ref()
                 .map(|_| self.state.segment_start_mono),
             process_start_mono: self.state.process_start_mono,
+            session: self.state.cached_activity.session,
         })
     }
 }
+
+/// How long after a session change a refused video start is retried instead of fatal.
+const SESSION_SETTLE_SECONDS: f64 = 30.0;
 
 fn bump_stem(day: &str, hms: &str) -> (String, String) {
     if hms.len() != 6 {
@@ -943,6 +1015,7 @@ pub(crate) mod tests {
             power_save: false,
             user_idle: false,
             power_unreadable: false,
+            ..ActivityState::default()
         }
     }
     fn idle() -> ActivityState {
@@ -951,6 +1024,7 @@ pub(crate) mod tests {
             power_save: false,
             user_idle: false,
             power_unreadable: false,
+            ..ActivityState::default()
         }
     }
 
@@ -1257,6 +1331,138 @@ pub(crate) mod tests {
         assert_eq!(f.stops.get(), 1);
         assert_eq!(f.events.completed.borrow().len(), 1)
     }
+    fn away() -> ActivityState {
+        ActivityState {
+            session: SessionPresence::NotActive,
+            ..active()
+        }
+    }
+    fn segment_dirs(f: &Fixture) -> usize {
+        let root = f.observer.config.captures_dir();
+        fs::read_dir(&root)
+            .map(|days| {
+                days.flatten()
+                    .map(|day| {
+                        fs::read_dir(day.path().join("desk"))
+                            .map(|entries| entries.count())
+                            .unwrap_or(0)
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    // No Python ancestor: no live desktop session means nothing is taken in at all.
+    #[test]
+    fn no_live_session_at_startup_takes_in_nothing_until_one_is() {
+        let mut f = fixture(false);
+        f.observer.backends.activity.0.push_back(Ok(away()));
+        initialize(&mut f);
+        for _ in 0..3 {
+            f.observer.backends.activity.0.push_back(Ok(away()));
+            f.observer.backends.audio.chunks.push_back(chunk(0.5));
+            f.mono.set(f.mono.get() + 5.0);
+            f.observer.tick().unwrap();
+        }
+        assert_eq!(f.starts.get(), 0);
+        assert_eq!(segment_dirs(&f), 0);
+        assert!(f.writes.0.borrow().is_empty());
+        let published = f.states.0.borrow().last().cloned().unwrap();
+        assert_eq!(published.session, SessionPresence::NotActive);
+        assert!(!published.segment_open);
+        f.observer.backends.activity.0.push_back(Ok(active()));
+        f.observer.tick().unwrap();
+        assert_eq!(f.starts.get(), 1);
+        assert_eq!(
+            f.states.0.borrow().last().unwrap().session,
+            SessionPresence::Live
+        );
+        // Sound gathered while waiting is discarded when the session comes back.
+        let mut g = fixture(false);
+        g.observer.backends.activity.0.push_back(Ok(away()));
+        initialize(&mut g);
+        g.observer.backends.activity.0.push_back(Ok(away()));
+        g.observer.tick().unwrap();
+        g.observer.backends.audio.chunks.push_back(chunk(0.5));
+        g.observer.backends.activity.0.push_back(Ok(active()));
+        g.observer.tick().unwrap();
+        g.mono.set(g.mono.get() + 5.0);
+        g.observer.tick().unwrap();
+        assert!(g.observer.state.frames.is_empty());
+    }
+
+    // No Python ancestor: a refused start right after a session change is retried.
+    #[test]
+    fn a_refused_start_after_a_session_change_is_retried_not_fatal() {
+        let mut f = fixture(false);
+        initialize(&mut f);
+        f.observer.backends.video.fail_start = true;
+        f.observer.backends.activity.0.push_back(Ok(ActivityState {
+            session_epoch: 3,
+            ..active()
+        }));
+        f.mono.set(f.mono.get() + 5.0);
+        f.wall.set(f.wall.get() + 5.0);
+        assert!(f.observer.tick().is_ok());
+        assert!(f.observer.state.segment_dir.is_some());
+        f.observer.backends.video.fail_start = false;
+        f.observer.backends.video.healthy = false;
+        f.observer.backends.activity.0.push_back(Ok(ActivityState {
+            session_epoch: 3,
+            ..active()
+        }));
+        f.mono.set(f.mono.get() + 5.0);
+        f.wall.set(f.wall.get() + 5.0);
+        f.observer.tick().unwrap();
+        assert_eq!(f.starts.get(), 3);
+    }
+
+    // No Python ancestor: losing the session keeps what was taken in while it was live.
+    #[test]
+    fn losing_the_session_closes_the_segment_and_takes_in_nothing() {
+        let mut f = fixture(false);
+        initialize(&mut f);
+        assert_eq!(f.starts.get(), 1);
+        f.observer.backends.activity.0.push_back(Ok(away()));
+        f.observer.tick().unwrap();
+        assert_eq!(f.stops.get(), 1);
+        assert_eq!(f.events.completed.borrow().len(), 1);
+        assert!(f.observer.state.segment_dir.is_none());
+        for _ in 0..3 {
+            f.observer.backends.activity.0.push_back(Ok(away()));
+            f.observer.backends.audio.chunks.push_back(chunk(0.5));
+            f.mono.set(f.mono.get() + 5.0);
+            f.observer.tick().unwrap();
+        }
+        assert_eq!(f.starts.get(), 1);
+        assert_eq!(segment_dirs(&f), 1);
+        assert!(f.drains.get() >= 3);
+        assert!(f.writes.0.borrow().is_empty());
+    }
+
+    // No Python ancestor: following a new session closes the segment and starts over.
+    #[test]
+    fn a_session_change_closes_the_segment_and_restarts_capture() {
+        let mut f = fixture(false);
+        initialize(&mut f);
+        f.observer.backends.activity.0.push_back(Ok(ActivityState {
+            session_epoch: 7,
+            ..active()
+        }));
+        f.mono.set(f.mono.get() + 5.0);
+        f.wall.set(f.wall.get() + 5.0);
+        f.observer.tick().unwrap();
+        assert_eq!(f.stops.get(), 1);
+        assert_eq!(f.starts.get(), 2);
+        assert_eq!(f.observer.state.segment_session_epoch, 7);
+        f.observer.backends.activity.0.push_back(Ok(ActivityState {
+            session_epoch: 7,
+            ..active()
+        }));
+        f.observer.tick().unwrap();
+        assert_eq!(f.starts.get(), 2);
+    }
+
     // tests/test_observer.py::test_save_audio_segment_unmuted_writes_combined
     #[test]
     fn two_hits_discard_three_hits_save_and_reset() {

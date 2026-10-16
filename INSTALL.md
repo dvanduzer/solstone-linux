@@ -175,6 +175,24 @@ solstone-linux status
 
 Activity detection uses screen-lock and power-save signals to notice when you step away. GNOME provides both signals; KDE Wayland provides screen lock; X11 can also provide DPMS power save. Where neither signal is available, the solstone app on linux still takes in what you share and that material goes into your journal, but activity-based segment boundaries do not trigger.
 
+### Which desktop session it takes in
+
+The solstone app takes in only your own desktop session, and only while it is the one in
+front of the screen. What it takes in goes into your journal. It asks the computer's login
+manager which session is in front, as it runs, so when you switch sessions it follows you
+without a restart.
+
+When your session is not the one in front of the screen, the solstone app takes in
+nothing, neither screen nor sound, until it is again. That covers someone else's session,
+the login screen, and the time after you log out. A separate session you log in to from
+another computer, such as a remote login, is never taken in. Sharing the desktop that's in
+front of the screen doesn't stop intake.
+
+When your screen is locked, the solstone app stops taking in the screen until you unlock it.
+
+If the panel icon says "can't reach your desktop", your session is in front but the
+solstone app can't connect to it. Log out and back in to fix that. `solstone-linux doctor` shows which session it is following.
+
 ### The panel icon
 
 The panel icon is the tray icon on KDE and an icon in the top panel on GNOME. It is

@@ -19,10 +19,11 @@ use crate::{
     activity::CompositeActivityProbe,
     audio::{backend::PulseAudioCapture, writer::FlacAudioWriter},
     config::Config,
+    desktop_session::{CaptureTarget, DesktopKind, SessionFollower, SharedTarget, native_resolver},
     observer::{
-        Backends, BackgroundCaptureStats, Clock, EventSink, Mode, Observer, ObserverError,
-        SegmentCompletedEvent, StateSnapshot, StoppedStream, VideoCapture, VideoStream,
-        WatchStateSink, lifecycle,
+        ActivityState, Backends, BackgroundCaptureStats, Clock, EventSink, Mode, Observer,
+        ObserverError, SegmentCompletedEvent, StateSnapshot, StoppedStream, VideoCapture,
+        VideoStream, WatchStateSink, lifecycle,
     },
     private_link::{
         PrivateLinkCapability, PrivateStateLock, load_credential,
@@ -266,7 +267,13 @@ fn run_capture(
     spawn_signal_task(Arc::clone(&stopped), portal_startup_cancellation.clone())
         .map_err(ObserverError::Io)?;
     let startup_heartbeat = begin_startup(Arc::clone(&notifier));
-    let video = VideoBackend::new(&config, portal_startup_cancellation)
+    // Resolve the session once before anything starts, so the video backend matches it
+    // and the first tick already knows whether there is a live session to capture.
+    let mut follower = SessionFollower::new(
+        native_resolver().map_err(|error| ObserverError::Io(error.to_string()))?,
+    );
+    let first_target = follower.resolve();
+    let video = VideoBackend::new(&config, portal_startup_cancellation, follower.shared())
         .map_err(ObserverError::VideoStart)?;
     let (audio, mute) = PulseAudioCapture::spawn().map_err(ObserverError::Io)?;
     let clock = SystemClock::new();
@@ -346,6 +353,7 @@ fn run_capture(
         pause_until: starting_pause.until_mono,
         segment_start_mono: None,
         process_start_mono: clock.monotonic_seconds(),
+        session: first_target.presence,
     };
     let snapshot = Arc::new(Mutex::new(initial_snapshot.clone()));
     let (states, tray_receiver) = WatchStateSink::channel(initial_snapshot);
@@ -371,7 +379,14 @@ fn run_capture(
     let backends = Backends {
         video,
         audio,
-        activity: CompositeActivityProbe::spawn(),
+        activity: CompositeActivityProbe::spawn_following(
+            follower,
+            ActivityState {
+                session: first_target.presence,
+                session_epoch: first_target.epoch,
+                ..ActivityState::default()
+            },
+        ),
         mute,
         writer: FlacAudioWriter,
         events: UploadEventSink { sync: sync_trigger },
@@ -784,31 +799,108 @@ fn spawn_signal_task(
     Ok(())
 }
 
-enum VideoBackend {
+enum ActiveVideo {
     Portal(PortalVideoCapture),
     X11(X11VideoCapture),
+}
+
+/// Video capture pointed at the session the follower resolved. Every start reads the
+/// current target, so a change of X display or of desktop kind is followed without a
+/// restart.
+struct VideoBackend {
+    active: ActiveVideo,
+    target: SharedTarget,
+    restore_token_path: std::path::PathBuf,
+    portal_startup_cancellation: CancellationToken,
+}
+
+fn backend_kind(target: &CaptureTarget) -> BackendKind {
+    match target.kind {
+        Some(DesktopKind::X11) => BackendKind::X11,
+        Some(DesktopKind::Wayland) => BackendKind::Portal,
+        // No live session yet: the startup environment is the only hint.
+        None => select_backend(
+            env::var("XDG_SESSION_TYPE").ok().as_deref(),
+            env::var("WAYLAND_DISPLAY").ok().as_deref(),
+            env::var("DISPLAY").ok().as_deref(),
+        ),
+    }
 }
 
 impl VideoBackend {
     fn new(
         config: &Config,
         portal_startup_cancellation: CancellationToken,
+        target: SharedTarget,
     ) -> Result<Self, String> {
-        match select_backend(
-            env::var("XDG_SESSION_TYPE").ok().as_deref(),
-            env::var("WAYLAND_DISPLAY").ok().as_deref(),
-            env::var("DISPLAY").ok().as_deref(),
-        ) {
-            BackendKind::X11 => X11VideoCapture::new().map(Self::X11),
+        let current = target.lock().expect("capture target lock").clone();
+        let restore_token_path = config.restore_token_path();
+        let active = Self::build(
+            backend_kind(&current),
+            &current,
+            &restore_token_path,
+            portal_startup_cancellation.clone(),
+        )?;
+        Ok(Self {
+            active,
+            target,
+            restore_token_path,
+            portal_startup_cancellation,
+        })
+    }
+
+    fn build(
+        kind: BackendKind,
+        target: &CaptureTarget,
+        restore_token_path: &std::path::Path,
+        portal_startup_cancellation: CancellationToken,
+    ) -> Result<ActiveVideo, String> {
+        match kind {
+            BackendKind::X11 => X11VideoCapture::new(
+                target
+                    .display
+                    .as_deref()
+                    .or(env::var("DISPLAY").ok().as_deref()),
+            )
+            .map(ActiveVideo::X11),
             BackendKind::Portal => PortalVideoCapture::spawn_with_cancellation(
                 AshpdPortalOps::new(),
-                FileTokenStore::new(config.restore_token_path()),
+                FileTokenStore::new(restore_token_path.to_path_buf()),
                 NativeWaylandGeometry,
                 GstreamerPipelineFactory::new()?,
                 portal_startup_cancellation,
             )
-            .map(Self::Portal),
+            .map(ActiveVideo::Portal),
         }
+    }
+
+    fn follow_target(&mut self) -> Result<(), String> {
+        let target = self.target.lock().expect("capture target lock").clone();
+        if target.kind.is_none() {
+            return Ok(());
+        }
+        let wanted = backend_kind(&target);
+        match (&mut self.active, wanted) {
+            (ActiveVideo::X11(capture), BackendKind::X11) => {
+                if let Some(x_display) = target.display.as_deref()
+                    && capture.display() != x_display
+                {
+                    tracing::info!(x_display, "X11 capture follows the active session");
+                    capture.set_display(x_display);
+                }
+            }
+            (ActiveVideo::Portal(_), BackendKind::Portal) => {}
+            _ => {
+                tracing::info!(kind = ?wanted, "the active session is another kind of desktop; switching video backend");
+                self.active = Self::build(
+                    wanted,
+                    &target,
+                    &self.restore_token_path,
+                    self.portal_startup_cancellation.clone(),
+                )?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -819,21 +911,22 @@ impl VideoCapture for VideoBackend {
         framerate: i64,
         draw_cursor: bool,
     ) -> Result<Vec<VideoStream>, String> {
-        match self {
-            Self::Portal(value) => value.start(directory, framerate, draw_cursor),
-            Self::X11(value) => value.start(directory, framerate, draw_cursor),
+        self.follow_target()?;
+        match &mut self.active {
+            ActiveVideo::Portal(value) => value.start(directory, framerate, draw_cursor),
+            ActiveVideo::X11(value) => value.start(directory, framerate, draw_cursor),
         }
     }
     fn stop(&mut self) -> Result<Vec<StoppedStream>, String> {
-        match self {
-            Self::Portal(value) => value.stop(),
-            Self::X11(value) => value.stop(),
+        match &mut self.active {
+            ActiveVideo::Portal(value) => value.stop(),
+            ActiveVideo::X11(value) => value.stop(),
         }
     }
     fn is_healthy(&self) -> bool {
-        match self {
-            Self::Portal(value) => value.is_healthy(),
-            Self::X11(value) => value.is_healthy(),
+        match &self.active {
+            ActiveVideo::Portal(value) => value.is_healthy(),
+            ActiveVideo::X11(value) => value.is_healthy(),
         }
     }
 }
@@ -1006,6 +1099,7 @@ mod tests {
             pause_until: None,
             segment_start_mono: None,
             process_start_mono: 0.0,
+            session: Default::default(),
         };
         let (states, receiver) = WatchStateSink::channel(snapshot.clone());
         (
@@ -1229,6 +1323,7 @@ mod tests {
             pause_until: None,
             segment_start_mono: None,
             process_start_mono: 42.0,
+            session: Default::default(),
         };
         let health = crate::sync_health::derive_health(
             &crate::sync_health::SyncFacts::default(),

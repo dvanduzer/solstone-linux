@@ -68,7 +68,18 @@ pub fn check_session_ready(
     environment: &HashMap<String, String>,
     runner: &dyn Runner,
 ) -> Option<&'static str> {
-    if missing(environment, "DISPLAY") && missing(environment, "WAYLAND_DISPLAY") {
+    check_session_ready_following(environment, runner, true)
+}
+
+/// `require_display` is false when logind answers: the app then finds the desktop
+/// session itself and waits for one, so a missing display is not a reason to exit.
+pub fn check_session_ready_following(
+    environment: &HashMap<String, String>,
+    runner: &dyn Runner,
+    require_display: bool,
+) -> Option<&'static str> {
+    if require_display && missing(environment, "DISPLAY") && missing(environment, "WAYLAND_DISPLAY")
+    {
         return Some("no display server (DISPLAY/WAYLAND_DISPLAY not set)");
     }
     if missing(environment, "DBUS_SESSION_BUS_ADDRESS") {
@@ -285,6 +296,14 @@ mod tests {
             check_session_ready(&ready_env(), &runner),
             Some("audio server not responding (pactl info failed)")
         );
+    }
+    // with logind answering, a missing display waits in the app instead of exiting.
+    #[test]
+    fn followed_session_needs_no_display_at_startup() {
+        let env = HashMap::from([("DBUS_SESSION_BUS_ADDRESS".into(), "bus".into())]);
+        let runner = FakeRunner::new(None, vec![]);
+        assert_eq!(check_session_ready_following(&env, &runner, false), None);
+        assert!(check_session_ready_following(&env, &runner, true).is_some());
     }
     // pactl timeout reports the same audio readiness message.
     #[test]

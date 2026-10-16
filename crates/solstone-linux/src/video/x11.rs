@@ -27,15 +27,16 @@ use crate::{
 const EOS_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub trait X11OutputProvider: Send {
-    fn outputs(&mut self) -> Result<Vec<Monitor>, String>;
+    fn outputs(&mut self, display: &str) -> Result<Vec<Monitor>, String>;
 }
 
 #[derive(Default)]
 pub struct RandrOutputProvider;
 
 impl X11OutputProvider for RandrOutputProvider {
-    fn outputs(&mut self) -> Result<Vec<Monitor>, String> {
-        let (connection, screen_index) = x11rb::connect(None).map_err(|error| error.to_string())?;
+    fn outputs(&mut self, display: &str) -> Result<Vec<Monitor>, String> {
+        let (connection, screen_index) =
+            x11rb::connect(Some(display)).map_err(|error| error.to_string())?;
         let root = connection.setup().roots[screen_index].root;
         // Use RandR output names, not GetMonitors' monitor-object names: this
         // matches the shipping Python observer's xrandr connector identities.
@@ -101,9 +102,9 @@ fn display_name(value: Option<String>) -> String {
 }
 
 impl X11VideoCapture {
-    pub fn new() -> Result<Self, String> {
+    pub fn new(display: Option<&str>) -> Result<Self, String> {
         Ok(Self::with_dependencies(
-            display_name(std::env::var("DISPLAY").ok()),
+            display_name(display.map(str::to_owned)),
             RandrOutputProvider,
             GstreamerPipelineFactory::new()?,
         ))
@@ -111,6 +112,17 @@ impl X11VideoCapture {
 }
 
 impl<P, F> X11VideoCapture<P, F> {
+    /// The display the next start captures. A running capture keeps its display
+    /// until it stops.
+    pub fn display(&self) -> &str {
+        &self.display
+    }
+    pub fn set_display(&mut self, display: &str) {
+        if !self.started && self.tracked.is_empty() {
+            self.display = display.to_owned();
+        }
+    }
+
     pub fn with_dependencies(display: impl Into<String>, outputs: P, pipelines: F) -> Self {
         Self {
             display: display.into(),
@@ -134,7 +146,7 @@ impl<P: X11OutputProvider, F: PipelineFactory> VideoCapture for X11VideoCapture<
                 "X11 video capture is already active; stop it before starting again".into(),
             );
         }
-        let monitors: Vec<_> = self.outputs.outputs()?.into_iter().filter(|monitor| {
+        let monitors: Vec<_> = self.outputs.outputs(&self.display)?.into_iter().filter(|monitor| {
             let usable = monitor.bounds.x1 >= 0 && monitor.bounds.y1 >= 0;
             if !usable {
                 warn!(connector = %monitor.id, x = monitor.bounds.x1, y = monitor.bounds.y1, "skipping X11 monitor with negative offset; ximagesrc requires non-negative coordinates");
@@ -249,7 +261,7 @@ mod tests {
 
     struct FakeOutputs(Result<Vec<Monitor>, String>);
     impl X11OutputProvider for FakeOutputs {
-        fn outputs(&mut self) -> Result<Vec<Monitor>, String> {
+        fn outputs(&mut self, _: &str) -> Result<Vec<Monitor>, String> {
             self.0.clone()
         }
     }

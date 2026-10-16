@@ -77,6 +77,7 @@ impl CheckResult {
 
 pub trait DoctorChecks {
     fn session_type(&mut self) -> CheckResult;
+    fn desktop_session(&mut self) -> CheckResult;
     fn portal(&mut self) -> CheckResult;
     fn pulse(&mut self) -> CheckResult;
     fn gstreamer(&mut self) -> CheckResult;
@@ -94,6 +95,7 @@ pub trait DoctorChecks {
 pub fn run_doctor(checks: &mut dyn DoctorChecks, output: &mut dyn io::Write) -> i32 {
     let names = [
         "session type",
+        "desktop session",
         "xdg-desktop-portal",
         "pipewire (pulse)",
         "gstreamer",
@@ -102,8 +104,9 @@ pub fn run_doctor(checks: &mut dyn DoctorChecks, output: &mut dyn io::Write) -> 
         "panel icon",
         "sync health",
     ];
-    let functions: [fn(&mut dyn DoctorChecks) -> CheckResult; 8] = [
+    let functions: [fn(&mut dyn DoctorChecks) -> CheckResult; 9] = [
         |v| v.session_type(),
+        |v| v.desktop_session(),
         |v| v.portal(),
         |v| v.pulse(),
         |v| v.gstreamer(),
@@ -144,7 +147,7 @@ pub fn run_doctor(checks: &mut dyn DoctorChecks, output: &mut dyn io::Write) -> 
     }
     let _ = writeln!(
         output,
-        "\ndoctor: 8 checks, {failures} failed, {warnings} warnings"
+        "\ndoctor: 9 checks, {failures} failed, {warnings} warnings"
     );
     if failures == 0 { 0 } else { 1 }
 }
@@ -168,6 +171,40 @@ impl<'a> RealDoctor<'a> {
     fn config(&mut self) -> &Config {
         self.config
             .get_or_insert_with(|| load_config(self.paths.clone()).config)
+    }
+}
+
+fn desktop_session_result(target: &crate::desktop_session::CaptureTarget) -> CheckResult {
+    use crate::desktop_session::{DesktopKind, SessionPresence};
+    const NAME: &str = "desktop session";
+    let session = target.session_id.as_deref().unwrap_or("?");
+    match target.presence {
+        SessionPresence::Live => match (target.kind, target.display.as_deref()) {
+            (Some(DesktopKind::X11), Some(display)) => CheckResult::ok(
+                NAME,
+                format!("following session {session} (x11 on {display})"),
+            ),
+            _ => CheckResult::ok(NAME, format!("following session {session} (wayland)")),
+        },
+        SessionPresence::NotActive => CheckResult::warn(
+            NAME,
+            "your desktop session isn't the one in front of the screen; nothing is taken in until it is",
+        ),
+        SessionPresence::NoDesktop => CheckResult::warn(
+            NAME,
+            "no desktop session of yours on this computer; nothing is taken in until you log in here (a session you log in to remotely is never taken in)",
+        ),
+        SessionPresence::Unreachable => CheckResult::fail(
+            NAME,
+            format!(
+                "can't reach your desktop ({}); log out and back in to restore it",
+                target.detail
+            ),
+        ),
+        SessionPresence::LoginUnavailable => CheckResult::fail(
+            NAME,
+            format!("{}; check that systemd-logind is running", target.detail),
+        ),
     }
 }
 
@@ -386,6 +423,17 @@ impl DoctorChecks for RealDoctor<'_> {
     fn session_type(&mut self) -> CheckResult {
         session_type_result(env::var("XDG_SESSION_TYPE").ok().as_deref())
     }
+    fn desktop_session(&mut self) -> CheckResult {
+        match crate::desktop_session::doctor_resolver() {
+            Ok(mut resolver) => {
+                desktop_session_result(&resolver.resolve(std::time::Instant::now()))
+            }
+            Err(error) => CheckResult::fail(
+                "desktop session",
+                format!("could not read login sessions: {error}"),
+            ),
+        }
+    }
     fn portal(&mut self) -> CheckResult {
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -425,7 +473,9 @@ impl DoctorChecks for RealDoctor<'_> {
         let display = display_value(env::var("DISPLAY").ok());
         let applicable = session != "wayland" && display.is_some();
         let randr = if applicable {
-            RandrOutputProvider.outputs().map(|_| ())
+            RandrOutputProvider
+                .outputs(display.as_deref().unwrap_or(":0"))
+                .map(|_| ())
         } else {
             Ok(())
         };
@@ -572,6 +622,7 @@ mod tests {
         fn all(severity: Severity) -> Self {
             let names = [
                 "session type",
+                "desktop session",
                 "xdg-desktop-portal",
                 "pipewire (pulse)",
                 "gstreamer",
@@ -598,6 +649,9 @@ mod tests {
     }
     impl DoctorChecks for FakeChecks {
         fn session_type(&mut self) -> CheckResult {
+            self.take()
+        }
+        fn desktop_session(&mut self) -> CheckResult {
             self.take()
         }
         fn portal(&mut self) -> CheckResult {
@@ -633,7 +687,34 @@ mod tests {
         assert_eq!(run_doctor(&mut checks, &mut out), 0);
         let out = String::from_utf8(out).unwrap();
         assert!(out.starts_with("ok    session type                  detail\n"));
-        assert!(out.contains("doctor: 8 checks, 0 failed, 0 warnings"));
+        assert!(out.contains("doctor: 9 checks, 0 failed, 0 warnings"));
+    }
+    // No Python ancestor: which session capture follows, and why it waits.
+    #[test]
+    fn desktop_session_reports_what_capture_follows() {
+        use crate::desktop_session::{CaptureTarget, DesktopKind, SessionPresence};
+        let live = CaptureTarget {
+            presence: SessionPresence::Live,
+            session_id: Some("4".into()),
+            kind: Some(DesktopKind::X11),
+            display: Some(":1".into()),
+            ..CaptureTarget::default()
+        };
+        let result = desktop_session_result(&live);
+        assert_eq!(result.severity, Severity::Ok);
+        assert!(result.detail.contains(":1"), "{}", result.detail);
+        for (presence, severity) in [
+            (SessionPresence::NotActive, Severity::Warn),
+            (SessionPresence::NoDesktop, Severity::Warn),
+            (SessionPresence::Unreachable, Severity::Fail),
+            (SessionPresence::LoginUnavailable, Severity::Fail),
+        ] {
+            let target = CaptureTarget {
+                presence,
+                ..CaptureTarget::default()
+            };
+            assert_eq!(desktop_session_result(&target).severity, severity);
+        }
     }
     // tests/test_doctor.py::test_run_doctor_any_fail_returns_one
     #[test]
@@ -975,6 +1056,9 @@ mod tests {
         impl DoctorChecks for Panic {
             fn session_type(&mut self) -> CheckResult {
                 panic!("boom")
+            }
+            fn desktop_session(&mut self) -> CheckResult {
+                self.0.take()
             }
             fn portal(&mut self) -> CheckResult {
                 self.0.take()

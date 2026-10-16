@@ -475,6 +475,7 @@ pub fn state(lock: bool, power: PowerObservation, user_idle: bool) -> ActivitySt
         power_save: power.power_save,
         user_idle,
         power_unreadable: !power.readable,
+        ..ActivityState::default()
     }
 }
 
@@ -497,6 +498,30 @@ impl CompositeActivityProbe {
             .spawn(move || {
                 run_worker(
                     dbus::NativeActivitySources::new(desktop, session_type),
+                    worker_latest,
+                )
+            })
+        {
+            tracing::warn!(%error, "could not start activity worker; defaulting to active");
+        }
+        Self { latest }
+    }
+
+    /// Activity that follows the session `follower` resolves, starting from `initial`
+    /// so the first tick already knows whether a session is live.
+    pub fn spawn_following(
+        follower: crate::desktop_session::SessionFollower,
+        initial: ActivityState,
+    ) -> Self {
+        let desktop = env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+        let session_type = env::var("XDG_SESSION_TYPE").unwrap_or_default();
+        let latest = Arc::new(Mutex::new(initial));
+        let worker_latest = Arc::clone(&latest);
+        if let Err(error) = thread::Builder::new()
+            .name("solstone-activity".into())
+            .spawn(move || {
+                run_worker(
+                    dbus::NativeActivitySources::following(desktop, session_type, follower),
                     worker_latest,
                 )
             })

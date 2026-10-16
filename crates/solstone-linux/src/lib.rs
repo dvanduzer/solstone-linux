@@ -12,6 +12,7 @@ pub mod clipboard;
 pub mod config;
 pub mod dbus_service;
 pub mod desktop_component;
+pub mod desktop_session;
 pub mod doctor;
 pub mod encoding;
 mod journal_mark;

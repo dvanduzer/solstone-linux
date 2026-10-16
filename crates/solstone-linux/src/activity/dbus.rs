@@ -15,7 +15,10 @@ use super::{
     LockSignal, ScreenSaverSpec, SessionBusOps, SystemBusOps, probe_backends, resolve,
     wayland_idle::NativeWaylandIdle, x11::NativeX11,
 };
-use crate::observer::ActivityState;
+use crate::{
+    desktop_session::{DesktopKind, SessionFollower},
+    observer::ActivityState,
+};
 
 trait ScreenSaverProxyOps {
     type Proxy: Clone;
@@ -156,9 +159,28 @@ struct NativeSystemBus {
     session_path: Option<zbus::zvariant::OwnedObjectPath>,
     signals_tx: mpsc::Sender<LockSignal>,
     signals_rx: mpsc::Receiver<LockSignal>,
+    subscription: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl NativeSystemBus {
+    /// Points lock reads at the captured session. Returns whether the session changed,
+    /// so the caller can subscribe to the new one's lock signals.
+    fn retarget(&mut self, path: Option<&str>) -> bool {
+        let Some(path) = path.and_then(|path| zbus::zvariant::OwnedObjectPath::try_from(path).ok())
+        else {
+            return false;
+        };
+        if self.session_path.as_ref() == Some(&path) {
+            return false;
+        }
+        if let Some(task) = self.subscription.take() {
+            task.abort();
+        }
+        let _ = self.signals_rx.try_iter().count();
+        self.session_path = Some(path);
+        true
+    }
+
     fn resolve_path(&mut self) -> BackendOutcome<zbus::zvariant::OwnedObjectPath> {
         if let Some(path) = &self.session_path {
             return BackendOutcome::Available(path.clone());
@@ -220,7 +242,7 @@ impl SystemBusOps for NativeSystemBus {
         let connection = self.connection.clone().ok_or("system bus unavailable")?;
         let sender = self.signals_tx.clone();
         let (setup_tx, setup_rx) = tokio::sync::oneshot::channel();
-        self.runtime.spawn(async move {
+        self.subscription = Some(self.runtime.spawn(async move {
             let proxy = match Proxy::new_owned(connection, "org.freedesktop.login1", path, "org.freedesktop.login1.Session").await {
                 Ok(proxy) => proxy,
                 Err(error) => { let _ = setup_tx.send(Err(error.to_string())); return; }
@@ -236,7 +258,7 @@ impl SystemBusOps for NativeSystemBus {
                     value = unlocks.next() => if value.is_some() { let _ = sender.send(LockSignal::Unlock); } else { break },
                 }
             }
-        });
+        }));
         self.runtime
             .block_on(setup_rx)
             .map_err(|_| "logind subscription task stopped during setup".to_owned())?
@@ -277,10 +299,30 @@ pub struct NativeActivitySources {
     x11: NativeX11,
     cache: CacheState,
     inventory: Option<BoundBackends>,
+    follower: Option<SessionFollower>,
 }
 
 impl NativeActivitySources {
+    /// Activity read from the session capture follows, re-resolved at every poll.
+    pub fn following(desktop: String, session_type: String, follower: SessionFollower) -> Self {
+        Self::build(
+            desktop,
+            session_type,
+            NativeX11::unconnected(),
+            Some(follower),
+        )
+    }
+
     pub fn new(desktop: String, session_type: String) -> Self {
+        Self::build(desktop, session_type, NativeX11::new(), None)
+    }
+
+    fn build(
+        desktop: String,
+        session_type: String,
+        x11: NativeX11,
+        follower: Option<SessionFollower>,
+    ) -> Self {
         let runtime = Arc::new(
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -310,17 +352,32 @@ impl NativeActivitySources {
                 session_path: None,
                 signals_tx,
                 signals_rx,
+                subscription: None,
             },
             wayland: NativeWaylandIdle::new(),
-            x11: NativeX11::new(),
+            x11,
             cache: CacheState::default(),
             inventory: None,
+            follower,
         }
     }
 }
 
 impl ActivityOps for NativeActivitySources {
     fn probe_once(&mut self) -> (ActivityState, BoundBackends) {
+        let target = self.follower.as_mut().map(SessionFollower::resolve);
+        if let Some(target) = &target {
+            match target.kind {
+                Some(DesktopKind::X11) => self.session_type = "x11".into(),
+                Some(DesktopKind::Wayland) => self.session_type = "wayland".into(),
+                None => {}
+            }
+            self.x11.retarget(target.epoch, target.display.as_deref());
+            if self.system.retarget(target.session_path.as_deref()) {
+                self.cache.subscription_attempted = false;
+                self.cache.lock_signal = Default::default();
+            }
+        }
         if self.inventory.is_none() {
             let (inventory, warnings) = probe_backends(
                 &self.desktop,
@@ -348,7 +405,20 @@ impl ActivityOps for NativeActivitySources {
         for warning in self.cache.take_warnings() {
             emit_activity_log(warning);
         }
-        (result.0, inventory)
+        let mut state = result.0;
+        if let Some(target) = target {
+            state.session = target.presence;
+            state.session_epoch = target.epoch;
+            // With more than one desktop session of this user, the user bus's screen
+            // saver can't say which session it speaks for; logind can.
+            if target.presence.is_live()
+                && target.local_desktops > 1
+                && let BackendOutcome::Available(locked) = self.system.locked_hint()
+            {
+                state.screen_locked = locked;
+            }
+        }
+        (state, inventory)
     }
 }
 

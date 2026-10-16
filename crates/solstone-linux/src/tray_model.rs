@@ -2,6 +2,7 @@
 // Copyright (c) 2026 sol pbc
 
 use crate::{
+    desktop_session::SessionPresence,
     observer::{Mode, StateSnapshot},
     sync_health::SyncHealth,
 };
@@ -11,8 +12,20 @@ pub enum TrayStatus {
     Recording,
     Idle,
     Paused,
+    /// Running, with no live desktop session of this owner to take in.
+    Waiting(SessionPresence),
     // Not produced by `status()`: retained as a real rung in the reference icon/status ladder.
     Stopped,
+}
+
+impl TrayStatus {
+    /// Waiting because something is wrong, not because the owner stepped away.
+    fn needs_attention(self) -> bool {
+        matches!(
+            self,
+            Self::Waiting(SessionPresence::Unreachable | SessionPresence::LoginUnavailable)
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,6 +49,8 @@ pub struct TrayModel {
 pub fn status(snapshot: &StateSnapshot) -> TrayStatus {
     if snapshot.paused {
         TrayStatus::Paused
+    } else if !snapshot.session.is_live() {
+        TrayStatus::Waiting(snapshot.session)
     } else if snapshot.mode == Mode::Screencast {
         TrayStatus::Recording
     } else {
@@ -48,6 +63,7 @@ pub fn status_name(status: TrayStatus) -> &'static str {
         TrayStatus::Recording => "recording",
         TrayStatus::Idle => "idle",
         TrayStatus::Paused => "paused",
+        TrayStatus::Waiting(_) => "waiting",
         TrayStatus::Stopped => "stopped",
     }
 }
@@ -78,6 +94,13 @@ pub fn header_label(status: TrayStatus, health: &SyncHealth, pause: i32) -> Stri
     match status {
         TrayStatus::Paused if pause > 0 => format!("paused ({}m remaining)", pause / 60),
         TrayStatus::Paused => "paused".into(),
+        TrayStatus::Waiting(SessionPresence::LoginUnavailable) => {
+            "can't check which session is in front".into()
+        }
+        status @ TrayStatus::Waiting(_) if status.needs_attention() => {
+            "can't reach your desktop".into()
+        }
+        TrayStatus::Waiting(_) => "waiting for your desktop".into(),
         TrayStatus::Stopped => "not running".into(),
         TrayStatus::Recording => health.header_recording.clone(),
         TrayStatus::Idle => health.header_idle.clone(),
@@ -89,13 +112,19 @@ pub fn tooltip(status: TrayStatus, health: &SyncHealth) -> String {
         TrayStatus::Recording => "on",
         TrayStatus::Paused => "paused",
         TrayStatus::Idle => "idle (screen inactive)",
+        TrayStatus::Waiting(SessionPresence::NotActive) => "waiting (your session isn't in front)",
+        TrayStatus::Waiting(SessionPresence::Unreachable) => "can't reach your desktop",
+        TrayStatus::Waiting(SessionPresence::LoginUnavailable) => {
+            "can't check which session is in front"
+        }
+        TrayStatus::Waiting(_) => "waiting (none of your sessions is in front)",
         TrayStatus::Stopped => "not running",
     };
     format!("{status_text}\n{}", health.tooltip)
 }
 
 pub fn sni_status(status: TrayStatus, health: &SyncHealth) -> String {
-    if status == TrayStatus::Stopped {
+    if status == TrayStatus::Stopped || status.needs_attention() {
         "NeedsAttention".into()
     } else {
         health.sni_status.clone()
@@ -103,13 +132,16 @@ pub fn sni_status(status: TrayStatus, health: &SyncHealth) -> String {
 }
 
 pub fn icon_name(status: TrayStatus, health: &SyncHealth) -> String {
+    if status.needs_attention() {
+        return "attention".into();
+    }
     match health.icon.as_str() {
         "healthy" => match status {
-            TrayStatus::Paused | TrayStatus::Stopped => "paused",
+            TrayStatus::Paused | TrayStatus::Stopped | TrayStatus::Waiting(_) => "paused",
             TrayStatus::Recording | TrayStatus::Idle => "healthy",
         },
         "connecting" => match status {
-            TrayStatus::Paused | TrayStatus::Stopped => "paused",
+            TrayStatus::Paused | TrayStatus::Stopped | TrayStatus::Waiting(_) => "paused",
             TrayStatus::Recording | TrayStatus::Idle => "connecting",
         },
         "attention" => "attention",
@@ -176,6 +208,27 @@ mod tests {
             ..SyncFacts::default()
         }
     }
+    #[test]
+    fn no_live_session_waits_and_a_broken_one_asks_for_attention() {
+        let health = derive_health(&connected_facts(), 0.0, 300.0);
+        let mut value = snapshot();
+        value.mode = Mode::Screencast;
+        value.session = SessionPresence::NotActive;
+        let away = build(&value, 300, 0.0, &health);
+        assert_eq!(away.status, TrayStatus::Waiting(SessionPresence::NotActive));
+        assert_eq!(status_name(away.status), "waiting");
+        assert_eq!(away.header, "waiting for your desktop");
+        assert_eq!(away.icon, "paused");
+        assert_ne!(away.sni_status, "NeedsAttention");
+        value.session = SessionPresence::Unreachable;
+        let broken = build(&value, 300, 0.0, &health);
+        assert_eq!(broken.header, "can't reach your desktop");
+        assert_eq!(broken.icon, "attention");
+        assert_eq!(broken.sni_status, "NeedsAttention");
+        value.paused = true;
+        assert_eq!(build(&value, 300, 0.0, &health).status, TrayStatus::Paused);
+    }
+
     fn snapshot() -> StateSnapshot {
         StateSnapshot {
             mode: Mode::Screencast,
@@ -186,6 +239,7 @@ mod tests {
             pause_until: None,
             segment_start_mono: Some(100.0),
             process_start_mono: 50.0,
+            session: Default::default(),
         }
     }
     fn connected_health() -> SyncHealth {

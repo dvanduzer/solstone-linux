@@ -195,6 +195,7 @@ mod tests {
             pause_until: None,
             segment_start_mono: None,
             process_start_mono: 0.0,
+            session: Default::default(),
         }
     }
     #[test]

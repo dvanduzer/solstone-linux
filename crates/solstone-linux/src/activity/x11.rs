@@ -25,6 +25,7 @@ fn map_dpms_mode(mode: DPMSMode) -> Result<DpmsPower, String> {
 
 pub struct NativeX11 {
     connection: Option<(RustConnection, usize)>,
+    epoch: Option<u64>,
 }
 
 impl Default for NativeX11 {
@@ -37,6 +38,36 @@ impl NativeX11 {
     pub fn new() -> Self {
         Self {
             connection: x11rb::connect(None).ok(),
+            epoch: None,
+        }
+    }
+
+    /// No connection until [`Self::retarget`] names a display.
+    pub fn unconnected() -> Self {
+        Self {
+            connection: None,
+            epoch: None,
+        }
+    }
+
+    /// Follows the captured session's display. Reconnects only when the session
+    /// changes, so a display number a new X server reuses is not a dead connection.
+    pub fn retarget(&mut self, epoch: u64, display: Option<&str>) {
+        if self.epoch == Some(epoch) && self.connection.is_some() {
+            return;
+        }
+        let changed = self.epoch != Some(epoch);
+        self.epoch = Some(epoch);
+        if changed {
+            // Never read another session's idle time or power state.
+            self.connection = None;
+        }
+        if let Some(display) = display.map(str::to_owned) {
+            self.connection = crate::desktop_session::within(
+                crate::desktop_session::X_CONNECT_TIMEOUT,
+                move || x11rb::connect(Some(&display)).ok(),
+            )
+            .flatten();
         }
     }
 

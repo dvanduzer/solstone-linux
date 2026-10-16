@@ -6,6 +6,11 @@ and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- the solstone app now takes in the session you're using, the one in front of the screen, for your journal, and follows you when you switch sessions, without a restart. before, it could stay on a session you were no longer using and miss the one you were. when none of your sessions is in front, it takes in nothing until one is.
+- on X11, if the file that lets apps connect to your screen is removed while you are still logged in, the solstone app keeps taking in your session for your journal.
+
 ## [2.0.21] - 2026-10-16
 
 ### Fixed

@@ -223,6 +223,7 @@ mod tests {
             pause_until: None,
             segment_start_mono: Some(0.0),
             process_start_mono: 0.0,
+            session: Default::default(),
         };
         let health = derive_health(
             &SyncFacts {

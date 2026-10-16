@@ -184,6 +184,7 @@ fn apply_interval(config: &mut Config, interval: Option<i64>) {
     }
 }
 
+#[cfg(test)]
 fn session_gate(
     environment: &mut HashMap<String, String>,
     uid: u32,
@@ -204,6 +205,7 @@ fn apply_session_environment(environment: &HashMap<String, String>) {
         "DISPLAY",
         "WAYLAND_DISPLAY",
         "DBUS_SESSION_BUS_ADDRESS",
+        "XAUTHORITY",
     ] {
         if let Some(value) = environment.get(name) {
             set_session_environment_variable(name, value);
@@ -1148,9 +1150,29 @@ fn cmd_run(interval: Option<i64>) -> i32 {
         }
     }
     apply_interval(&mut config, interval);
+    let uid = process_uid();
     let mut environment: HashMap<String, String> = env::vars().collect();
-    let gate_result = session_gate(&mut environment, process_uid(), &SystemRunner);
+    session_env::recover_session_env(&mut environment, uid, &SystemRunner);
+    // What the user manager handed over is only a fallback: it names whichever session
+    // last imported it. Capture finds its session in logind, and X11 reads the
+    // credential this process keeps for that session.
+    crate::desktop_session::remember_startup_environment(
+        crate::desktop_session::StartupEnvironment {
+            display: environment.get("DISPLAY").cloned(),
+            xauthority: environment.get("XAUTHORITY").cloned(),
+            home: environment.get("HOME").map(std::path::PathBuf::from),
+        },
+    );
+    let managed = crate::desktop_session::managed_xauthority_path(
+        environment.get("XDG_RUNTIME_DIR").map(String::as_str),
+        uid,
+    );
+    environment.insert("XAUTHORITY".into(), managed.to_string_lossy().into_owned());
     apply_session_environment(&environment);
+    let logind_answers = crate::desktop_session::logind_answers(uid);
+    let gate_result =
+        session_env::check_session_ready_following(&environment, &SystemRunner, !logind_answers)
+            .map_or(Ok(()), |reason| Err(RunFailure::NotReady(reason)));
     if let Err(failure) = gate_result {
         if let RunFailure::NotReady(reason) = failure {
             tracing::warn!("Session not ready: {reason}");
@@ -3375,6 +3397,7 @@ mod tests {
             pause_until: None,
             segment_start_mono: None,
             process_start_mono: 0.0,
+            session: Default::default(),
         });
         let handle = crate::browser::server::start(crate::browser::server::ServerConfig {
             base_dir: running_config.base_dir.clone(),

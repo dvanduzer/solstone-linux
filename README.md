@@ -1,7 +1,9 @@
 # solstone-linux
 
 The solstone app on linux takes in what you share with it on a GNOME Wayland
-session; all of it goes into your journal, which lives on a device you own.
+session; all of it goes into your journal, which lives on a device you own. It takes in
+only your own desktop session, and only while that session is the one in front of the
+screen ([details](INSTALL.md#which-desktop-session-it-takes-in)).
 
 **Note:** Activity detection uses screen-lock and power-save signals to notice when you step away. Coverage varies by desktop: GNOME provides both signals; KDE (Wayland) provides screen lock only; any X11 session also provides DPMS power save; other Wayland desktops provide screen lock where the compositor exposes it. Where neither signal is available, the solstone app on linux still takes in what you share and that material goes into your journal, but activity-based segment boundaries will not trigger.
 
