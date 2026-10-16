@@ -6,10 +6,12 @@ and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+## [2.0.21] - 2026-10-16
+
 ### Fixed
 
-- fixed a check that could resend files already in your journal after pairing again.
-- on linux, once browser pages have gone into your journal, the solstone extension and `solstone-linux status` no longer say they are still waiting on this computer.
+- after you pair again, the solstone app no longer goes back over files your journal already holds; it confirms them with your journal instead.
+- once browser pages have gone into your journal, the solstone extension and `solstone-linux status` no longer say they are still waiting on this computer.
 
 ## [2.0.20] - 2026-10-14
 
