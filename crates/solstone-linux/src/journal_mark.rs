@@ -18,7 +18,7 @@ use crate::{
         ensure_private_directory, open_regular_readonly,
     },
     private_link::{
-        PrivateIoOperation, PrivateStateError, PrivateTargetKind, SYSTEM_STATUS_TIMEOUT,
+        PrivateIoOperation, PrivateStateError, PrivateTargetKind, RETIRE_REQUEST_TIMEOUT,
         compute_pairing_id, format_spoken_mark, load_credential, read_private_file,
     },
 };
@@ -494,7 +494,7 @@ pub(crate) async fn retire_client_registration(credential: &Credential) {
         return;
     };
     let _ = tokio::time::timeout(
-        SYSTEM_STATUS_TIMEOUT,
+        RETIRE_REQUEST_TIMEOUT,
         client.request(
             "DELETE",
             &path,

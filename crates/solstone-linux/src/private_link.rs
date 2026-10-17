@@ -56,7 +56,15 @@ const LAN_CARRIER_TIMEOUT: Duration = Duration::from_secs(5);
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(30);
 const INGEST_TIMEOUT: Duration = Duration::from_secs(300);
 const LISTING_TIMEOUT: Duration = Duration::from_secs(60);
-pub(crate) const SYSTEM_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+// A journal probe is often the request that dials a fresh carrier, and the
+// request timeout covers that dial. When a LAN endpoint does not answer, the
+// LAN leg alone spends its full cap before the relay leg starts, so the probe
+// budget is that cap plus room for the relay leg.
+const RELAY_LEG_ALLOWANCE: Duration = Duration::from_secs(10);
+const SYSTEM_STATUS_TIMEOUT: Duration = LAN_CARRIER_TIMEOUT.saturating_add(RELAY_LEG_ALLOWANCE);
+// Retiring a client registration is a best-effort direct request that does not
+// go through the bridge; it keeps its own short bound.
+pub(crate) const RETIRE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const SYSTEM_STATUS_PATH: &str = "/api/system/status";
 pub(crate) const OBSERVER_HEADER_NAME: &str = "x-solstone-observer";
 pub(crate) const PROTOCOL_VERSION_HEADER_NAME: &str = "x-solstone-protocol-version";
@@ -3899,6 +3907,87 @@ pub(crate) mod tests {
         peer.shutdown().await;
     }
 
+    // A probe with no live carrier pays for the dial. When the LAN endpoint never
+    // answers, the probe's own budget must still reach the relay leg rather than
+    // giving up while the LAN leg is spending its cap.
+    #[tokio::test]
+    async fn journal_probe_reaches_relay_when_lan_never_answers() {
+        let temp = tempfile::tempdir().unwrap();
+        let peer = PrivateLinkPeer::start().await;
+        let lan = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let lan_port = lan.local_addr().unwrap().port();
+        let stalled = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (stream, _) = lan.accept().await.unwrap();
+                held.push(stream);
+            }
+        });
+        let relay = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let relay_origin = format!("http://{}", relay.local_addr().unwrap());
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let relay_task = tokio::spawn(async move {
+            let mut reached_tx = Some(reached_tx);
+            loop {
+                let (mut stream, _) = relay.accept().await.unwrap();
+                if let Some(tx) = reached_tx.take() {
+                    let _ = tx.send(std::time::Instant::now());
+                }
+                let _ = read_http_head(&mut stream).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+        });
+        let mut credential = peer.credential();
+        credential.endpoints = vec![EndpointAddr {
+            host: "127.0.0.1".into(),
+            port: lan_port,
+        }];
+        credential.relay_origin = Some(relay_origin);
+        credential.device_token = Some(test_jwt(i64::MAX / 2));
+        let session = start_private_link_session(temp.path(), credential, "stream")
+            .await
+            .unwrap();
+        assert!(session.opener.has_lan_transport());
+        assert!(session.opener.relay_transport.lock().unwrap().is_some());
+
+        let started = std::time::Instant::now();
+        let outcome = session.capability().system_status().await;
+        let returned = std::time::Instant::now();
+
+        assert!(
+            outcome.is_err(),
+            "the relay refuses every dial in this test"
+        );
+        let reached = reached_rx
+            .await
+            .expect("the probe never reached the relay leg");
+        assert!(
+            reached < returned,
+            "relay reached {:?} after the probe gave up at {:?}",
+            reached - started,
+            returned - started
+        );
+        assert!(reached - started >= LAN_CARRIER_TIMEOUT);
+        assert!(
+            returned - started < SYSTEM_STATUS_TIMEOUT,
+            "the probe ran out its budget at {:?} instead of hearing the relay's answer",
+            returned - started
+        );
+
+        relay_task.abort();
+        stalled.abort();
+        session.shutdown().await.unwrap();
+        peer.shutdown().await;
+    }
+
     impl Pairer for FakePairer {
         fn pair<'a>(
             &'a self,
@@ -7556,8 +7645,8 @@ pub(crate) mod tests {
         assert!(session.opener.relay_transport.lock().unwrap().is_some());
 
         // Dial the carrier directly: the refused LAN leg alone spends 3.75 s in the
-        // pinned client's retry ladder, which leaves a request's 5 s budget too
-        // little room for the relay leg on a loaded machine.
+        // pinned client's retry ladder, so this keeps the test about the token
+        // refresh rather than about any request's time budget.
         assert!(session.opener.dial_carrier().await.is_err());
         relay.await.unwrap();
 
