@@ -1,7 +1,7 @@
 # solstone-linux Makefile
 # Standalone Linux desktop observer for solstone
 
-.PHONY: all bootstrap install format brand-sync test check-observer-contract check-rust-release-manifest check-transparency-minisign check-audit-signed-packet ci audit update-deps shellcheck install-service uninstall-service service-restart service-status service-logs versions clean clean-install release release-images release-candidate release-candidate-prove release-candidate-recover sign-release-manifest verify-release-signature publish-origin publish-release publish-transparency resign-transparency-pointer check-toolchain-env establish-toolchain rust-preflight check-cargo-deny
+.PHONY: all bootstrap agent-setup install format brand-sync test check-observer-contract check-rust-release-manifest check-transparency-minisign check-audit-signed-packet ci audit update-deps shellcheck install-service uninstall-service service-restart service-status service-logs versions clean clean-install release release-images release-candidate release-candidate-prove release-candidate-recover sign-release-manifest verify-release-signature publish-origin publish-release publish-transparency resign-transparency-pointer check-toolchain-env establish-toolchain rust-preflight check-cargo-deny
 
 APP := solstone-linux
 UNIT := solstone-linux.service
@@ -60,13 +60,16 @@ check-cargo-deny:
 		echo "error: cargo-deny version mismatch: expected 'cargo-deny $(CARGO_DENY_VERSION)', got '$$actual'; run 'make install'" >&2; exit 1; \
 	fi
 
-install: establish-toolchain rust-preflight
+agent-setup: establish-toolchain rust-preflight
 	@actual=$$(cargo deny --version 2>/dev/null || true); \
 	if [ "$$actual" != "cargo-deny $(CARGO_DENY_VERSION)" ]; then \
 		$(CARGO) install cargo-deny --version $(CARGO_DENY_VERSION) $(CARGO_LOCKED) || { actual=$$(cargo deny --version 2>/dev/null || echo unavailable); echo "error: cargo-deny installation mismatch: expected 'cargo-deny $(CARGO_DENY_VERSION)', actual '$$actual'" >&2; echo "repair: cargo install cargo-deny --version $(CARGO_DENY_VERSION) --locked" >&2; exit 1; }; \
 	fi
 	@actual=$$(cargo deny --version 2>/dev/null || true); \
 	[ "$$actual" = "cargo-deny $(CARGO_DENY_VERSION)" ] || { echo "error: cargo-deny verification mismatch: expected 'cargo-deny $(CARGO_DENY_VERSION)', actual '$${actual:-unavailable}'" >&2; echo "repair: cargo install cargo-deny --version $(CARGO_DENY_VERSION) --locked" >&2; exit 1; }
+	$(CARGO) metadata $(CARGO_LOCKED) --format-version 1 > /dev/null
+
+install: agent-setup
 	@$(CARGO) install --path crates/solstone-linux $(CARGO_LOCKED) || { echo "error: observer installation mismatch: expected $(CARGO_BIN_DIR)/$(APP), actual installation failed" >&2; echo "repair: cargo install --path crates/solstone-linux --locked" >&2; exit 1; }
 	@$(CARGO) install --path crates/solstone-linux-window $(CARGO_LOCKED)
 
