@@ -241,6 +241,9 @@ pub struct ObserverState {
     /// Until this monotonic time, a video start that fails right after a session
     /// change takes in sound only and retries, rather than stopping the app.
     pub session_settle_until: f64,
+    /// Until this monotonic time, video that died on its own is not restarted, so
+    /// the restart waits for a fresh reading of the lock.
+    pub video_retry_after: f64,
 }
 
 pub struct Observer<V, A, P, M, W, E, C, Q, N> {
@@ -317,6 +320,7 @@ where
                 segment_session_epoch: 0,
                 waited_for_session: false,
                 session_settle_until: f64::NEG_INFINITY,
+                video_retry_after: f64::NEG_INFINITY,
             },
         }
     }
@@ -426,7 +430,7 @@ where
                 },
             );
         }
-        let target = self.probe_status().unwrap_or(self.state.mode);
+        let mut target = self.probe_status().unwrap_or(self.state.mode);
         if !self.session_live() {
             // The session in front of the seat stopped being this owner's: keep what
             // was taken in while it was, then take in nothing until one is back.
@@ -436,6 +440,17 @@ where
         if self.state.mode == Mode::Screencast && !self.backends.video.is_healthy() {
             self.stop_video()?;
             self.state.mode = Mode::Idle;
+            // A desktop ends its screen stream as it locks or logs out, and can say so
+            // before it reports the lock. Restarting on this tick's reading would ask
+            // a locking desktop for the screen and block on its answer.
+            self.state.video_retry_after =
+                self.backends.clock.monotonic_seconds() + VIDEO_RETRY_SECONDS;
+            tracing::info!("screen stream ended; restarting it after a fresh lock check");
+        }
+        if target == Mode::Screencast
+            && self.backends.clock.monotonic_seconds() < self.state.video_retry_after
+        {
+            target = Mode::Idle;
         }
         let mode_changed = target != self.state.mode;
         let screen_transition =
@@ -729,6 +744,10 @@ where
 
 /// How long after a session change a refused video start is retried instead of fatal.
 const SESSION_SETTLE_SECONDS: f64 = 30.0;
+
+/// How long video that died on its own stays down before a restart: at least one
+/// more activity poll.
+const VIDEO_RETRY_SECONDS: f64 = 10.0;
 
 fn bump_stem(day: &str, hms: &str) -> (String, String) {
     if hms.len() != 6 {
@@ -1414,6 +1433,10 @@ pub(crate) mod tests {
         f.mono.set(f.mono.get() + 5.0);
         f.wall.set(f.wall.get() + 5.0);
         f.observer.tick().unwrap();
+        assert_eq!(f.starts.get(), 2);
+        f.mono.set(f.mono.get() + 10.0);
+        f.wall.set(f.wall.get() + 10.0);
+        f.observer.tick().unwrap();
         assert_eq!(f.starts.get(), 3);
     }
 
@@ -1645,17 +1668,47 @@ pub(crate) mod tests {
         // The wall jump does not stretch the length: four seconds of capture ran.
         assert!(f.events.completed.borrow()[0].key.ends_with("_4"))
     }
-    // No 1:1 test: observer.py:663-733 agrees watchdog restart is same-tick and fatal.
+    // observer.py:663-733 restarts on the same tick; this waits for a fresh poll.
+    // A failed restart is still fatal.
     #[test]
-    fn watchdog_active_restarts_same_tick_and_failure_is_fatal() {
+    fn watchdog_active_restarts_after_a_fresh_poll_and_failure_is_fatal() {
         let mut f = fixture(false);
         initialize(&mut f);
         f.observer.backends.video.healthy = false;
         f.observer.backends.video.fail_start = true;
+        f.observer.tick().unwrap();
+        assert_eq!(f.stops.get(), 1);
+        assert_eq!(f.starts.get(), 1);
+        assert_eq!(f.observer.state.mode, Mode::Idle);
+        f.mono.set(f.mono.get() + 5.0);
+        f.observer.tick().unwrap();
+        assert_eq!(f.starts.get(), 1);
+        f.mono.set(f.mono.get() + 5.0);
         let e = f.observer.tick().unwrap_err();
         assert!(matches!(e, ObserverError::VideoStart(_)));
-        assert_eq!(f.stops.get(), 1);
         assert_eq!(f.starts.get(), 2)
+    }
+    // No Python ancestor: the stream ends as the desktop locks, and the lock is
+    // only reported on the next poll. Nothing asks the locked desktop for the screen.
+    #[test]
+    fn video_ending_before_the_lock_is_reported_is_not_restarted_into_the_lock() {
+        let mut f = fixture(false);
+        initialize(&mut f);
+        f.observer.backends.video.healthy = false;
+        f.observer.tick().unwrap();
+        assert_eq!(f.starts.get(), 1);
+        for _ in 0..4 {
+            f.mono.set(f.mono.get() + 5.0);
+            f.observer.backends.activity.0.push_back(Ok(idle()));
+            f.observer.tick().unwrap();
+        }
+        assert_eq!(f.starts.get(), 1);
+        assert_eq!(f.observer.state.mode, Mode::Idle);
+        f.observer.backends.video.healthy = true;
+        f.mono.set(f.mono.get() + 5.0);
+        f.observer.tick().unwrap();
+        assert_eq!(f.starts.get(), 2);
+        assert_eq!(f.observer.state.mode, Mode::Screencast)
     }
     // No 1:1 Python ancestor: unhealthy idle continues audio-only.
     #[test]

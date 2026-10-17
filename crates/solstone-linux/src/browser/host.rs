@@ -272,9 +272,8 @@ mod tests {
             app_side
                 .write_all(&frame(br#"{"type":"bye","reason":"shutdown"}"#))
                 .unwrap();
-            app_side
-                .write_all(&frame(br#"{"type":"state","after":"bye"}"#))
-                .unwrap();
+            // The relay may already have closed its end after the bye.
+            let _ = app_side.write_all(&frame(br#"{"type":"state","after":"bye"}"#));
             app_side
         });
         let mut output = Vec::new();

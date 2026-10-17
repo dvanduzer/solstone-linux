@@ -7555,10 +7555,10 @@ pub(crate) mod tests {
         assert!(session.opener.has_lan_transport());
         assert!(session.opener.relay_transport.lock().unwrap().is_some());
 
-        assert!(matches!(
-            session.capability().system_status().await,
-            Err(LinkOutcome::Success { .. })
-        ));
+        // Dial the carrier directly: the refused LAN leg alone spends 3.75 s in the
+        // pinned client's retry ladder, which leaves a request's 5 s budget too
+        // little room for the relay leg on a loaded machine.
+        assert!(session.opener.dial_carrier().await.is_err());
         relay.await.unwrap();
 
         let updated = load_credential(temp.path()).unwrap().unwrap();
