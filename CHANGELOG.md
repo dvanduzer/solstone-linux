@@ -6,9 +6,11 @@ and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+## [2.0.22] - 2026-10-17
+
 ### Fixed
 
-- the solstone app now takes in the session you're using, the one in front of the screen, for your journal, and follows you when you switch sessions, without a restart. before, it could stay on a session you were no longer using and miss the one you were. when none of your sessions is in front, it takes in nothing until one is.
+- the solstone app now takes in the session you're using, the one in front of the screen, for your journal, and moves to the new session when you switch, without a restart. before, it could stay on a session you were no longer using and miss the one you were. when none of your sessions is in front, it takes in nothing until one is.
 - on X11, if the file that lets apps connect to your screen is removed while you are still logged in, the solstone app keeps taking in your session for your journal.
 - on GNOME, locking your screen or logging out no longer sometimes stops the solstone app and makes it ask again to share your screen.
 
