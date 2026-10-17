@@ -45,6 +45,7 @@ pub mod tray;
 pub mod tray_model;
 pub mod upload;
 pub mod video;
+pub mod window_control;
 
 #[cfg(test)]
 mod docs_policy_tests;

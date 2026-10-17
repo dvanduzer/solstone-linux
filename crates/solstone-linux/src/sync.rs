@@ -121,6 +121,7 @@ pub(crate) enum UploadOutcome {
     Acked,
     Bounded,
     Stop,
+    Stale,
 }
 
 struct LinkFactPersistence {
@@ -171,6 +172,9 @@ pub struct SyncService {
     task: JoinHandle<()>,
     #[allow(dead_code)]
     optional_jobs: Arc<crate::private_link_optional::OptionalJobs>,
+    state_dir: PathBuf,
+    shared_circuit_open_permanent: Arc<AtomicBool>,
+    circuit_unblock_requested: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -222,10 +226,48 @@ impl SyncSampler {
     }
 }
 
+#[derive(Clone)]
 struct SyncControl {
     notify: Arc<Notify>,
     pending_trigger: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
+    circuit_open_permanent: Arc<AtomicBool>,
+    circuit_unblock_requested: Arc<AtomicBool>,
+}
+
+impl SyncControl {
+    pub(crate) fn new(
+        notify: Arc<Notify>,
+        pending_trigger: Arc<AtomicBool>,
+        running: Arc<AtomicBool>,
+        circuit_open_permanent: Arc<AtomicBool>,
+        circuit_unblock_requested: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            notify,
+            pending_trigger,
+            running,
+            circuit_open_permanent,
+            circuit_unblock_requested,
+        }
+    }
+}
+
+#[cfg(test)]
+impl SyncControl {
+    pub(crate) fn test_new(
+        notify: Arc<Notify>,
+        pending_trigger: Arc<AtomicBool>,
+        running: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            notify,
+            pending_trigger,
+            running,
+            circuit_open_permanent: Arc::new(AtomicBool::new(false)),
+            circuit_unblock_requested: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 impl SyncService {
@@ -258,6 +300,8 @@ impl SyncService {
         let notify = Arc::new(Notify::new());
         let pending_trigger = Arc::new(AtomicBool::new(false));
         let running = Arc::new(AtomicBool::new(true));
+        let shared_circuit_open_permanent = Arc::new(AtomicBool::new(false));
+        let circuit_unblock_requested = Arc::new(AtomicBool::new(false));
         let link_facts = client.link_facts();
         let mut facts = load_facts(&config.state_dir());
         facts.in_progress = false;
@@ -295,11 +339,13 @@ impl SyncService {
             config.clone(),
             Arc::clone(&client),
             Arc::clone(&clock),
-            SyncControl {
-                notify: Arc::clone(&notify),
-                pending_trigger: Arc::clone(&pending_trigger),
-                running: Arc::clone(&running),
-            },
+            SyncControl::new(
+                Arc::clone(&notify),
+                Arc::clone(&pending_trigger),
+                Arc::clone(&running),
+                Arc::clone(&shared_circuit_open_permanent),
+                Arc::clone(&circuit_unblock_requested),
+            ),
             Arc::clone(&facts),
             Arc::clone(&recent_error_count),
             browser_custody,
@@ -318,6 +364,9 @@ impl SyncService {
             abort,
             task,
             optional_jobs,
+            state_dir: config.state_dir(),
+            shared_circuit_open_permanent,
+            circuit_unblock_requested,
         }
     }
 
@@ -330,6 +379,16 @@ impl SyncService {
         SyncTrigger {
             notify: Arc::clone(&self.notify),
             pending_trigger: Arc::clone(&self.pending_trigger),
+        }
+    }
+
+    pub(crate) fn reset_handle(&self) -> SyncResetHandle {
+        SyncResetHandle {
+            facts: Arc::clone(&self.facts),
+            link_facts: self.link_facts.clone(),
+            state_dir: self.state_dir.clone(),
+            shared_circuit_open_permanent: Arc::clone(&self.shared_circuit_open_permanent),
+            circuit_unblock_requested: Arc::clone(&self.circuit_unblock_requested),
         }
     }
 
@@ -374,6 +433,59 @@ impl SyncService {
 }
 
 #[derive(Clone)]
+pub(crate) struct SyncResetHandle {
+    facts: Arc<Mutex<SyncFacts>>,
+    link_facts: LinkFacts,
+    state_dir: PathBuf,
+    shared_circuit_open_permanent: Arc<AtomicBool>,
+    circuit_unblock_requested: Arc<AtomicBool>,
+}
+
+impl SyncResetHandle {
+    pub(crate) fn reset_association_blockers(&self) {
+        self.shared_circuit_open_permanent
+            .store(false, Ordering::Release);
+        self.circuit_unblock_requested
+            .store(true, Ordering::Release);
+        self.link_facts.clear_terminal_revocation();
+        {
+            let mut facts = self.facts.lock().unwrap_or_else(|p| p.into_inner());
+            facts.link = Some(self.link_facts.snapshot());
+            facts.last_error_class = None;
+            facts.last_error_code = None;
+            if let Err(error) = crate::sync_health::save_facts(&self.state_dir, &facts) {
+                tracing::warn!(%error, "Failed to persist cleared sync facts during association reset");
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        facts: Arc<Mutex<SyncFacts>>,
+        link_facts: LinkFacts,
+        state_dir: PathBuf,
+    ) -> Self {
+        Self {
+            facts,
+            link_facts,
+            state_dir,
+            shared_circuit_open_permanent: Arc::new(AtomicBool::new(false)),
+            circuit_unblock_requested: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn circuit_unblock_requested(&self) -> &Arc<AtomicBool> {
+        &self.circuit_unblock_requested
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared_circuit_open_permanent(&self) -> &Arc<AtomicBool> {
+        &self.shared_circuit_open_permanent
+    }
+}
+
+#[derive(Clone)]
 pub struct SyncTrigger {
     notify: Arc<Notify>,
     pending_trigger: Arc<AtomicBool>,
@@ -393,6 +505,8 @@ struct SyncWorker {
     notify: Arc<Notify>,
     pending_trigger: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
+    shared_circuit_open_permanent: Arc<AtomicBool>,
+    circuit_unblock_requested: Arc<AtomicBool>,
     facts: Arc<Mutex<SyncFacts>>,
     recent_error_count: Arc<AtomicU8>,
     browser_custody: Option<Arc<Mutex<crate::browser::custody::Custody>>>,
@@ -443,6 +557,8 @@ impl SyncWorker {
             notify: control.notify,
             pending_trigger: control.pending_trigger,
             running: control.running,
+            shared_circuit_open_permanent: control.circuit_open_permanent,
+            circuit_unblock_requested: control.circuit_unblock_requested,
             facts,
             recent_error_count,
             browser_custody,
@@ -467,6 +583,11 @@ impl SyncWorker {
         loop {
             let _ = tokio::time::timeout(Duration::from_secs(60), self.notify.notified()).await;
             let completion_pending = self.pending_trigger.swap(false, Ordering::AcqRel);
+            if self.circuit_unblock_requested.swap(false, Ordering::AcqRel) {
+                self.circuit_open_permanent = false;
+                self.shared_circuit_open_permanent
+                    .store(false, Ordering::Release);
+            }
             if !self.is_running() {
                 // A completion can race shutdown. Give the final local segment one bounded
                 // reconciliation pass before the walker exits. A paired keyless observer uses
@@ -589,6 +710,11 @@ impl SyncWorker {
     }
 
     async fn try_probe(&mut self) -> bool {
+        if self.circuit_unblock_requested.swap(false, Ordering::AcqRel) {
+            self.circuit_open_permanent = false;
+            self.shared_circuit_open_permanent
+                .store(false, Ordering::Release);
+        }
         if self.circuit_open_permanent {
             self.clear_progress();
             return false;
@@ -612,6 +738,8 @@ impl SyncWorker {
                 self.record_contact(true);
                 self.circuit_open = false;
                 self.circuit_open_permanent = false;
+                self.shared_circuit_open_permanent
+                    .store(false, Ordering::Release);
                 self.circuit_open_since = 0.0;
                 self.circuit_cooldown = CIRCUIT_COOLDOWN_INITIAL;
                 self.consecutive_failures = 0;
@@ -746,6 +874,7 @@ impl SyncWorker {
                         pass_error_code = self.last_error_code;
                         break 'phase1;
                     }
+                    UploadOutcome::Stale => {}
                 }
             }
         }
@@ -886,6 +1015,7 @@ impl SyncWorker {
                                             pass_error_code = self.last_error_code;
                                             break;
                                         }
+                                        UploadOutcome::Stale => {}
                                     }
                                 }
                             }
@@ -1021,6 +1151,7 @@ impl SyncWorker {
                                     pass_error_code = self.last_error_code;
                                     break;
                                 }
+                                UploadOutcome::Stale => {}
                             }
                         }
                     }
@@ -1128,6 +1259,9 @@ impl SyncWorker {
             .await;
         if !result.success && result.stale_capability {
             return UploadOutcome::Stop;
+        }
+        if result.success && result.stale_capability {
+            return UploadOutcome::Stale;
         }
 
         if result.success {
@@ -1451,7 +1585,12 @@ impl SyncWorker {
             .store(self.consecutive_failures.min(99) as u8, Ordering::Release);
         if self.consecutive_failures >= self.circuit_threshold() {
             self.circuit_open = true;
-            self.circuit_open_permanent = error_type == ErrorType::Auth && self.client.is_revoked();
+            let is_perm = error_type == ErrorType::Auth && self.client.is_revoked();
+            self.circuit_open_permanent = is_perm;
+            if is_perm {
+                self.shared_circuit_open_permanent
+                    .store(true, Ordering::Release);
+            }
             self.circuit_open_since = self.clock.monotonic_seconds();
             self.circuit_cooldown = CIRCUIT_COOLDOWN_INITIAL;
         }
@@ -2076,11 +2215,11 @@ pub(crate) async fn cleanup_synced_day_for_composition(
         config,
         client,
         clock,
-        SyncControl {
-            notify: Arc::new(Notify::new()),
-            pending_trigger: Arc::new(AtomicBool::new(false)),
-            running: Arc::new(AtomicBool::new(true)),
-        },
+        SyncControl::test_new(
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+        ),
         Arc::clone(&facts),
         Arc::new(AtomicU8::new(0)),
         None,
@@ -2428,11 +2567,11 @@ mod tests {
             config,
             client,
             clock,
-            SyncControl {
-                notify: Arc::new(Notify::new()),
-                pending_trigger: Arc::new(AtomicBool::new(false)),
-                running: Arc::new(AtomicBool::new(true)),
-            },
+            SyncControl::test_new(
+                Arc::new(Notify::new()),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+            ),
             Arc::new(Mutex::new(SyncFacts::default())),
             Arc::new(AtomicU8::new(0)),
             None,
@@ -4497,11 +4636,11 @@ mod tests {
             config,
             client,
             clock,
-            SyncControl {
-                notify: Arc::new(Notify::new()),
-                pending_trigger: Arc::new(AtomicBool::new(false)),
-                running: Arc::new(AtomicBool::new(true)),
-            },
+            SyncControl::test_new(
+                Arc::new(Notify::new()),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+            ),
             Arc::new(Mutex::new(SyncFacts::default())),
             Arc::new(AtomicU8::new(0)),
             None,
@@ -5252,11 +5391,11 @@ mod tests {
                 wall: 1_800_000_000.0,
                 mono: 0.0,
             }),
-            SyncControl {
-                notify: notify.clone(),
-                pending_trigger: Arc::new(AtomicBool::new(false)),
-                running: running.clone(),
-            },
+            SyncControl::test_new(
+                notify.clone(),
+                Arc::new(AtomicBool::new(false)),
+                running.clone(),
+            ),
             Arc::new(Mutex::new(SyncFacts::default())),
             Arc::new(AtomicU8::new(0)),
             None,
@@ -7231,11 +7370,11 @@ mod tests {
         assert_eq!(fs::read(&pages).unwrap(), original_bytes);
         clock.set_wall(at(16).timestamp() as f64);
 
-        let control = SyncControl {
-            notify: Arc::new(Notify::new()),
-            pending_trigger: Arc::new(AtomicBool::new(false)),
-            running: Arc::new(AtomicBool::new(true)),
-        };
+        let control = SyncControl::test_new(
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+        );
         let mut worker = SyncWorker::new(
             config.clone(),
             Arc::clone(&upload),
@@ -7397,10 +7536,6 @@ mod tests {
         )
         .await
         .unwrap();
-        let captured_writer = session_a.capability().writer();
-        let captured_identity = captured_writer.identity_key().to_owned();
-        let captured_pairing = captured_writer.pairing_id().to_owned();
-
         let segment = browser_period(&temp);
         let pages = segment.join(crate::browser::PAGES_FILENAME);
         let bytes = fs::read(&pages).unwrap();
@@ -7439,11 +7574,11 @@ mod tests {
             config,
             Arc::clone(&client),
             clock,
-            SyncControl {
-                notify: Arc::new(Notify::new()),
-                pending_trigger: Arc::new(AtomicBool::new(false)),
-                running: Arc::new(AtomicBool::new(true)),
-            },
+            SyncControl::test_new(
+                Arc::new(Notify::new()),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+            ),
             Arc::new(Mutex::new(SyncFacts::default())),
             Arc::new(AtomicU8::new(0)),
             Some(Arc::clone(&custody)),
@@ -7457,19 +7592,11 @@ mod tests {
         client.install_capability(session_b.capability());
         gate.notify_one();
 
-        assert_eq!(upload.await.unwrap(), UploadOutcome::Acked);
+        assert_eq!(upload.await.unwrap(), UploadOutcome::Stale);
         assert!(!client.is_revoked());
         assert!(segment.exists());
         assert_eq!(fs::read(&pages).unwrap(), bytes);
-        let ack = read_ack(&segment).unwrap();
-        assert_eq!(ack.identity_key, captured_identity);
-        assert_eq!(ack.pairing_id, captured_pairing);
-        custody
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .evidence_fault = None;
-        remove_confirmed_segment(&segment, Some(&custody)).unwrap();
-        assert!(!segment.exists());
+        assert!(read_ack(&segment).is_none());
         assert!(peer_b.requests().is_empty());
         session_a.shutdown().await.unwrap();
         session_b.shutdown().await.unwrap();
@@ -7555,11 +7682,11 @@ mod tests {
             config.clone(),
             Arc::clone(&client),
             clock.clone(),
-            SyncControl {
-                notify: Arc::new(Notify::new()),
-                pending_trigger: Arc::new(AtomicBool::new(false)),
-                running: Arc::new(AtomicBool::new(true)),
-            },
+            SyncControl::test_new(
+                Arc::new(Notify::new()),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+            ),
             Arc::new(Mutex::new(SyncFacts::default())),
             Arc::new(AtomicU8::new(0)),
             Some(Arc::clone(&custody)),
@@ -7642,11 +7769,11 @@ mod tests {
             config.clone(),
             success_client,
             clock.clone(),
-            SyncControl {
-                notify: Arc::new(Notify::new()),
-                pending_trigger: Arc::new(AtomicBool::new(false)),
-                running: Arc::new(AtomicBool::new(true)),
-            },
+            SyncControl::test_new(
+                Arc::new(Notify::new()),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+            ),
             Arc::new(Mutex::new(SyncFacts::default())),
             Arc::new(AtomicU8::new(0)),
             Some(Arc::clone(&custody)),
@@ -7721,11 +7848,11 @@ mod tests {
                 wall: 0.0,
                 mono: 0.0,
             }),
-            SyncControl {
-                notify: Arc::new(Notify::new()),
-                pending_trigger: Arc::new(AtomicBool::new(false)),
-                running: Arc::new(AtomicBool::new(true)),
-            },
+            SyncControl::test_new(
+                Arc::new(Notify::new()),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+            ),
             Arc::new(Mutex::new(SyncFacts::default())),
             Arc::new(AtomicU8::new(0)),
             Some(Arc::clone(&abort_custody)),

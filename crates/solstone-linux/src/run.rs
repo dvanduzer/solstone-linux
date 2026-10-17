@@ -316,27 +316,6 @@ fn run_capture(
     let sync_trigger = sync.trigger_handle();
     let sync_sampler = sync.sampler_handle();
     sync.trigger();
-    let linked_shutdown_notify = Arc::new(tokio::sync::Notify::new());
-    let linked_start = if process_epoch.is_some() {
-        let shutdown_notify = Arc::clone(&linked_shutdown_notify);
-        let on_confirmed = Some(sync_trigger.clone());
-        runtime.spawn(start_linked_owner(
-            linked_upload,
-            linked_root,
-            linked_stream,
-            linked_state_lock,
-            transport_enabled,
-            open_journal.clone(),
-            shutdown_notify,
-            on_confirmed,
-        ))
-    } else {
-        runtime.spawn(async {
-            Err::<crate::private_link::PrivateLinkOwner, _>(
-                crate::private_link::PrivateStateError::BridgeUnavailable,
-            )
-        })
-    };
     // Read before anything subscribes to state: the browser host and the panel
     // must see a held pause from the first snapshot, not after initialization.
     let starting_pause = crate::pause_hold::StartingPause::read(
@@ -357,6 +336,43 @@ fn run_capture(
     };
     let snapshot = Arc::new(Mutex::new(initial_snapshot.clone()));
     let (states, tray_receiver) = WatchStateSink::channel(initial_snapshot);
+    let (initial_health, initial_progress) = sync_sampler.sample();
+    let health = Arc::new(Mutex::new(initial_health));
+    let progress = Arc::new(Mutex::new(initial_progress));
+    let linked_shutdown_notify = Arc::new(tokio::sync::Notify::new());
+    let (linked_start, window_control) = if process_epoch.is_some() {
+        let shutdown_notify = Arc::clone(&linked_shutdown_notify);
+        let on_confirmed = Some(sync_trigger.clone());
+        let (supervisor, handler) = crate::window_control::WindowControlSupervisor::new(
+            linked_state_lock,
+            linked_upload,
+            crate::config::ConfigPaths {
+                config_dir: Some(linked_root.clone()),
+                ..Default::default()
+            },
+            linked_stream,
+            transport_enabled,
+            open_journal.clone(),
+            shutdown_notify,
+            on_confirmed,
+            sync.reset_handle(),
+            Arc::new(crate::window_control::SystemCeremonyClock),
+            crate::cli::hostname().unwrap_or_else(|_| "linux".into()),
+            Arc::new(crate::window_control::ProductionOwnerStarter),
+            Arc::new(crate::private_link::SplPairer),
+            Arc::new(crate::private_file::NoWriteFault),
+            Arc::clone(&health),
+            Arc::clone(&snapshot),
+        );
+        (runtime.spawn(supervisor.run()), handler)
+    } else {
+        (
+            runtime.spawn(async {
+                Err::<(), _>(crate::private_link::PrivateStateError::BridgeUnavailable)
+            }),
+            crate::window_control::WindowControlHandler::default(),
+        )
+    };
     let browser = if crate::browser::ENABLED {
         browser_custody.clone().and_then(|custody| {
             start_browser(
@@ -370,9 +386,6 @@ fn run_capture(
         None
     };
     let signal_receiver = tray_receiver.clone();
-    let (initial_health, initial_progress) = sync_sampler.sample();
-    let health = Arc::new(Mutex::new(initial_health));
-    let progress = Arc::new(Mutex::new(initial_progress));
     let (command_sender, command_receiver) = std::sync::mpsc::channel();
     let commands = CommandSender::new(command_sender.clone());
     let _command_lifetime_sender = command_sender;
@@ -423,6 +436,7 @@ fn run_capture(
             sampler: sync_sampler,
             commands,
             open_journal: open_journal.clone(),
+            window_control,
         },
     );
     if initialized && run_result.is_ok() {
@@ -482,10 +496,7 @@ fn run_capture(
         sync.shutdown(SHUTDOWN_TIMEOUT),
         (linked_start, |linked_start| async move {
             match linked_start {
-                Ok(Ok(owner)) => owner
-                    .shutdown()
-                    .await
-                    .map_err(|error| ObserverError::Io(format!("linked shutdown failed: {error}"))),
+                Ok(Ok(())) => Ok(()),
                 Ok(Err(error)) => {
                     tracing::warn!(%error, "Linked transport remained unavailable");
                     Ok(())
@@ -585,6 +596,7 @@ fn start_browser(
     }
 }
 
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_linked_owner(
     upload: Arc<UploadClient>,

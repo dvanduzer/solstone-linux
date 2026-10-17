@@ -346,6 +346,7 @@ enum ConfigOverlay<'a> {
     /// in-memory config that may be older than a hand edit, so it must never write its
     /// whole settings snapshot back over the file.
     PanelIconOffer(bool),
+    GuidedField(&'a str, Value),
     Sanitize,
 }
 
@@ -450,6 +451,8 @@ fn write_config_merge(
         true
     };
 
+    let is_guided_field = matches!(overlay, ConfigOverlay::GuidedField(..));
+
     match overlay {
         ConfigOverlay::Settings(snapshot) => {
             capture_framerate = snapshot.capture_framerate.clamp(1, 10);
@@ -470,6 +473,52 @@ fn write_config_merge(
         ConfigOverlay::PanelIconOffer(value) => {
             panel_icon_offer = value;
         }
+        ConfigOverlay::GuidedField(key, value) => {
+            let normalized = match key {
+                "capture_framerate" => {
+                    let n = value.as_i64().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "invalid capture_framerate")
+                    })?;
+                    let clamped = n.clamp(1, 10);
+                    capture_framerate = clamped;
+                    Value::Number(clamped.into())
+                }
+                "draw_cursor" => {
+                    let b = value.as_bool().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "invalid draw_cursor")
+                    })?;
+                    draw_cursor = b;
+                    Value::Bool(b)
+                }
+                "start_paused" => {
+                    let b = value.as_bool().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "invalid start_paused")
+                    })?;
+                    start_paused = b;
+                    Value::Bool(b)
+                }
+                "segment_interval" => {
+                    let n = value.as_i64().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "invalid segment_interval")
+                    })?;
+                    if n <= 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "segment_interval must be positive",
+                        ));
+                    }
+                    segment_interval = n;
+                    Value::Number(n.into())
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "unknown guided field",
+                    ));
+                }
+            };
+            map.insert(key.to_owned(), normalized);
+        }
         ConfigOverlay::Sanitize => {}
     }
 
@@ -487,7 +536,9 @@ fn write_config_merge(
         config_dir: resolved.config_dir.clone(),
     };
 
-    let mut bytes = if merge_basis.is_none() {
+    let mut bytes = if is_guided_field {
+        serde_json::to_vec_pretty(&map).map_err(io::Error::other)?
+    } else if merge_basis.is_none() {
         serde_json::to_vec_pretty(&returned_config).map_err(io::Error::other)?
     } else {
         map.insert("stream".into(), Value::String(stream));
@@ -608,6 +659,19 @@ pub fn panel_icon_offer_enabled(paths: &ConfigPaths) -> bool {
 /// unmodelled or hand-added -- exactly as the file has it.
 pub fn set_panel_icon_offer(paths: &ConfigPaths, value: bool) -> io::Result<Config> {
     write_config_merge(paths, ConfigOverlay::PanelIconOffer(value), &NoWriteFault)
+}
+
+pub(crate) fn set_guided_field(paths: &ConfigPaths, key: &str, value: Value) -> io::Result<Config> {
+    set_guided_field_with_fault(paths, key, value, &NoWriteFault)
+}
+
+pub(crate) fn set_guided_field_with_fault(
+    paths: &ConfigPaths,
+    key: &str,
+    value: Value,
+    fault: &dyn DurableWriteFault,
+) -> io::Result<Config> {
+    write_config_merge(paths, ConfigOverlay::GuidedField(key, value), fault)
 }
 
 fn migrate(config: &Config) -> io::Result<()> {

@@ -259,11 +259,20 @@ pub(crate) fn journal_mark_held_on_disk(config_root: &Path) -> bool {
 }
 
 pub(crate) fn grandfather_answer_file(config_root: &Path) -> Result<(), PrivateStateError> {
-    grandfather_answer_file_with_fault(config_root, &NoWriteFault)
+    grandfather_answer_file_with_fault(config_root, None, &NoWriteFault)
+}
+
+#[allow(dead_code)]
+pub(crate) fn grandfather_answer_file_with_candidate(
+    config_root: &Path,
+    candidate_pairing_id: Option<&str>,
+) -> Result<(), PrivateStateError> {
+    grandfather_answer_file_with_fault(config_root, candidate_pairing_id, &NoWriteFault)
 }
 
 pub(crate) fn grandfather_answer_file_with_fault(
     config_root: &Path,
+    candidate_pairing_id: Option<&str>,
     fault: &dyn DurableWriteFault,
 ) -> Result<(), PrivateStateError> {
     let path = config_root.join(PAIRING_ANSWER_FILENAME);
@@ -277,7 +286,11 @@ pub(crate) fn grandfather_answer_file_with_fault(
             match cred {
                 Some(cred) => {
                     let id = compute_pairing_id(&cred.client_cert_pem);
-                    write_pairing_answer_with_fault(config_root, &id, fault)
+                    if candidate_pairing_id == Some(id.as_str()) {
+                        write_pairing_answer_with_fault(config_root, "", fault)
+                    } else {
+                        write_pairing_answer_with_fault(config_root, &id, fault)
+                    }
                 }
                 None => write_pairing_answer_with_fault(config_root, "", fault),
             }
@@ -669,6 +682,34 @@ mod tests {
             Some(PairingAnswer {
                 confirmed: "custom".into()
             })
+        );
+    }
+
+    #[test]
+    fn grandfather_candidate_trap_prevents_confirmation() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("cfg");
+        fs::create_dir_all(&root).unwrap();
+
+        let cred = sample_credential("01234567-89ab-cdef-0123-456789abcdef", "cand-pem");
+        crate::private_link::persist_credential(&root, &cred).unwrap();
+        let cand_id = compute_pairing_id(&cred.client_cert_pem);
+
+        // When candidate matches on-disk cred without answer file -> trap writes empty answer
+        grandfather_answer_file_with_candidate(&root, Some(&cand_id)).unwrap();
+        assert_eq!(
+            read_pairing_answer(&root).unwrap(),
+            Some(PairingAnswer {
+                confirmed: "".into()
+            })
+        );
+
+        // If a different candidate is passed -> normal grandfathering writes on-disk cred id
+        let _ = fs::remove_file(root.join(PAIRING_ANSWER_FILENAME));
+        grandfather_answer_file_with_candidate(&root, Some("different-id")).unwrap();
+        assert_eq!(
+            read_pairing_answer(&root).unwrap(),
+            Some(PairingAnswer { confirmed: cand_id })
         );
     }
 
@@ -1422,7 +1463,7 @@ mod tests {
         let cred = sample_credential("01234567-89ab-cdef-0123-456789abcdef", "cert-pem");
         crate::private_link::persist_credential(&root, &cred).unwrap();
 
-        let res = grandfather_answer_file_with_fault(&root, &FailingFault);
+        let res = grandfather_answer_file_with_fault(&root, None, &FailingFault);
         assert!(res.is_err());
         assert!(!root.join(PAIRING_ANSWER_FILENAME).exists());
     }

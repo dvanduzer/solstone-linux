@@ -804,6 +804,30 @@ pub(crate) async fn setup_with_stream<R: Read>(
     .await
 }
 
+pub(crate) async fn pair_and_admit(
+    pairer: &dyn Pairer,
+    link: &str,
+    device_label: &str,
+) -> Result<Credential, PrivateStateError> {
+    let relay_pair_link =
+        match pairlink::parse(link).map_err(|_| PrivateStateError::PairInputInvalid)? {
+            ParsedPairLink::Relay(relay_link) => Some(relay_link),
+            ParsedPairLink::Direct(_) => None,
+        };
+    let pairing_identity = pairing_ceremony_identity(device_label);
+    let mut credential = pairer.pair(link, device_label, &pairing_identity).await?;
+    if let Some(relay_link) = relay_pair_link {
+        if credential.relay_origin.as_deref() != Some(relay_link.relay_origin.as_str()) {
+            return Err(PrivateStateError::PairingFailed);
+        }
+        credential.endpoints.clear();
+        credential.local_endpoints = None;
+        TransportClient::new_relay_only(credential.clone(), None)
+            .map_err(|_| PrivateStateError::PairingFailed)?;
+    }
+    Ok(credential)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn setup_with_pairer_and_stream_with_fault<R: Read>(
     pairer: &dyn Pairer,
@@ -835,27 +859,11 @@ pub(crate) async fn setup_with_pairer_and_stream_with_fault<R: Read>(
     {
         let _answer_lock = crate::journal_mark::AnswerLock::acquire(state_lock.root()).await?;
         let fault = grandfather_write_fault.unwrap_or(&NoWriteFault);
-        crate::journal_mark::grandfather_answer_file_with_fault(state_lock.root(), fault)?;
+        crate::journal_mark::grandfather_answer_file_with_fault(state_lock.root(), None, fault)?;
     }
 
     let link = read_pair_link(input)?;
-    let relay_pair_link =
-        match pairlink::parse(&link).map_err(|_| PrivateStateError::PairInputInvalid)? {
-            ParsedPairLink::Relay(relay_link) => Some(relay_link),
-            ParsedPairLink::Direct(_) => None,
-        };
-    let pairing_identity = pairing_ceremony_identity(device_label);
-    let mut credential = pairer.pair(&link, device_label, &pairing_identity).await?;
-    if let Some(relay_link) = relay_pair_link {
-        if credential.relay_origin.as_deref() != Some(relay_link.relay_origin.as_str()) {
-            return Err(PrivateStateError::PairingFailed);
-        }
-        credential.endpoints.clear();
-        credential.local_endpoints = None;
-        TransportClient::new_relay_only(credential.clone(), None)
-            .map_err(|_| PrivateStateError::PairingFailed)?;
-    }
-
+    let credential = pair_and_admit(pairer, &link, device_label).await?;
     let new_pairing_id = compute_pairing_id(&credential.client_cert_pem);
 
     if let Some(ref mark_words) = parsed_mark {
@@ -1315,6 +1323,16 @@ impl LinkFacts {
         self.persist();
     }
 
+    pub(crate) fn clear_terminal_revocation(&self) {
+        let mut state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
+        if !state.terminal_revocation {
+            return;
+        }
+        state.terminal_revocation = false;
+        drop(state);
+        self.persist();
+    }
+
     pub(crate) fn note_unknown_journals(&self, unknown: Vec<spl_transport::UnknownJournal>) {
         let mut state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
         if state.unknown_journals == unknown {
@@ -1693,13 +1711,36 @@ pub(crate) struct PrivateLinkSession {
     _state_lock: Arc<PrivateStateLock>,
 }
 
-enum OpenJournalGate {
+#[derive(Clone)]
+pub(crate) enum OpenJournalGate {
     Open(String),
     Closed,
 }
 
-struct OpenJournalTarget {
-    gate: Mutex<OpenJournalGate>,
+pub(crate) struct OpenJournalTarget {
+    pub(crate) gate: Mutex<OpenJournalGate>,
+}
+
+#[cfg(test)]
+impl OpenJournalTarget {
+    pub(crate) fn close(&self) {
+        if let Ok(mut gate) = self.gate.lock() {
+            *gate = OpenJournalGate::Closed;
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn open_journal_fixture(
+    target: &str,
+) -> (Arc<OpenJournalTarget>, OpenJournalCapability) {
+    let target = Arc::new(OpenJournalTarget {
+        gate: Mutex::new(OpenJournalGate::Open(target.to_owned())),
+    });
+    let capability = OpenJournalCapability {
+        target: Arc::downgrade(&target),
+    };
+    (target, capability)
 }
 
 #[derive(Clone)]
@@ -1743,7 +1784,7 @@ impl OpenJournalCapability {
         }
     }
 
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn open_with(&self, opener: impl FnOnce(&str) -> Result<(), ()>) -> Result<(), ()> {
         self.open_inner(opener)
     }
@@ -1776,6 +1817,12 @@ impl OpenJournalAccess {
     pub(crate) fn open(&self) -> Result<(), ()> {
         let capability = self.current.lock().map_err(|_| ())?.clone().ok_or(())?;
         capability.open()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn open_with(&self, opener: impl FnOnce(&str) -> Result<(), ()>) -> Result<(), ()> {
+        let capability = self.current.lock().map_err(|_| ())?.clone().ok_or(())?;
+        capability.open_with(opener)
     }
 
     pub(crate) fn install(&self, capability: OpenJournalCapability) {
@@ -2241,12 +2288,17 @@ impl PrivateLinkOwner {
         self.capability.clone()
     }
 
+    pub(crate) fn fence_writer(&self) {
+        self.capability.inner.writer.fence_shutdown();
+    }
+
     pub(crate) fn open_journal_capability(&self) -> OpenJournalCapability {
         OpenJournalCapability {
             target: Arc::downgrade(&self.open_journal_target),
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn install_open_journal_access(&mut self, access: OpenJournalAccess) {
         let capability = self.open_journal_capability();
         access.install(capability);
@@ -2572,8 +2624,14 @@ impl OrderedCredentialWriter {
         updated.device_token = Some(token.to_owned());
         updated.device_token_expires_at = Some(expires_at);
         let cred_path = self.config_root.join(CREDENTIALS_FILENAME);
-        let durable = serde_json::to_vec(&updated).ok().is_some_and(|bytes| {
-            atomic_write_bytes_with_fault(&cred_path, &bytes, self.fault.as_ref()).is_ok()
+        let bytes = serde_json::to_vec(&updated).ok();
+        let durable = bytes.is_some_and(|bytes| {
+            atomic_write_bytes_guarded(&cred_path, &bytes, self.fault.as_ref(), &|| {
+                !self.shutdown_fenced.load(Ordering::Acquire)
+                    && self.pairing_id == hook_pairing_id
+                    && self.live_hook_epoch.load(Ordering::Acquire) == hook_epoch
+            })
+            .is_ok()
         });
         if durable {
             *current = updated;
@@ -5654,16 +5712,6 @@ pub(crate) mod tests {
         facts.owner_lost();
         let after_loss = facts.owner_epoch();
         assert_ne!(after_loss, after_begin);
-    }
-
-    fn open_journal_fixture(target: &str) -> (Arc<OpenJournalTarget>, OpenJournalCapability) {
-        let target = Arc::new(OpenJournalTarget {
-            gate: Mutex::new(OpenJournalGate::Open(target.to_owned())),
-        });
-        let capability = OpenJournalCapability {
-            target: Arc::downgrade(&target),
-        };
-        (target, capability)
     }
 
     #[test]
