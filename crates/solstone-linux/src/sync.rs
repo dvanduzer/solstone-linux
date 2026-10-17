@@ -7933,6 +7933,7 @@ mod tests {
             clock.clone(),
         ));
         worker.client = Arc::clone(&cancel_client);
+        worker.refresh_association();
         assert!(
             cancelled_segment
                 .join(crate::browser::PAGES_FILENAME)
