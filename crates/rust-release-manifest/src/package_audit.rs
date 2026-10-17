@@ -24,6 +24,8 @@ use xz2::read::XzDecoder;
 const MAX_MEMBER_BYTES: u64 = 256 * 1024 * 1024;
 const INSTALL_NOTES: &[u8] = include_bytes!("../../../packaging/INSTALL-NOTES");
 const RUST_DEPENDENCY_NOTICES: &[u8] = include_bytes!("../../../RUST_DEPENDENCY_NOTICES.txt");
+const DESKTOP_ENTRY: &[u8] =
+    include_bytes!("../../../packaging/org.solpbc.solstone.Window.desktop");
 pub(crate) const DEB_COPYRIGHT: &[u8] = concat!(
     "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\n",
     "Upstream-Name: solstone-linux\n",
@@ -57,6 +59,8 @@ const EXPECTED_NEEDED: [&str; 8] = [
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PayloadRole {
     Executable,
+    WindowExecutable,
+    DesktopEntry,
     License,
     InstallNotes,
     DependencyNotices,
@@ -71,12 +75,24 @@ pub(crate) struct PayloadAuthority {
     pub(crate) role: PayloadRole,
 }
 
-pub(crate) const PAYLOAD_AUTHORITY: [PayloadAuthority; 19] = [
+pub(crate) const PAYLOAD_AUTHORITY: [PayloadAuthority; 21] = [
     PayloadAuthority {
         source: "target/release/solstone-linux",
         installed: "/usr/bin/solstone-linux",
         mode: 0o755,
         role: PayloadRole::Executable,
+    },
+    PayloadAuthority {
+        source: "target/release/solstone-linux-window",
+        installed: "/usr/bin/solstone-linux-window",
+        mode: 0o755,
+        role: PayloadRole::WindowExecutable,
+    },
+    PayloadAuthority {
+        source: "packaging/org.solpbc.solstone.Window.desktop",
+        installed: "/usr/share/applications/org.solpbc.solstone.Window.desktop",
+        mode: 0o644,
+        role: PayloadRole::DesktopEntry,
     },
     PayloadAuthority {
         source: "LICENSE",
@@ -788,6 +804,10 @@ fn expected_path(format: Format, authority: PayloadAuthority) -> String {
         Format::Deb | Format::Rpm => authority.installed.trim_start_matches('/').to_owned(),
         Format::Tar => match authority.role {
             PayloadRole::Executable => "bin/solstone-linux".to_owned(),
+            PayloadRole::WindowExecutable => "bin/solstone-linux-window".to_owned(),
+            PayloadRole::DesktopEntry => {
+                "share/applications/org.solpbc.solstone.Window.desktop".to_owned()
+            }
             PayloadRole::License => "LICENSE".to_owned(),
             PayloadRole::InstallNotes => "INSTALL-NOTES".to_owned(),
             PayloadRole::DependencyNotices => "RUST_DEPENDENCY_NOTICES.txt".to_owned(),
@@ -842,7 +862,11 @@ fn inspect_payload(
         let member = by_path
             .remove(&expected)
             .ok_or_else(|| audit_error(path, "PayloadClosure", "missing", &expected))?;
-        if authority.role != PayloadRole::Executable && member.mode & 0o111 != 0 {
+        if !matches!(
+            authority.role,
+            PayloadRole::Executable | PayloadRole::WindowExecutable
+        ) && member.mode & 0o111 != 0
+        {
             return Err(audit_error(
                 path,
                 "ExtraExecutable",
@@ -860,6 +884,21 @@ fn inspect_payload(
         }
         match authority.role {
             PayloadRole::Executable => executable = Some(member.bytes),
+            PayloadRole::WindowExecutable => {
+                inspect_window_elf(path, &member.bytes)?;
+                nonbinary.insert(authority.source.to_owned(), digest(&member.bytes));
+            }
+            PayloadRole::DesktopEntry => {
+                if member.bytes != DESKTOP_ENTRY {
+                    return Err(audit_error(
+                        path,
+                        "DivergentPayload",
+                        "desktop-entry",
+                        &expected,
+                    ));
+                }
+                nonbinary.insert(authority.source.to_owned(), digest(&member.bytes));
+            }
             PayloadRole::DependencyNotices => {
                 if member.bytes != RUST_DEPENDENCY_NOTICES {
                     return Err(audit_error(path, "DivergentPayload", "notices", &expected));
@@ -953,6 +992,35 @@ fn inspect_elf(path: &Path, bytes: &[u8]) -> Result<Elf64Linkage> {
         ));
     }
     Ok(parsed)
+}
+
+fn inspect_window_elf(path: &Path, bytes: &[u8]) -> Result<()> {
+    let member = "/usr/bin/solstone-linux-window";
+    let parsed = parse_elf64(bytes)
+        .map_err(|error| audit_error(path, "MalformedElf", &error.to_string(), member))?;
+    if parsed.elf_type != EXPECTED_ELF_TYPE
+        || parsed.machine != EXPECTED_MACHINE
+        || parsed.interpreter != EXPECTED_INTERPRETER
+        || !parsed
+            .needed
+            .iter()
+            .any(|library| library == "libgtk-4.so.1")
+        || parsed
+            .needed
+            .iter()
+            .any(|library| library.contains("webkit") || library.starts_with("libgtk-3"))
+        || parsed.soname.is_some()
+        || parsed.rpath.is_some()
+        || parsed.runpath.is_some()
+    {
+        return Err(audit_error(
+            path,
+            "UnexpectedImport",
+            &format!("{parsed:?}"),
+            member,
+        ));
+    }
+    Ok(())
 }
 
 pub fn audit_packages(
@@ -1067,6 +1135,8 @@ mod tests {
             .map(|authority| {
                 let bytes = match authority.role {
                     PayloadRole::Executable => crate::elf64::pinned_elf64_for_test(),
+                    PayloadRole::WindowExecutable => crate::elf64::window_elf64_for_test(),
+                    PayloadRole::DesktopEntry => DESKTOP_ENTRY.to_vec(),
                     PayloadRole::InstallNotes => INSTALL_NOTES.to_vec(),
                     PayloadRole::License => b"license\n".to_vec(),
                     PayloadRole::DependencyNotices => RUST_DEPENDENCY_NOTICES.to_vec(),

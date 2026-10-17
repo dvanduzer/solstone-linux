@@ -68,6 +68,9 @@ fn committed_asset_set() -> BTreeSet<PathBuf> {
     let mut paths = BTreeSet::from([
         root.join("LICENSE").canonicalize().unwrap(),
         root.join("packaging/INSTALL-NOTES").canonicalize().unwrap(),
+        root.join("packaging/org.solpbc.solstone.Window.desktop")
+            .canonicalize()
+            .unwrap(),
         root.join("RUST_DEPENDENCY_NOTICES.txt")
             .canonicalize()
             .unwrap(),
@@ -117,7 +120,7 @@ fn package_metadata_and_resolved_licenses() {
             Value::String("0".into())
         ]
     );
-    assert_eq!(deb["depends"].as_str(), Some("$auto"));
+    assert!(deb["depends"].as_str().unwrap().contains("$auto"));
 
     let rpm = &member["package"]["metadata"]["generate-rpm"];
     assert_eq!(rpm["license"].as_str(), Some("AGPL-3.0-only"));
@@ -184,14 +187,14 @@ fn package_assets_exist_and_match() {
     let expected = committed_asset_set();
     assert_eq!(
         expected.len(),
-        18,
-        "LICENSE + INSTALL-NOTES + RUST_DEPENDENCY_NOTICES.txt + 15 icons"
+        19,
+        "LICENSE + INSTALL-NOTES + RUST_DEPENDENCY_NOTICES.txt + launcher + 15 icons"
     );
 
     let deb = deb_assets(&member);
     let rpm = rpm_assets(&member);
-    assert_eq!(deb.len(), 19);
-    assert_eq!(rpm.len(), 19);
+    assert_eq!(deb.len(), 21);
+    assert_eq!(rpm.len(), 21);
     assert_eq!(deb[0].0, "target/release/solstone-linux");
     assert_eq!(rpm[0].0, "target/release/solstone-linux");
     assert_eq!(deb[0].2, "755");
@@ -199,12 +202,12 @@ fn package_assets_exist_and_match() {
 
     let deb_paths = deb
         .iter()
-        .skip(1)
+        .skip(2)
         .map(|(source, _, _)| manifest_dir().join(source).canonicalize().unwrap())
         .collect::<BTreeSet<_>>();
     let rpm_paths = rpm
         .iter()
-        .skip(1)
+        .skip(2)
         .map(|(source, _, _)| workspace_root().join(source).canonicalize().unwrap())
         .collect::<BTreeSet<_>>();
     assert_eq!(deb_paths, expected);
@@ -212,7 +215,6 @@ fn package_assets_exist_and_match() {
 
     for (_, destination, mode) in deb.iter().chain(rpm.iter()) {
         assert!(!destination.ends_with(".service"));
-        assert!(!destination.ends_with(".desktop"));
         assert!(mode == "644" || mode == "755");
     }
     assert!(
@@ -230,8 +232,8 @@ fn debian_sealing_enumerates_every_installed_payload() {
     let (_, member) = metadata();
     let payload_count = deb_assets(&member).len() + 1;
     assert_eq!(
-        payload_count, 20,
-        "19 declared assets + generated copyright"
+        payload_count, 22,
+        "21 declared assets + generated copyright"
     );
 
     let containerfile =
@@ -253,6 +255,21 @@ fn copy_tree(source: &Path, destination: &Path) {
     }
 }
 
+fn add_window_payload(root: &Path) {
+    fs::write(root.join("bin/solstone-linux-window"), b"fixture-window\n").unwrap();
+    fs::set_permissions(
+        root.join("bin/solstone-linux-window"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("share/applications")).unwrap();
+    fs::copy(
+        workspace_root().join("packaging/org.solpbc.solstone.Window.desktop"),
+        root.join("share/applications/org.solpbc.solstone.Window.desktop"),
+    )
+    .unwrap();
+}
+
 fn release_fixture(temp: &Path) -> PathBuf {
     let root_name = format!("solstone-linux-{VERSION}-linux-x86_64");
     let root = temp.join(&root_name);
@@ -263,6 +280,7 @@ fn release_fixture(temp: &Path) -> PathBuf {
         fs::Permissions::from_mode(0o755),
     )
     .unwrap();
+    add_window_payload(&root);
     fs::copy(workspace_root().join("LICENSE"), root.join("LICENSE")).unwrap();
     fs::copy(
         workspace_root().join("packaging/INSTALL-NOTES"),
@@ -538,6 +556,7 @@ fn installer_rejects_archive_missing_dependency_notices() {
         fs::Permissions::from_mode(0o755),
     )
     .unwrap();
+    add_window_payload(&root);
     fs::copy(workspace_root().join("LICENSE"), root.join("LICENSE")).unwrap();
     fs::copy(
         workspace_root().join("packaging/INSTALL-NOTES"),

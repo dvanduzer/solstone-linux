@@ -524,6 +524,17 @@ pub(crate) fn pinned_elf64_for_test() -> Vec<u8> {
 }
 
 #[cfg(test)]
+pub(crate) fn window_elf64_for_test() -> Vec<u8> {
+    linkage_elf64_for_test(
+        "/lib64/ld-linux-x86-64.so.2",
+        &["libgtk-4.so.1", "libc.so.6"],
+        None,
+        None,
+        None,
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn linkage_elf64_for_test(
     interpreter_value: &str,
     libraries: &[&str],

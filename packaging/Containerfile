@@ -32,7 +32,7 @@ RUN rustc --version --verbose > /tmp/rustc-verbose \
 
 # Cargo currently serializes package name immediately before version. Keep the
 # non-empty guard below so any JSON ordering change fails the build.
-RUN cargo build --locked --release -p solstone-linux -p rust-release-manifest \
+RUN cargo build --locked --release -p solstone-linux -p solstone-linux-window -p rust-release-manifest \
     && VERSION=$(cargo metadata --locked --format-version 1 --no-deps \
         | sed -n 's/.*"name":"solstone-linux","version":"\([^"]*\)".*/\1/p') \
     && { test -n "$VERSION" \
@@ -40,6 +40,8 @@ RUN cargo build --locked --release -p solstone-linux -p rust-release-manifest \
              echo "repair: cargo metadata --locked --format-version 1 --no-deps" >&2; exit 1; }; } \
     && ROOT="solstone-linux-${VERSION}-linux-x86_64" \
     && install -D -m 0755 target/release/solstone-linux "/release-tree/${ROOT}/bin/solstone-linux" \
+    && install -D -m 0755 target/release/solstone-linux-window "/release-tree/${ROOT}/bin/solstone-linux-window" \
+    && install -D -m 0644 packaging/org.solpbc.solstone.Window.desktop "/release-tree/${ROOT}/share/applications/org.solpbc.solstone.Window.desktop" \
     && install -D -m 0644 LICENSE "/release-tree/${ROOT}/LICENSE" \
     && install -D -m 0644 packaging/INSTALL-NOTES "/release-tree/${ROOT}/INSTALL-NOTES" \
     && install -D -m 0644 RUST_DEPENDENCY_NOTICES.txt "/release-tree/${ROOT}/RUST_DEPENDENCY_NOTICES.txt" \
@@ -78,8 +80,8 @@ RUN actual="$(cargo deb --version)" \
         | LC_ALL=C sort -z \
         | xargs -0 -r md5sum -- > DEBIAN/md5sums \
     && md5_count="$(wc -l < DEBIAN/md5sums)" \
-    && { test "${md5_count}" -eq 20 \
-        || { echo "error: Debian md5 inventory mismatch: expected 20 payloads, actual ${md5_count:-unavailable}" >&2; \
+    && { test "${md5_count}" -eq 22 \
+        || { echo "error: Debian md5 inventory mismatch: expected 22 payloads, actual ${md5_count:-unavailable}" >&2; \
              echo "repair: align the sealing bound with package assets and generated copyright" >&2; exit 1; }; } \
     && chmod 0644 DEBIAN/md5sums \
     && dpkg-deb --root-owner-group -Zxz -z9 --build "$DEB_ROOT" "${DEB}.sealed" >/dev/null \

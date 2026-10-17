@@ -396,7 +396,7 @@ fn package_payload_authority_matches_both_manifest_dialects() {
         .collect::<Vec<_>>();
     assert_eq!(deb, rpm);
     assert_eq!(deb, expected);
-    assert_eq!(expected.len(), 19);
+    assert_eq!(expected.len(), 21);
 }
 
 fn audit_fixture_bytes(
@@ -405,6 +405,12 @@ fn audit_fixture_bytes(
 ) -> Vec<u8> {
     match authority.role {
         crate::package_audit::PayloadRole::Executable => executable.to_vec(),
+        crate::package_audit::PayloadRole::WindowExecutable => {
+            crate::elf64::window_elf64_for_test()
+        }
+        crate::package_audit::PayloadRole::DesktopEntry => {
+            include_bytes!("../../../packaging/org.solpbc.solstone.Window.desktop").to_vec()
+        }
         crate::package_audit::PayloadRole::InstallNotes => {
             include_bytes!("../../../packaging/INSTALL-NOTES").to_vec()
         }
@@ -438,6 +444,12 @@ fn audit_tar_with_payload(
         }
         let relative = match authority.role {
             crate::package_audit::PayloadRole::Executable => "bin/solstone-linux".to_owned(),
+            crate::package_audit::PayloadRole::WindowExecutable => {
+                "bin/solstone-linux-window".to_owned()
+            }
+            crate::package_audit::PayloadRole::DesktopEntry => {
+                "share/applications/org.solpbc.solstone.Window.desktop".to_owned()
+            }
             crate::package_audit::PayloadRole::License => "LICENSE".to_owned(),
             crate::package_audit::PayloadRole::InstallNotes => "INSTALL-NOTES".to_owned(),
             crate::package_audit::PayloadRole::DependencyNotices => {
@@ -789,6 +801,15 @@ fn package_audit_real_artifacts_cover_payload_rejection_matrix() {
         Mutation::Omit(PayloadRole::DependencyNotices),
         Mutation::Omit(PayloadRole::InstallNotes),
         Mutation::Omit(PayloadRole::Executable),
+        Mutation::Omit(PayloadRole::WindowExecutable),
+        Mutation::Omit(PayloadRole::DesktopEntry),
+        Mutation::Replace(
+            PayloadRole::DesktopEntry,
+            b"different launcher".to_vec(),
+            0o644,
+            "DivergentPayload",
+            "desktop-entry",
+        ),
     ];
 
     for format in ["tar", "deb", "rpm"] {
@@ -812,6 +833,10 @@ fn package_audit_real_artifacts_cover_payload_rejection_matrix() {
                     let member = match format {
                         "tar" => match role {
                             PayloadRole::Executable => "bin/solstone-linux".to_owned(),
+                            PayloadRole::WindowExecutable => "bin/solstone-linux-window".to_owned(),
+                            PayloadRole::DesktopEntry => {
+                                "share/applications/org.solpbc.solstone.Window.desktop".to_owned()
+                            }
                             PayloadRole::License => "LICENSE".to_owned(),
                             PayloadRole::InstallNotes => "INSTALL-NOTES".to_owned(),
                             PayloadRole::DependencyNotices => {
@@ -836,6 +861,10 @@ fn package_audit_real_artifacts_cover_payload_rejection_matrix() {
                     let member = match format {
                         "tar" => match role {
                             PayloadRole::Executable => "bin/solstone-linux".to_owned(),
+                            PayloadRole::WindowExecutable => "bin/solstone-linux-window".to_owned(),
+                            PayloadRole::DesktopEntry => {
+                                "share/applications/org.solpbc.solstone.Window.desktop".to_owned()
+                            }
                             PayloadRole::License => "LICENSE".to_owned(),
                             PayloadRole::InstallNotes => "INSTALL-NOTES".to_owned(),
                             PayloadRole::DependencyNotices => {

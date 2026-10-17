@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=solstone
+Exec=solstone-linux window
+Icon=solstone-observer
+Terminal=false
+StartupNotify=true
+Categories=Utility;
+StartupWMClass=org.solpbc.solstone.Window

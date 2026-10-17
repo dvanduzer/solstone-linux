@@ -1529,6 +1529,20 @@ pub fn emit_proof_handoff(input: &ProofHandoffInput<'_>) -> Result<()> {
         .map_err(display_error)?
         .trim()
         .to_owned();
+    let window_executable = actual_executable.with_file_name("solstone-linux-window");
+    require_regular_executable(&window_executable, "proof installed window executable")?;
+    let window_version = Command::new(&window_executable)
+        .arg("--version")
+        .output()
+        .map_err(display_error)?;
+    if !window_version.status.success()
+        || String::from_utf8(window_version.stdout)
+            .map_err(display_error)?
+            .trim()
+            != format!("solstone-linux-window {}", input.version)
+    {
+        return Err(Error::new("proof window runtime/version command mismatch"));
+    }
     let proof = CandidateProof {
         schema_version: 1,
         platform: input.platform.into(),

@@ -39,6 +39,7 @@ RUN apt-get update \
         cmake \
         pkg-config \
         libglib2.0-dev \
+        libgtk-4-dev \
         libgstreamer1.0-dev \
         libpulse0 \
         binutils \
@@ -124,6 +125,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libglib2.0-0 \
+        libgtk-4-1 \
         libgstreamer1.0-0 \
         libpulse0 \
     && rm -rf /var/lib/apt/lists/*
@@ -135,6 +137,7 @@ FROM ${FEDORA_STOCK_BASE} AS fedora-proof
 # pulseaudio-libs: the observer dynamically links PulseAudio.
 RUN dnf install -y \
         glib2 \
+        gtk4 \
         gstreamer1 \
         pulseaudio-libs \
     && dnf clean all

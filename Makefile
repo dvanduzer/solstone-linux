@@ -15,6 +15,7 @@ export RUSTUP_TOOLCHAIN := $(RUST_VERSION)
 export PATH := $(CARGO_BIN_DIR):$(PATH)
 RUST_TARGET := x86_64-unknown-linux-gnu
 CARGO_LOCKED := --locked
+UPDATE_DEPS_ARGS ?=
 CARGO_DENY_VERSION := 0.20.2
 CARGO_DEB_VERSION := 3.7.0
 CARGO_GENERATE_RPM_VERSION := 0.21.0
@@ -67,6 +68,7 @@ install: establish-toolchain rust-preflight
 	@actual=$$(cargo deny --version 2>/dev/null || true); \
 	[ "$$actual" = "cargo-deny $(CARGO_DENY_VERSION)" ] || { echo "error: cargo-deny verification mismatch: expected 'cargo-deny $(CARGO_DENY_VERSION)', actual '$${actual:-unavailable}'" >&2; echo "repair: cargo install cargo-deny --version $(CARGO_DENY_VERSION) --locked" >&2; exit 1; }
 	@$(CARGO) install --path crates/solstone-linux $(CARGO_LOCKED) || { echo "error: observer installation mismatch: expected $(CARGO_BIN_DIR)/$(APP), actual installation failed" >&2; echo "repair: cargo install --path crates/solstone-linux --locked" >&2; exit 1; }
+	@$(CARGO) install --path crates/solstone-linux-window $(CARGO_LOCKED)
 
 bootstrap:
 	@if ! command -v rustup >/dev/null 2>&1; then curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path; fi
@@ -106,7 +108,7 @@ brand-sync:
 	@echo "brand: synced from $(BRAND_DIR)"
 
 test: rust-preflight
-	$(CARGO) test $(CARGO_LOCKED) -p solstone-linux
+	$(CARGO) test $(CARGO_LOCKED) -p solstone-linux -p solstone-linux-window
 
 check-observer-contract: rust-preflight
 	@echo "Client-ingest contract bundle: 14.0.0"
@@ -170,7 +172,7 @@ ci: rust-preflight check-cargo-deny check-observer-contract check-rust-release-m
 	@echo "This gate does not run target-package validation or the release FLAC soak."
 	$(CARGO) fmt --check
 	$(CARGO) clippy $(CARGO_LOCKED) --all-targets -- -D warnings
-	$(CARGO) test $(CARGO_LOCKED) -p solstone-linux
+	$(CARGO) test $(CARGO_LOCKED) -p solstone-linux -p solstone-linux-window
 	$(MAKE) shellcheck
 	cargo deny $(CARGO_LOCKED) --offline check licenses bans sources
 
@@ -218,7 +220,7 @@ audit: rust-preflight check-cargo-deny
 	@CARGO_NET_OFFLINE=true $(CARGO) run $(CARGO_LOCKED) -p rust-release-manifest -- audit --bundle "$(BUNDLE)" --receipt "$(RECEIPT)" --pubkey "$(PUBKEY)" --locator "$(LOCATOR)"
 
 update-deps: rust-preflight
-	$(CARGO) update
+	$(CARGO) update $(UPDATE_DEPS_ARGS)
 
 install-service: install
 	$(CARGO_BIN_DIR)/$(APP) install-service

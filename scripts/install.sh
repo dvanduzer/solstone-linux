@@ -63,6 +63,9 @@ if [[ ! -f "$ARCHIVE" ]]; then
   echo "error: release tarball not found: $ARCHIVE" >&2
   exit 1
 fi
+if [[ "$PREFIX" != /* ]]; then
+  PREFIX="$PWD/$PREFIX"
+fi
 
 ARCH=$(uname -m)
 if [[ "$ARCH" != "x86_64" ]]; then
@@ -122,10 +125,12 @@ done <<< "$CONTENTS"
 
 for REQUIRED in \
   "$TOP/bin/solstone-linux" \
+  "$TOP/bin/solstone-linux-window" \
   "$TOP/LICENSE" \
   "$TOP/INSTALL-NOTES" \
   "$TOP/RUST_DEPENDENCY_NOTICES.txt" \
-  "$TOP/share/icons/hicolor/scalable/apps/solstone-observer.svg"; do
+  "$TOP/share/icons/hicolor/scalable/apps/solstone-observer.svg" \
+  "$TOP/share/applications/org.solpbc.solstone.Window.desktop"; do
   if ! grep -Fxq "$REQUIRED" <<< "$CONTENTS"; then
     echo "error: archive is missing $REQUIRED" >&2
     exit 1
@@ -134,6 +139,7 @@ done
 
 echo "solstone-linux $RELEASE_VERSION install plan ($DISTRO_FAMILY, x86_64):"
 echo "  install binary: $PREFIX/bin/solstone-linux"
+echo "  install binary: $PREFIX/bin/solstone-linux-window"
 echo "  install icons:  $PREFIX/share/icons/hicolor/"
 echo "  install docs:   $PREFIX/share/doc/solstone-linux/"
 if [[ ":$PATH:" != *":$PREFIX/bin:"* ]]; then
@@ -162,8 +168,10 @@ SOURCE="$EXTRACT_DIR/$TOP"
 mkdir -p \
   "$PREFIX/bin" \
   "$PREFIX/share/doc/solstone-linux" \
+  "$PREFIX/share/applications" \
   "$PREFIX/share/icons"
 install -m 0755 "$SOURCE/bin/solstone-linux" "$PREFIX/bin/solstone-linux"
+install -m 0755 "$SOURCE/bin/solstone-linux-window" "$PREFIX/bin/solstone-linux-window"
 install -m 0644 "$SOURCE/LICENSE" "$PREFIX/share/doc/solstone-linux/LICENSE"
 install -m 0644 "$SOURCE/INSTALL-NOTES" "$PREFIX/share/doc/solstone-linux/INSTALL-NOTES"
 install -m 0644 "$SOURCE/RUST_DEPENDENCY_NOTICES.txt" "$PREFIX/share/doc/solstone-linux/RUST_DEPENDENCY_NOTICES.txt"
@@ -171,6 +179,34 @@ while IFS= read -r -d '' ICON; do
   RELATIVE_ICON=${ICON#"$SOURCE/share/icons/hicolor/"}
   install -D -m 0644 "$ICON" "$PREFIX/share/icons/hicolor/$RELATIVE_ICON"
 done < <(find "$SOURCE/share/icons/hicolor" -type f -print0)
+
+# Exec is parsed twice: first the desktop-entry string escaping, then the
+# quoted argument. Use an absolute path so app-menu launch does not depend on
+# the interactive shell's PATH. No prefix byte becomes shell source.
+DESKTOP_PREFIX=""
+for ((INDEX=0; INDEX<${#PREFIX}; INDEX++)); do
+  CHARACTER=${PREFIX:INDEX:1}
+  case "$CHARACTER" in
+    $'\\') DESKTOP_PREFIX+=$'\\\\\\\\' ;;
+    '"'|'`'|'$') DESKTOP_PREFIX+=$'\\\\'; DESKTOP_PREFIX+="$CHARACTER" ;;
+    '%') DESKTOP_PREFIX+='%%' ;;
+    $'\n') DESKTOP_PREFIX+='\n' ;;
+    $'\r') DESKTOP_PREFIX+='\r' ;;
+    $'\t') DESKTOP_PREFIX+='\t' ;;
+    *) DESKTOP_PREFIX+="$CHARACTER" ;;
+  esac
+done
+while IFS= read -r LINE; do
+  case "$LINE" in
+    Exec=*)
+      # The desktop-launched shell expands $1, never this installer.
+      # shellcheck disable=SC2016
+      printf '%s%s%s\n' 'Exec=/bin/sh -c "exec \\"\\$1\\" window" sh "' "$DESKTOP_PREFIX" '/bin/solstone-linux"'
+      ;;
+    *) printf '%s\n' "$LINE" ;;
+  esac
+done < "$SOURCE/share/applications/org.solpbc.solstone.Window.desktop" > "$PREFIX/share/applications/org.solpbc.solstone.Window.desktop"
+chmod 0644 "$PREFIX/share/applications/org.solpbc.solstone.Window.desktop"
 
 echo "installed solstone-linux $RELEASE_VERSION under $PREFIX"
 echo "next: solstone-linux install-service"

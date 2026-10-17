@@ -30,12 +30,20 @@ fn fixture(mutate: impl FnOnce(&Path)) -> Fixture {
     tar::Archive::new(Cursor::new(archive.stdout))
         .unpack(temp.path())
         .unwrap();
-    for relative in [
-        "Cargo.toml",
-        "crates/solstone-linux/Cargo.toml",
-        "Cargo.lock",
-    ] {
-        fs::copy(live.join(relative), temp.path().join(relative)).unwrap();
+    let workspace: toml::Value =
+        toml::from_str(&fs::read_to_string(live.join("Cargo.toml")).unwrap()).unwrap();
+    let mut manifests = vec![PathBuf::from("Cargo.toml"), PathBuf::from("Cargo.lock")];
+    manifests.extend(
+        workspace["workspace"]["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|member| Path::new(member.as_str().unwrap()).join("Cargo.toml")),
+    );
+    for relative in manifests {
+        let target = temp.path().join(&relative);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::copy(live.join(relative), target).unwrap();
     }
     mutate(temp.path());
     for args in [

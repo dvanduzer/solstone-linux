@@ -1,0 +1,17 @@
+[package]
+name = "solstone-linux-window"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+gtk = { package = "gtk4", version = "=0.11.5", features = ["v4_6"] }
+num-format = { version = "0.4.4", features = ["with-system-locale"] }
+resvg = { version = "0.47", default-features = false }
+solstone-linux = { path = "../solstone-linux" }
+tokio.workspace = true

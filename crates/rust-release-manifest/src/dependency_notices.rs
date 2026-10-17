@@ -14,7 +14,9 @@ use std::{
 
 pub const NOTICES_SCHEMA_VERSION: &str = "solstone-linux.rust-dependency-notices.v1";
 pub const VENDORED_PREBUILTS_SCHEMA: &str = "solstone-linux.vendored-prebuilts.v1";
-pub const ROOT_PACKAGE: &str = "solstone-linux";
+// The window depends on the daemon library with its production features, so
+// this normal/build closure covers both shipped executables.
+pub const ROOT_PACKAGE: &str = "solstone-linux-window";
 pub const FILTER_PLATFORM: &str = "x86_64-unknown-linux-gnu";
 pub const POPULATION_QUERY: &str = "cargo metadata --locked --offline --format-version 1 --filter-platform x86_64-unknown-linux-gnu";
 
