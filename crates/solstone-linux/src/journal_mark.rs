@@ -23,6 +23,8 @@ use crate::{
     },
 };
 
+pub(crate) const PAIRING_COMMIT_FILENAME: &str = "pairing-commit-pending";
+
 pub(crate) const PAIRING_ANSWER_FILENAME: &str = "pairing-answer.json";
 pub(crate) const ANSWER_LOCK_FILENAME: &str = ".solstone-linux.pairing-answer.lock";
 pub(crate) const ANSWER_LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -210,7 +212,11 @@ pub(crate) fn write_pairing_answer(
     config_root: &Path,
     confirmed: &str,
 ) -> Result<(), PrivateStateError> {
-    write_pairing_answer_with_fault(config_root, confirmed, &NoWriteFault)
+    write_pairing_answer_with_fault(config_root, confirmed, &NoWriteFault)?;
+    if !confirmed.is_empty() {
+        finish_pairing_commit(config_root, confirmed)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn write_pairing_answer_with_fault(
@@ -235,8 +241,84 @@ pub(crate) fn write_pairing_answer_with_fault(
     })
 }
 
+/// A durable intent fences both credential and answer reads across interrupted commits.
+/// Presence, including unreadable or unsafe state, always holds activation.
+pub(crate) fn pairing_commit_pending(config_root: &Path) -> bool {
+    !matches!(fs::symlink_metadata(config_root.join(PAIRING_COMMIT_FILENAME)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound)
+}
+
+pub(crate) fn begin_pairing_commit(
+    config_root: &Path,
+    pairing_id: &str,
+    fault: &dyn DurableWriteFault,
+) -> Result<(), PrivateStateError> {
+    atomic_write_bytes_with_fault(
+        &config_root.join(PAIRING_COMMIT_FILENAME),
+        pairing_id.as_bytes(),
+        fault,
+    )
+    .map_err(|error| {
+        map_private_file(
+            error,
+            PrivateTargetKind::PairingAnswer,
+            PrivateIoOperation::Persist,
+        )
+    })
+}
+
+/// Called under AnswerLock, only after a new affirmative answer and both durable writes.
+pub(crate) fn finish_pairing_commit(
+    config_root: &Path,
+    pairing_id: &str,
+) -> Result<(), PrivateStateError> {
+    finish_pairing_commit_with_fault(config_root, pairing_id, &NoWriteFault)
+}
+
+pub(crate) fn finish_pairing_commit_with_fault(
+    config_root: &Path,
+    pairing_id: &str,
+    fault: &dyn DurableWriteFault,
+) -> Result<(), PrivateStateError> {
+    if !pairing_commit_pending(config_root) {
+        return Ok(());
+    }
+    let credential = load_credential(config_root)?.ok_or(PrivateStateError::CredentialChanged)?;
+    let answer = read_pairing_answer(config_root)?;
+    if compute_pairing_id(&credential.client_cert_pem) != pairing_id
+        || answer.as_ref().map(|a| a.confirmed.as_str()) != Some(pairing_id)
+    {
+        return Err(PrivateStateError::CredentialChanged);
+    }
+    let path = config_root.join(PAIRING_COMMIT_FILENAME);
+    match open_regular_readonly(&path) {
+        Ok(_) => {}
+        Err(PrivateFileError::Io {
+            kind: io::ErrorKind::NotFound,
+            ..
+        }) => return Ok(()),
+        Err(error) => {
+            return Err(map_private_file(
+                error,
+                PrivateTargetKind::PairingAnswer,
+                PrivateIoOperation::Open,
+            ));
+        }
+    }
+    fs::remove_file(path).map_err(|source| PrivateStateError::Io {
+        operation: PrivateIoOperation::Remove,
+        source,
+    })?;
+    // Both files are durable and yes was explicit. An uncertain unlink can only
+    // restore the hold after a crash, never invent a confirmed credential.
+    fault
+        .before(crate::private_file::DurableWriteStage::DirSync)
+        .and_then(|()| File::open(config_root).and_then(|dir| dir.sync_all()))
+        .map_err(|_| PrivateStateError::PairingCommitUncertain)
+}
+
 pub(crate) fn is_pairing_confirmed(config_root: &Path, pairing_id: &str) -> bool {
-    if pairing_id.is_empty() {
+    if pairing_id.is_empty() || pairing_commit_pending(config_root) {
         return false;
     }
     match read_pairing_answer(config_root) {
@@ -246,6 +328,9 @@ pub(crate) fn is_pairing_confirmed(config_root: &Path, pairing_id: &str) -> bool
 }
 
 pub(crate) fn journal_mark_held_on_disk(config_root: &Path) -> bool {
+    if pairing_commit_pending(config_root) {
+        return true;
+    }
     let cred = match load_credential(config_root) {
         Ok(Some(cred)) => cred,
         _ => return false,
@@ -275,6 +360,9 @@ pub(crate) fn grandfather_answer_file_with_fault(
     candidate_pairing_id: Option<&str>,
     fault: &dyn DurableWriteFault,
 ) -> Result<(), PrivateStateError> {
+    if pairing_commit_pending(config_root) {
+        return Ok(());
+    }
     let path = config_root.join(PAIRING_ANSWER_FILENAME);
     match open_regular_readonly(&path) {
         Ok(_) => Ok(()),

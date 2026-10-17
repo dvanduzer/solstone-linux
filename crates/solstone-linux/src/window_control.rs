@@ -15,17 +15,18 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::config::{ConfigPaths, set_guided_field};
 use crate::journal_mark::{
-    JOURNAL_MARK_RECHECK_INTERVAL, PAIRING_ANSWER_FILENAME, is_pairing_confirmed,
+    JOURNAL_MARK_RECHECK_INTERVAL, PAIRING_ANSWER_FILENAME, begin_pairing_commit,
+    finish_pairing_commit_with_fault, is_pairing_confirmed, pairing_commit_pending,
     read_pairing_answer, retire_client_registration, write_pairing_answer_with_fault,
 };
 use crate::observer::{Mode, StateSnapshot};
 use crate::private_file::DurableWriteFault;
 use crate::private_link::{
     CREDENTIALS_FILENAME, LinkFact, LinkFacts, OpenJournalAccess, Pairer, PrivateLinkOwner,
-    PrivateStateError, PrivateStateLock, format_spoken_mark, pair_and_admit,
-    persist_credential_with_fault,
+    PrivateStateError, PrivateStateLock, PrivateTargetKind, format_spoken_mark, pair_and_admit,
+    persist_credential_with_fault, read_private_file,
 };
-use crate::sync::{SyncResetHandle, SyncTrigger};
+use crate::sync::{SyncResetHandle, SyncSampler, SyncTrigger};
 use crate::sync_health::SyncHealth;
 use crate::tray_model;
 use crate::upload::UploadClient;
@@ -250,8 +251,9 @@ pub(crate) trait ManagedOwner: Send {
     fn fence_writer(&self);
     fn install_journal(&self, access: &OpenJournalAccess);
     fn arm(&self, upload: &UploadClient);
-    fn shutdown(self: Box<Self>)
-    -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+    fn shutdown(
+        self: Box<Self>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), PrivateStateError>> + Send>>;
 }
 
 pub(crate) trait OwnerStarter: Send + Sync {
@@ -298,9 +300,16 @@ impl ManagedOwner for ProductionOwner {
     }
     fn shutdown(
         self: Box<Self>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), PrivateStateError>> + Send>>
+    {
         Box::pin(async move {
-            let _ = self.owner.shutdown().await;
+            let writer = self.owner.capability().writer();
+            let stopped = self.owner.shutdown().await;
+            let drain = tokio::task::spawn_blocking(move || writer.wait_for_writes());
+            match tokio::time::timeout(Duration::from_secs(2), drain).await {
+                Ok(Ok(())) => stopped,
+                _ => Err(PrivateStateError::ShutdownFailed),
+            }
         })
     }
 }
@@ -336,10 +345,11 @@ pub(crate) struct SystemCeremonyClock;
 
 impl CeremonyClock for SystemCeremonyClock {
     fn monotonic_seconds(&self) -> f64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0)
+        static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        ORIGIN
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_secs_f64()
     }
     fn sleep(
         &self,
@@ -405,6 +415,7 @@ pub(crate) enum SupervisorCommand {
         responder: oneshot::Sender<String>,
     },
     OpenJournal {
+        opener: Option<CustomOpener>,
         responder: oneshot::Sender<String>,
     },
 }
@@ -542,8 +553,10 @@ pub struct WindowControlSupervisor {
     durable_fault: Arc<dyn DurableWriteFault>,
     phase: Arc<Mutex<Phase>>,
     health: Arc<Mutex<SyncHealth>>,
+    sampler: Option<SyncSampler>,
     snapshot: Arc<Mutex<StateSnapshot>>,
     owner: Option<Box<dyn ManagedOwner>>,
+    activation_blocked: bool,
     pending_candidate: Option<PendingCandidate>,
     attempt_counter: u64,
     cmd_rx: mpsc::Receiver<SupervisorCommand>,
@@ -570,6 +583,7 @@ impl WindowControlSupervisor {
         snapshot: Arc<Mutex<StateSnapshot>>,
     ) -> (Self, WindowControlHandler) {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let sampler = Some(sync_reset.sampler_handle());
         let phase = Arc::new(Mutex::new(Phase {
             durable: "unavailable".into(),
             owner_status: "absent".into(),
@@ -586,8 +600,8 @@ impl WindowControlSupervisor {
                 tx: Some(cmd_tx),
                 config_paths: config_paths.clone(),
                 health: Arc::clone(&health),
+                sampler: sampler.clone(),
                 snapshot: Arc::clone(&snapshot),
-                open_journal: open_journal.clone(),
                 custom_opener: None,
             }),
         };
@@ -608,8 +622,10 @@ impl WindowControlSupervisor {
             durable_fault,
             phase,
             health,
+            sampler,
             snapshot,
             owner: None,
+            activation_blocked: false,
             pending_candidate: None,
             attempt_counter: 0,
             cmd_rx,
@@ -619,7 +635,15 @@ impl WindowControlSupervisor {
 
     fn assemble_current(&self, restart_override: Option<bool>) -> String {
         let phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
-        let health = self.health.lock().unwrap_or_else(|p| p.into_inner());
+        let health = self.sampler.as_ref().map_or_else(
+            || {
+                self.health
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone()
+            },
+            SyncSampler::health,
+        );
         let snapshot = self.snapshot.lock().unwrap_or_else(|p| p.into_inner());
         assemble_document(
             &phase,
@@ -632,6 +656,9 @@ impl WindowControlSupervisor {
 
     fn check_durable_state(&self, candidate_pairing_id: Option<&str>) -> String {
         let config_root = resolve_config_dir(&self.config_paths);
+        if pairing_commit_pending(&config_root) {
+            return "held".into();
+        }
         let cred_opt = crate::private_link::load_credential(&config_root)
             .ok()
             .flatten();
@@ -748,7 +775,7 @@ impl WindowControlSupervisor {
                     }
                     if let Some(owner) = self.owner.take() {
                         owner.fence_writer();
-                        owner.shutdown().await;
+                        owner.shutdown().await?;
                     }
                     return Ok(());
                 }
@@ -759,7 +786,7 @@ impl WindowControlSupervisor {
                         }
                         if let Some(owner) = self.owner.take() {
                             owner.fence_writer();
-                            owner.shutdown().await;
+                            owner.shutdown().await?;
                         }
                         return Ok(());
                     };
@@ -790,7 +817,7 @@ impl WindowControlSupervisor {
     }
 
     async fn recheck_cli_confirm(&mut self) {
-        if self.owner.is_some() {
+        if self.owner.is_some() || self.activation_blocked {
             return;
         }
         let config_root = resolve_config_dir(&self.config_paths);
@@ -807,6 +834,8 @@ impl WindowControlSupervisor {
                 if already_failed {
                     return;
                 }
+                self.upload.prepare_new_owner();
+                self.sync_reset.reset_association_blockers();
                 let lock_res = self.cloned_lock.try_clone();
                 let Ok(lock_clone) = lock_res else { return };
                 match self
@@ -881,8 +910,8 @@ impl WindowControlSupervisor {
                 let doc = self.handle_write_setting(field, value).await;
                 let _ = responder.send(doc);
             }
-            SupervisorCommand::OpenJournal { responder } => {
-                let doc = self.handle_open_journal().await;
+            SupervisorCommand::OpenJournal { opener, responder } => {
+                let doc = self.handle_open_journal(opener).await;
                 let _ = responder.send(doc);
             }
         }
@@ -1005,30 +1034,17 @@ impl WindowControlSupervisor {
         pairing_id: String,
         accept: bool,
     ) -> String {
+        self.check_expiry().await;
         let Some(candidate) = self.pending_candidate.clone() else {
-            {
-                let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
-                phase.attempt = Some(AttemptDocument {
-                    id: attempt_id,
-                    pairing_id,
-                    state: "stale".into(),
-                    mark: None,
-                });
-            }
             return self.assemble_current(None);
         };
 
         if candidate.attempt_id != attempt_id || candidate.pairing_id != pairing_id {
-            {
-                let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
-                phase.attempt = Some(AttemptDocument {
-                    id: attempt_id,
-                    pairing_id,
-                    state: "stale".into(),
-                    mark: None,
-                });
-            }
-            return self.assemble_current(None);
+            // Refuse the old answer without destroying the newer comparison.
+            let mut doc: ControlDocument = serde_json::from_str(&self.assemble_current(None))
+                .expect("serialized control document");
+            doc.fault = Some("stale-answer".into());
+            return serde_json::to_string(&doc).expect("control document serialization");
         }
 
         if !accept {
@@ -1070,78 +1086,88 @@ impl WindowControlSupervisor {
 
         if let Some(old) = self.owner.take() {
             old.fence_writer();
-            old.shutdown().await;
+            if old.shutdown().await.is_err() {
+                self.activation_blocked = true;
+            }
+        }
+        if self.activation_blocked {
+            self.pending_candidate = None;
+            retire_client_registration(&candidate.credential).await;
+            {
+                let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+                phase.owner_status = "failed".into();
+                phase.fault = Some("owner-stop-failed".into());
+                phase.attempt = None;
+            }
+            return self.assemble_current(None);
         }
 
+        self.upload.prepare_new_owner();
         let config_root = resolve_config_dir(&self.config_paths);
         let fault = self.durable_fault.clone();
         let cand = candidate.clone();
 
         let commit_result = async {
             let _answer_lock = crate::journal_mark::AnswerLock::acquire(&config_root).await?;
-            let cred_path = config_root.join(CREDENTIALS_FILENAME);
-            let answer_path = config_root.join(PAIRING_ANSWER_FILENAME);
-            let prev_cred_bytes = fs::read(&cred_path).ok();
-            let prev_answer_bytes = fs::read(&answer_path).ok();
-
-            if !answer_path.exists() {
-                write_pairing_answer_with_fault(&config_root, "", fault.as_ref())?;
-            }
-
-            if let Err(e) =
-                persist_credential_with_fault(&config_root, &cand.credential, fault.as_ref())
-            {
-                if let Some(ref b) = prev_cred_bytes {
-                    let _ = fs::write(&cred_path, b);
-                } else {
-                    let _ = fs::remove_file(&cred_path);
-                }
-                if let Some(ref b) = prev_answer_bytes {
-                    let _ = fs::write(&answer_path, b);
-                } else {
-                    let _ = fs::remove_file(&answer_path);
-                }
-                return Err(e);
-            }
-
-            if let Err(e) =
-                write_pairing_answer_with_fault(&config_root, &cand.pairing_id, fault.as_ref())
-            {
-                if let Some(ref b) = prev_cred_bytes {
-                    let _ = fs::write(&cred_path, b);
-                } else {
-                    let _ = fs::remove_file(&cred_path);
-                }
-                if let Some(ref b) = prev_answer_bytes {
-                    let _ = fs::write(&answer_path, b);
-                } else {
-                    let _ = fs::remove_file(&answer_path);
-                }
-                return Err(e);
-            }
-            Ok(())
+            // Refuse unreadable/unsafe previous state rather than treating it as absent.
+            read_private_file(
+                &config_root.join(CREDENTIALS_FILENAME),
+                PrivateTargetKind::Credential,
+            )?;
+            read_private_file(
+                &config_root.join(PAIRING_ANSWER_FILENAME),
+                PrivateTargetKind::PairingAnswer,
+            )?;
+            // No rollback can be guaranteed after an I/O error. Leave this durable fence
+            // through every partial write; a fresh explicit confirmation can finish it.
+            begin_pairing_commit(&config_root, &cand.pairing_id, fault.as_ref())?;
+            persist_credential_with_fault(&config_root, &cand.credential, fault.as_ref())?;
+            write_pairing_answer_with_fault(&config_root, &cand.pairing_id, fault.as_ref())?;
+            finish_pairing_commit_with_fault(&config_root, &cand.pairing_id, fault.as_ref())
         }
         .await;
 
-        if commit_result.is_err() {
-            let durable_state = self.check_durable_state(Some(&cand.pairing_id));
+        if let Err(error) = commit_result {
+            let uncertain = matches!(error, PrivateStateError::PairingCommitUncertain);
+            let durable_state = if uncertain {
+                "unavailable".into()
+            } else {
+                self.check_durable_state(Some(&cand.pairing_id))
+            };
+            self.upload
+                .link_facts()
+                .set_journal_mark_held(durable_state == "held");
             self.pending_candidate = None;
             {
                 let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
                 phase.durable = durable_state;
                 phase.owner_status = "absent".into();
-                phase.fault = Some("commit-failed".into());
+                phase.fault = Some(
+                    if uncertain {
+                        "commit-outcome-unknown"
+                    } else {
+                        "commit-failed"
+                    }
+                    .into(),
+                );
+                if uncertain {
+                    phase.failed_owner_pairing_id = Some(cand.pairing_id.clone());
+                }
                 phase.attempt = Some(AttemptDocument {
                     id: cand.attempt_id,
                     pairing_id: cand.pairing_id,
-                    state: "failed".into(),
+                    state: if uncertain {
+                        "outcome-unknown"
+                    } else {
+                        "failed"
+                    }
+                    .into(),
                     mark: None,
                 });
             }
             return self.assemble_current(None);
         }
 
-        self.upload.prepare_new_owner();
         self.sync_reset.reset_association_blockers();
 
         let lock_clone = match self.cloned_lock.try_clone() {
@@ -1281,7 +1307,7 @@ impl WindowControlSupervisor {
         }
     }
 
-    async fn handle_open_journal(&mut self) -> String {
+    async fn handle_open_journal(&mut self, opener: Option<CustomOpener>) -> String {
         let is_confirmed = {
             let phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
             phase.durable == "confirmed"
@@ -1293,7 +1319,10 @@ impl WindowControlSupervisor {
             }
             return self.assemble_current(None);
         }
-        let open_result = self.open_journal.open();
+        let open_result = match opener {
+            Some(opener) => self.open_journal.open_with(|url| opener(url)),
+            None => self.open_journal.open(),
+        };
         if open_result.is_err() {
             let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
             phase.open_journal = Some("unavailable".into());
@@ -1313,9 +1342,8 @@ struct WindowControlHandlerInner {
     tx: Option<mpsc::Sender<SupervisorCommand>>,
     config_paths: ConfigPaths,
     health: Arc<Mutex<SyncHealth>>,
+    sampler: Option<SyncSampler>,
     snapshot: Arc<Mutex<StateSnapshot>>,
-    open_journal: OpenJournalAccess,
-    #[allow(dead_code)]
     custom_opener: Option<CustomOpener>,
 }
 
@@ -1347,6 +1375,7 @@ impl Default for WindowControlHandler {
                     0.0,
                     600.0,
                 ))),
+                sampler: None,
                 snapshot: Arc::new(Mutex::new(StateSnapshot {
                     mode: Mode::Idle,
                     paused: false,
@@ -1358,7 +1387,6 @@ impl Default for WindowControlHandler {
                     process_start_mono: 0.0,
                     session: Default::default(),
                 })),
-                open_journal: OpenJournalAccess::default(),
                 custom_opener: None,
             }),
         }
@@ -1373,8 +1401,8 @@ impl WindowControlHandler {
                 tx: self.inner.tx.clone(),
                 config_paths: self.inner.config_paths.clone(),
                 health: Arc::clone(&self.inner.health),
+                sampler: self.inner.sampler.clone(),
                 snapshot: Arc::clone(&self.inner.snapshot),
-                open_journal: self.inner.open_journal.clone(),
                 custom_opener: Some(opener),
             }),
         }
@@ -1382,7 +1410,16 @@ impl WindowControlHandler {
 
     pub fn get_control_state(&self) -> String {
         let phase = self.inner.phase.lock().unwrap_or_else(|p| p.into_inner());
-        let health = self.inner.health.lock().unwrap_or_else(|p| p.into_inner());
+        let health = self.inner.sampler.as_ref().map_or_else(
+            || {
+                self.inner
+                    .health
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone()
+            },
+            SyncSampler::health,
+        );
         let snapshot = self
             .inner
             .snapshot
@@ -1500,37 +1537,15 @@ impl WindowControlHandler {
     }
 
     pub async fn open_journal(&self) -> String {
-        #[cfg(test)]
-        if let Some(ref opener) = self.inner.custom_opener {
-            let is_confirmed = {
-                let phase = self.inner.phase.lock().unwrap_or_else(|p| p.into_inner());
-                phase.durable == "confirmed"
-            };
-            if !is_confirmed {
-                {
-                    let mut phase = self.inner.phase.lock().unwrap_or_else(|p| p.into_inner());
-                    phase.open_journal = Some("not-confirmed".into());
-                }
-                return self.get_control_state();
-            }
-            let opener = opener.clone();
-            let res = self.inner.open_journal.open_with(move |url| opener(url));
-            if res.is_ok() {
-                let mut phase = self.inner.phase.lock().unwrap_or_else(|p| p.into_inner());
-                phase.open_journal = Some("opened".into());
-            } else {
-                let mut phase = self.inner.phase.lock().unwrap_or_else(|p| p.into_inner());
-                phase.open_journal = Some("unavailable".into());
-            }
-            return self.get_control_state();
-        }
-
         let Some(ref tx) = self.inner.tx else {
             return self.get_control_state();
         };
         let (resp_tx, resp_rx) = oneshot::channel();
         if tx
-            .send(SupervisorCommand::OpenJournal { responder: resp_tx })
+            .send(SupervisorCommand::OpenJournal {
+                opener: self.inner.custom_opener.clone(),
+                responder: resp_tx,
+            })
             .await
             .is_err()
         {
@@ -1715,6 +1730,7 @@ mod tests {
     pub struct FakeOwnerState {
         pub fenced: Arc<AtomicBool>,
         pub shutdown: Arc<AtomicBool>,
+        pub shutdown_fails: Arc<AtomicBool>,
         pub credential: Credential,
         pub link_facts: LinkFacts,
     }
@@ -1735,13 +1751,23 @@ mod tests {
             }
         }
 
-        fn arm(&self, _upload: &UploadClient) {}
+        fn arm(&self, _upload: &UploadClient) {
+            self.state.link_facts.publish(LinkFact::ListenerReady);
+        }
 
         fn shutdown(
             self: Box<Self>,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), PrivateStateError>> + Send>,
+        > {
             self.state.shutdown.store(true, Ordering::SeqCst);
-            Box::pin(async move {})
+            Box::pin(async move {
+                if self.state.shutdown_fails.load(Ordering::SeqCst) {
+                    Err(PrivateStateError::ShutdownFailed)
+                } else {
+                    Ok(())
+                }
+            })
         }
     }
 
@@ -1774,6 +1800,7 @@ mod tests {
             let state = Arc::new(FakeOwnerState {
                 fenced: Arc::new(AtomicBool::new(false)),
                 shutdown: Arc::new(AtomicBool::new(false)),
+                shutdown_fails: Arc::new(AtomicBool::new(false)),
                 credential: credential.clone(),
                 link_facts: link_facts.clone(),
             });
@@ -2029,6 +2056,47 @@ mod tests {
             }
         }
 
+        async fn restart(&mut self) {
+            self.shutdown_notify.notify_one();
+            (&mut self.supervisor_task).await.unwrap().unwrap();
+            let config = crate::config::resolve_config_paths(&self.config_paths);
+            self.upload = Arc::new(UploadClient::new(
+                &config,
+                None::<PrivateLinkCapability>,
+                Arc::new(SystemClock::new()),
+            ));
+            self.sync_facts = Arc::new(Mutex::new(SyncFacts::default()));
+            self.sync_reset = SyncResetHandle::new_for_test(
+                self.sync_facts.clone(),
+                self.upload.link_facts(),
+                self.state_dir.clone(),
+            );
+            self.open_journal = OpenJournalAccess::default();
+            self.shutdown_notify = Arc::new(tokio::sync::Notify::new());
+            let (supervisor, handler) = WindowControlSupervisor::new(
+                self._daemon_lock.try_clone().unwrap(),
+                self.upload.clone(),
+                self.config_paths.clone(),
+                "test-stream".into(),
+                true,
+                self.open_journal.clone(),
+                self.shutdown_notify.clone(),
+                None,
+                self.sync_reset.clone(),
+                Arc::new(self.clock.clone()),
+                "test-device".into(),
+                self.starter.clone(),
+                self.pairer.clone(),
+                Arc::new(NoWriteFault),
+                self.health.clone(),
+                self.snapshot.clone(),
+            );
+            self.handler = handler;
+            self.supervisor_task = tokio::spawn(supervisor.run());
+            // Go through the real command channel after startup has reconstructed disk state.
+            self.handler.open_journal().await;
+        }
+
         async fn shutdown(self) {
             self.shutdown_notify.notify_one();
             let _ = self.supervisor_task.await;
@@ -2088,6 +2156,7 @@ mod tests {
         assert_eq!(answer_model.view, SessionView::Confirmed);
         assert_eq!(answer_model.durable, "confirmed");
         assert_eq!(answer_model.owner, "running");
+        assert_eq!(answer_model.health, "listener-ready");
         assert!(answer_model.attempt.is_none());
 
         assert!(harness.config_root.join(CREDENTIALS_FILENAME).exists());
@@ -2207,8 +2276,13 @@ mod tests {
             .answer_pairing("wrong_attempt".into(), att.pairing_id.clone(), true)
             .await;
         let stale_model = decode_control_str(&stale_doc).unwrap();
-        assert_eq!(stale_model.attempt.as_ref().unwrap().state, "stale");
-        assert!(stale_model.attempt.as_ref().unwrap().mark.is_none());
+        assert_eq!(stale_model.fault.as_deref(), Some("stale-answer"));
+        assert_eq!(stale_model.attempt.as_ref().unwrap().id, att.id);
+        assert_eq!(stale_model.attempt.as_ref().unwrap().state, "pending");
+        assert_eq!(stale_model.attempt.as_ref().unwrap().mark, att.mark);
+        let fresh = decode_control_str(&harness.handler.get_control_state()).unwrap();
+        assert!(fresh.fault.is_none());
+        assert_eq!(fresh.attempt.unwrap().mark, att.mark);
         assert_eq!(starter.starts.load(Ordering::SeqCst), 0);
 
         let stale_doc2 = harness
@@ -2216,7 +2290,9 @@ mod tests {
             .answer_pairing(att.id.clone(), "wrong_pairing".into(), true)
             .await;
         let stale_model2 = decode_control_str(&stale_doc2).unwrap();
-        assert_eq!(stale_model2.attempt.as_ref().unwrap().state, "stale");
+        assert_eq!(stale_model2.fault.as_deref(), Some("stale-answer"));
+        assert_eq!(stale_model2.attempt.as_ref().unwrap().id, att.id);
+        assert_eq!(stale_model2.attempt.as_ref().unwrap().mark, att.mark);
         assert_eq!(starter.starts.load(Ordering::SeqCst), 0);
 
         let ok_doc = harness
@@ -2232,7 +2308,8 @@ mod tests {
             .answer_pairing(att.id, att.pairing_id, true)
             .await;
         let dup_model = decode_control_str(&dup_doc).unwrap();
-        assert_eq!(dup_model.attempt.as_ref().unwrap().state, "stale");
+        assert!(dup_model.attempt.is_none());
+        assert_eq!(dup_model.durable, "confirmed");
         assert_eq!(starter.starts.load(Ordering::SeqCst), 1);
 
         harness.shutdown().await;
@@ -2458,6 +2535,294 @@ mod tests {
         let check_durable = harness.check_durable_state_on_root(None);
         assert_eq!(check_durable, "unpaired");
 
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cli_confirmation_recovers_interrupted_commit_without_held_health() {
+        let cred = sample_valid_credential("held-cert");
+        let pairing_id = compute_pairing_id(&cred.client_cert_pem);
+        let starter = Arc::new(FakeOwnerStarter::default());
+        let harness = TestHarness::new(
+            Some(cred),
+            false,
+            Arc::new(FakePairer::new(sample_valid_credential("next-cert"))),
+            starter.clone(),
+            Arc::new(NoWriteFault),
+        )
+        .await;
+        harness.handler.open_journal().await;
+        begin_pairing_commit(&harness.config_root, &pairing_id, &NoWriteFault).unwrap();
+        {
+            let _lock = crate::journal_mark::AnswerLock::acquire(&harness.config_root)
+                .await
+                .unwrap();
+            crate::journal_mark::write_pairing_answer(&harness.config_root, &pairing_id).unwrap();
+        }
+        harness
+            .clock
+            .advance_and_yield(JOURNAL_MARK_RECHECK_INTERVAL)
+            .await;
+        harness.handler.open_journal().await;
+        let model = decode_control_str(&harness.handler.get_control_state()).unwrap();
+        assert_eq!(starter.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(model.durable, "confirmed");
+        assert_eq!(model.owner, "running");
+        assert_eq!(model.health, "listener-ready");
+        assert!(!pairing_commit_pending(&harness.config_root));
+        harness.shutdown().await;
+    }
+
+    struct FinalCommitSyncFault {
+        armed: AtomicBool,
+        syncs: AtomicUsize,
+    }
+
+    impl DurableWriteFault for FinalCommitSyncFault {
+        fn before(&self, stage: DurableWriteStage) -> io::Result<()> {
+            if self.armed.load(Ordering::SeqCst)
+                && stage == DurableWriteStage::DirSync
+                && self.syncs.fetch_add(1, Ordering::SeqCst) == 3
+            {
+                return Err(io::Error::other("controlled final commit sync failure"));
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn uncertain_final_commit_cannot_activate_until_restart_settles_it() {
+        let starter = Arc::new(FakeOwnerStarter::default());
+        let fault = Arc::new(FinalCommitSyncFault {
+            armed: AtomicBool::new(false),
+            syncs: AtomicUsize::new(0),
+        });
+        let mut harness = TestHarness::new(
+            None,
+            false,
+            Arc::new(FakePairer::new(sample_valid_credential("new-cert"))),
+            starter.clone(),
+            fault.clone(),
+        )
+        .await;
+        let begin = harness
+            .handler
+            .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.into())
+            .await;
+        let att = decode_control_str(&begin).unwrap().attempt.unwrap();
+        fault.armed.store(true, Ordering::SeqCst);
+        let answer = harness
+            .handler
+            .answer_pairing(att.id, att.pairing_id.clone(), true)
+            .await;
+        let model = decode_control_str(&answer).unwrap();
+        assert_eq!(model.fault.as_deref(), Some("commit-outcome-unknown"));
+        assert_eq!(model.durable, "unavailable");
+        assert_eq!(model.attempt.unwrap().state, "outcome-unknown");
+        assert_eq!(starter.starts.load(Ordering::SeqCst), 0);
+        harness
+            .clock
+            .advance_and_yield(JOURNAL_MARK_RECHECK_INTERVAL)
+            .await;
+        harness.handler.open_journal().await;
+        assert_eq!(starter.starts.load(Ordering::SeqCst), 0);
+        // Both files had persisted after explicit yes; the real surviving filesystem
+        // settles the removal uncertainty on a fresh supervisor reconstruction.
+        harness.restart().await;
+        assert_eq!(starter.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            decode_control_str(&harness.handler.get_control_state())
+                .unwrap()
+                .durable,
+            "confirmed"
+        );
+        assert!(is_pairing_confirmed(&harness.config_root, &att.pairing_id));
+        harness.shutdown().await;
+    }
+
+    struct CommitWriteFault {
+        armed: AtomicBool,
+        writes: AtomicUsize,
+        target: usize,
+        stage: DurableWriteStage,
+    }
+
+    impl DurableWriteFault for CommitWriteFault {
+        fn before(&self, stage: DurableWriteStage) -> io::Result<()> {
+            if self.armed.load(Ordering::SeqCst) {
+                if stage == DurableWriteStage::Create {
+                    self.writes.fetch_add(1, Ordering::SeqCst);
+                }
+                if self.writes.load(Ordering::SeqCst) == self.target && stage == self.stage {
+                    return Err(io::Error::other("controlled commit write failure"));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_credential_and_answer_writes_stay_held_after_restart() {
+        for replacement in [false, true] {
+            for target in [2, 3] {
+                for stage in [
+                    DurableWriteStage::Create,
+                    DurableWriteStage::Write,
+                    DurableWriteStage::Fsync,
+                    DurableWriteStage::Rename,
+                    DurableWriteStage::DirSync,
+                ] {
+                    let cred = sample_valid_credential("new-cert");
+                    let pairer = Arc::new(FakePairer::new(cred.clone()));
+                    let starter = Arc::new(FakeOwnerStarter::default());
+                    let fault = Arc::new(CommitWriteFault {
+                        armed: AtomicBool::new(false),
+                        writes: AtomicUsize::new(0),
+                        target,
+                        stage,
+                    });
+                    let mut harness = TestHarness::new(
+                        replacement.then(|| sample_valid_credential("old-cert")),
+                        replacement,
+                        pairer,
+                        starter.clone(),
+                        fault.clone(),
+                    )
+                    .await;
+                    let begin = harness
+                        .handler
+                        .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.into())
+                        .await;
+                    let att = decode_control_str(&begin).unwrap().attempt.unwrap();
+                    fault.armed.store(true, Ordering::SeqCst);
+                    let answer = harness
+                        .handler
+                        .answer_pairing(att.id, att.pairing_id.clone(), true)
+                        .await;
+                    let model = decode_control_str(&answer).unwrap();
+                    assert_eq!(model.fault.as_deref(), Some("commit-failed"));
+                    assert_eq!(model.durable, "held");
+                    assert_ne!(model.view, SessionView::Confirmed);
+                    assert!(pairing_commit_pending(&harness.config_root));
+                    assert!(!is_pairing_confirmed(&harness.config_root, &att.pairing_id));
+                    assert_eq!(
+                        starter.starts.load(Ordering::SeqCst),
+                        usize::from(replacement)
+                    );
+                    harness.restart().await;
+                    let restarted =
+                        decode_control_str(&harness.handler.get_control_state()).unwrap();
+                    assert_eq!(restarted.durable, "held");
+                    assert_eq!(restarted.owner, "absent");
+                    assert_eq!(
+                        starter.starts.load(Ordering::SeqCst),
+                        usize::from(replacement)
+                    );
+                    // A later deliberate ceremony recovers, without rollback or migration.
+                    let begin = harness
+                        .handler
+                        .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.into())
+                        .await;
+                    let att = decode_control_str(&begin).unwrap().attempt.unwrap();
+                    let answer = harness
+                        .handler
+                        .answer_pairing(att.id, att.pairing_id.clone(), true)
+                        .await;
+                    assert_eq!(decode_control_str(&answer).unwrap().durable, "confirmed");
+                    assert!(!pairing_commit_pending(&harness.config_root));
+                    assert!(is_pairing_confirmed(&harness.config_root, &att.pairing_id));
+                    harness.shutdown().await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn answer_rechecks_deadline_when_timer_delivery_is_delayed() {
+        let starter = Arc::new(FakeOwnerStarter::default());
+        let harness = TestHarness::new(
+            None,
+            false,
+            Arc::new(FakePairer::new(sample_valid_credential("new-cert"))),
+            starter.clone(),
+            Arc::new(NoWriteFault),
+        )
+        .await;
+        let begin = harness
+            .handler
+            .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.into())
+            .await;
+        let att = decode_control_str(&begin).unwrap().attempt.unwrap();
+        {
+            let mut clock = harness.clock.inner.lock().unwrap();
+            assert!(clock.sleepers.iter().any(|(deadline, tx)| !tx.is_closed()
+                && *deadline
+                    == clock.monotonic_seconds + JOURNAL_MARK_RECHECK_INTERVAL.as_secs_f64()));
+            // Advance the clock, intentionally withholding timer delivery.
+            clock.monotonic_seconds += CEREMONY_TTL.as_secs_f64() + 1.0;
+        }
+        let answer = harness
+            .handler
+            .answer_pairing(att.id, att.pairing_id, true)
+            .await;
+        let model = decode_control_str(&answer).unwrap();
+        assert_eq!(model.attempt.unwrap().state, "expired");
+        assert_eq!(starter.starts.load(Ordering::SeqCst), 0);
+        assert!(!harness.config_root.join(CREDENTIALS_FILENAME).exists());
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_quiescence_blocks_replacement_and_later_activation() {
+        let starter = Arc::new(FakeOwnerStarter::default());
+        let harness = TestHarness::new(
+            Some(sample_valid_credential("old-cert")),
+            true,
+            Arc::new(FakePairer::new(sample_valid_credential("new-cert"))),
+            starter.clone(),
+            Arc::new(NoWriteFault),
+        )
+        .await;
+        let before = fs::read(harness.config_root.join(CREDENTIALS_FILENAME)).unwrap();
+        let before_answer = fs::read(harness.config_root.join(PAIRING_ANSWER_FILENAME)).unwrap();
+        for _ in 0..2 {
+            let begin = harness
+                .handler
+                .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.into())
+                .await;
+            let att = decode_control_str(&begin).unwrap().attempt.unwrap();
+            starter.states.lock().unwrap()[0]
+                .shutdown_fails
+                .store(true, Ordering::SeqCst);
+            let answer = harness
+                .handler
+                .answer_pairing(att.id, att.pairing_id, true)
+                .await;
+            let model = decode_control_str(&answer).unwrap();
+            assert_eq!(model.fault.as_deref(), Some("owner-stop-failed"));
+            assert_eq!(model.owner, "failed");
+            assert_eq!(starter.starts.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                fs::read(harness.config_root.join(CREDENTIALS_FILENAME)).unwrap(),
+                before
+            );
+            assert_eq!(
+                fs::read(harness.config_root.join(PAIRING_ANSWER_FILENAME)).unwrap(),
+                before_answer
+            );
+        }
+        harness
+            .clock
+            .advance_and_yield(JOURNAL_MARK_RECHECK_INTERVAL)
+            .await;
+        harness.handler.open_journal().await;
+        assert_eq!(starter.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            decode_control_str(&harness.handler.get_control_state())
+                .unwrap()
+                .owner,
+            "failed"
+        );
         harness.shutdown().await;
     }
 

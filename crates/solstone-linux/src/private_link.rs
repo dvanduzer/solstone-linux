@@ -98,6 +98,7 @@ pub(crate) enum PrivateIoOperation {
 pub(crate) enum PrivateStateError {
     MalformedCredential,
     MalformedPairingAnswer,
+    PairingCommitUncertain,
     CredentialChanged,
     InvalidTarget {
         kind: PrivateTargetKind,
@@ -122,6 +123,7 @@ impl fmt::Display for PrivateStateError {
         match self {
             Self::MalformedCredential => formatter.write_str("MalformedCredential"),
             Self::MalformedPairingAnswer => formatter.write_str("MalformedPairingAnswer"),
+            Self::PairingCommitUncertain => formatter.write_str("PairingCommitUncertain"),
             Self::CredentialChanged => formatter.write_str("CredentialChanged"),
             Self::InvalidTarget { kind } => write!(formatter, "InvalidTarget({kind:?})"),
             Self::Io { operation, source } => {
@@ -1271,6 +1273,20 @@ impl LinkFacts {
 
     pub(crate) fn association_epoch(&self) -> u64 {
         self.inner.association_epoch.load(Ordering::Acquire)
+    }
+
+    /// Serializes local receipt disposal with owner loss. The callback must only
+    /// touch local segment/custody files, never health, transport or this state.
+    pub(crate) fn with_association_current<R>(
+        &self,
+        epoch: u64,
+        action: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let _state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
+        if self.association_epoch() != epoch {
+            return None;
+        }
+        Some(action())
     }
 
     pub(crate) fn publish_if_association_current(&self, fact: LinkFact, epoch: u64) -> bool {
@@ -2585,6 +2601,12 @@ impl OrderedCredentialWriter {
         self.live_hook_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// Use on a blocking thread after fencing; replacement waits with a bounded
+    /// async deadline, while ordinary shutdown stays nonblocking.
+    pub(crate) fn wait_for_writes(&self) {
+        drop(self.credential.lock().unwrap_or_else(|p| p.into_inner()));
+    }
+
     pub(crate) fn create_token_hook(self: &Arc<Self>) -> TokenPersistHook {
         let epoch = self.live_hook_epoch.load(Ordering::Acquire);
         self.create_token_hook_with_epoch(epoch)
@@ -2633,6 +2655,11 @@ impl OrderedCredentialWriter {
             })
             .is_ok()
         });
+        if self.shutdown_fenced.load(Ordering::Acquire)
+            || self.live_hook_epoch.load(Ordering::Acquire) != hook_epoch
+        {
+            return;
+        }
         if durable {
             *current = updated;
             self.access_mutation_generation
