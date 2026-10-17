@@ -2,14 +2,43 @@
 "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
 <node>
   <interface name="org.solpbc.solstone.Observer1">
+      <method name="AbandonPairing">
+          <arg name="attempt_id" direction="in" type="s" />
+          <arg direction="out" type="s" />
+        </method>
+      <method name="AnswerPairing">
+          <arg name="attempt_id" direction="in" type="s" />
+          <arg name="pairing_id" direction="in" type="s" />
+          <arg name="accept" direction="in" type="b" />
+          <arg direction="out" type="s" />
+        </method>
+      <method name="BeginPairing">
+          <arg name="link" direction="in" type="s" />
+          <arg direction="out" type="s" />
+        </method>
+      <method name="CancelPairing">
+          <arg name="attempt_id" direction="in" type="s" />
+          <arg direction="out" type="s" />
+        </method>
+      <method name="GetControlState">
+          <arg direction="out" type="s" />
+        </method>
       <method name="GetStats">
           <arg direction="out" type="a{sv}" />
         </method>
-        <method name="Pause">
-          <arg name="duration_seconds" direction="in" type="i" />
-            <arg direction="out" type="s" />
+      <method name="OpenJournal">
+          <arg direction="out" type="s" />
         </method>
-        <method name="Resume">
+      <method name="Pause">
+          <arg name="duration_seconds" direction="in" type="i" />
+          <arg direction="out" type="s" />
+        </method>
+      <method name="Resume">
+          <arg direction="out" type="s" />
+        </method>
+      <method name="WriteSetting">
+          <arg name="field" direction="in" type="s" />
+          <arg name="value" direction="in" type="s" />
           <arg direction="out" type="s" />
         </method>
         <signal name="ErrorOccurred">

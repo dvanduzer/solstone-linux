@@ -30,6 +30,7 @@ pub struct Observer1<C: Clock, O: ObserverCommands> {
     pub config: Config,
     pub clock: C,
     pub commands: O,
+    pub window_control: crate::window_control::WindowControlHandler,
 }
 impl<C: Clock, O: ObserverCommands> Observer1<C, O> {
     fn with_snapshot<R>(&self, f: impl FnOnce(&StateSnapshot) -> R) -> R {
@@ -115,6 +116,29 @@ impl<C: Clock + Send + Sync + 'static, O: ObserverCommands + 'static> Observer1<
                 ),
             ])
         })
+    }
+    fn get_control_state(&self) -> String {
+        self.window_control.get_control_state()
+    }
+    async fn begin_pairing(&self, link: String) -> String {
+        self.window_control.begin_pairing(link).await
+    }
+    async fn answer_pairing(&self, attempt_id: String, pairing_id: String, accept: bool) -> String {
+        self.window_control
+            .answer_pairing(attempt_id, pairing_id, accept)
+            .await
+    }
+    async fn cancel_pairing(&self, attempt_id: String) -> String {
+        self.window_control.cancel_pairing(attempt_id).await
+    }
+    async fn abandon_pairing(&self, attempt_id: String) -> String {
+        self.window_control.abandon_pairing(attempt_id).await
+    }
+    async fn write_setting(&self, field: String, value: String) -> String {
+        self.window_control.write_setting(field, value).await
+    }
+    async fn open_journal(&self) -> String {
+        self.window_control.open_journal().await
     }
     #[zbus(signal)]
     pub(crate) async fn status_changed(
@@ -257,6 +281,7 @@ mod tests {
                 config,
                 clock: TestClock(clock.clone()),
                 commands: commands.clone(),
+                window_control: crate::window_control::WindowControlHandler::default(),
             },
             commands,
             clock,
@@ -341,6 +366,7 @@ mod tests {
             config,
             clock: TestClock(Arc::new(std::sync::atomic::AtomicU64::new(0))),
             commands: Commands::default(),
+            window_control: crate::window_control::WindowControlHandler::default(),
         };
         let mut xml = String::new();
         service.introspect_to_writer(&mut xml, 0);
@@ -374,6 +400,7 @@ mod tests {
             config: Config::default(),
             clock: TestClock(now.clone()),
             commands: Commands::default(),
+            window_control: crate::window_control::WindowControlHandler::default(),
         };
         let first = service.segment_timer();
         now.store(101, std::sync::atomic::Ordering::Release);

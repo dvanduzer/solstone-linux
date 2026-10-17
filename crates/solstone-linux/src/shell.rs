@@ -145,6 +145,7 @@ pub(crate) struct ShellInputs {
     pub sampler: SyncSampler,
     pub commands: CommandSender,
     pub open_journal: crate::private_link::OpenJournalAccess,
+    pub window_control: crate::window_control::WindowControlHandler,
 }
 
 pub(crate) struct DesktopShell {
@@ -176,6 +177,7 @@ fn bind_consumers<C: Clock, O: ObserverCommands>(
     config: Config,
     clock: C,
     commands: O,
+    window_control: crate::window_control::WindowControlHandler,
 ) -> (Observer1<C, O>, TrayHealth) {
     let tray_health = TrayHealth {
         cell: Arc::clone(&health),
@@ -188,6 +190,7 @@ fn bind_consumers<C: Clock, O: ObserverCommands>(
             config,
             clock,
             commands,
+            window_control,
         },
         tray_health,
     )
@@ -220,6 +223,7 @@ pub(crate) fn start(runtime: &tokio::runtime::Runtime, inputs: ShellInputs) -> D
         inputs.config.clone(),
         inputs.clock.clone(),
         inputs.commands.clone(),
+        inputs.window_control,
     );
     let signal_sink = with_connection(inputs.connection.as_ref(), |connection| {
         // Setup owns the name before recovery. Observer1 can only be served after recovery and
@@ -760,6 +764,7 @@ mod tests {
             Config::default(),
             TestClock(Arc::new(AtomicU64::new(0))),
             CommandSender::new(command_sender),
+            crate::window_control::WindowControlHandler::default(),
         );
         assert!(Arc::ptr_eq(&interface.health, &tray_health.cell));
         assert!(Arc::ptr_eq(&interface.progress, &progress));

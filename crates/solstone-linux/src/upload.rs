@@ -16,7 +16,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -129,12 +129,21 @@ pub struct DayCustody {
 pub(crate) struct Inner {
     capability: std::sync::RwLock<Option<PrivateLinkCapability>>,
     fallback_link_facts: crate::private_link::LinkFacts,
+    installation_generation: AtomicU64,
     #[cfg(test)]
     expose_link_facts: AtomicBool,
     revoked: AtomicBool,
     cancellation: CancellationToken,
     retry_delays: Vec<i64>,
     immediate_attempts: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct CapturedAssociation {
+    pub(crate) capability: Option<PrivateLinkCapability>,
+    facts: crate::private_link::LinkFacts,
+    epoch: u64,
+    installation_generation: u64,
 }
 
 struct CapturedCapability {
@@ -163,6 +172,7 @@ impl UploadClient {
         let inner = Arc::new(Inner {
             capability: std::sync::RwLock::new(capability.into()),
             fallback_link_facts: crate::private_link::LinkFacts::default(),
+            installation_generation: AtomicU64::new(0),
             #[cfg(test)]
             expose_link_facts: AtomicBool::new(true),
             revoked: AtomicBool::new(false),
@@ -219,13 +229,62 @@ impl UploadClient {
         self.inner.publish_link_fact(fact);
     }
 
-    pub(crate) fn prepare_new_owner(&self) {
-        let previous = self
+    pub(crate) fn capture_association(&self) -> CapturedAssociation {
+        let installed = self
             .inner
             .capability
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let capability = installed.clone();
+        let facts = capability.as_ref().map_or_else(
+            || self.inner.fallback_link_facts.clone(),
+            |capability| capability.facts(),
+        );
+        CapturedAssociation {
+            epoch: facts.association_epoch(),
+            facts,
+            capability,
+            installation_generation: self.inner.installation_generation.load(Ordering::Acquire),
+        }
+    }
+
+    pub(crate) fn association_is_current(&self, captured: &CapturedAssociation) -> bool {
+        self.inner.installation_generation.load(Ordering::Acquire)
+            == captured.installation_generation
+            && captured.facts.association_epoch() == captured.epoch
+    }
+
+    /// Local segment disposal only: no client, health or facts callbacks inside action.
+    pub(crate) fn with_association_current<R>(
+        &self,
+        captured: &CapturedAssociation,
+        action: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let _installed = self
+            .inner
+            .capability
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        if !self.association_is_current(captured) {
+            return None;
+        }
+        captured
+            .facts
+            .with_association_current(captured.epoch, action)
+    }
+
+    pub(crate) fn prepare_new_owner(&self) {
+        let previous = {
+            let mut installed = self
+                .inner
+                .capability
+                .write()
+                .unwrap_or_else(|p| p.into_inner());
+            self.inner
+                .installation_generation
+                .fetch_add(1, Ordering::AcqRel);
+            installed.take()
+        };
         self.inner.revoked.store(false, Ordering::Release);
         if let Some(capability) = previous {
             capability.facts().begin_owner_generation();
@@ -238,13 +297,19 @@ impl UploadClient {
     }
 
     pub(crate) fn install_capability(&self, capability: PrivateLinkCapability) {
-        *self
-            .inner
-            .capability
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(capability);
-        self.inner.revoked.store(false, Ordering::Release);
-        self.link_facts().republish_current();
+        {
+            let mut installed = self
+                .inner
+                .capability
+                .write()
+                .unwrap_or_else(|p| p.into_inner());
+            self.inner
+                .installation_generation
+                .fetch_add(1, Ordering::AcqRel);
+            *installed = Some(capability.clone());
+            self.inner.revoked.store(false, Ordering::Release);
+        }
+        capability.facts().republish_current();
     }
 
     pub async fn upload_segment(
@@ -442,8 +507,13 @@ impl UploadClient {
             return custody_failure(ErrorType::Transient, None);
         };
 
+        let epoch = capability.facts().association_epoch();
+        let outcome = capability.segments_day(day, source).await;
+        if !self.inner.is_installed_for_epoch(&capability, epoch) {
+            return custody_failure(ErrorType::Transient, None);
+        }
         let (segments, status_code) = match self
-            .read_json(capability.segments_day(day, source).await, "segments")
+            .read_json(outcome, "segments", &capability, epoch)
             .await
         {
             Ok(value) => value,
@@ -470,6 +540,8 @@ impl UploadClient {
         &self,
         outcome: LinkOutcome,
         route: &str,
+        capability: &PrivateLinkCapability,
+        epoch: u64,
     ) -> Result<(Value, u16), DayCustody> {
         match outcome {
             LinkOutcome::Success { status, body } if status == StatusCode::OK => {
@@ -480,11 +552,17 @@ impl UploadClient {
                         custody_failure(ErrorType::Incompatible, Some(status.as_u16()))
                     })
             }
-            outcome => Err(self.read_failure(outcome, route).await),
+            outcome => Err(self.read_failure(outcome, route, capability, epoch).await),
         }
     }
 
-    async fn read_failure(&self, outcome: LinkOutcome, _route: &str) -> DayCustody {
+    async fn read_failure(
+        &self,
+        outcome: LinkOutcome,
+        _route: &str,
+        capability: &PrivateLinkCapability,
+        epoch: u64,
+    ) -> DayCustody {
         match outcome {
             LinkOutcome::Success { status, .. } | LinkOutcome::LocalRejected { status } => {
                 custody_failure(
@@ -495,9 +573,14 @@ impl UploadClient {
             LinkOutcome::Forbidden => {
                 // The v3 authority's linked_device_required refusal is an auth latch, not a
                 // retryable transport failure.
-                self.inner.revoked.store(true, Ordering::Release);
-                self.inner
-                    .publish_link_fact(crate::private_link::LinkFact::TerminalRevocation);
+                self.inner.with_installed_for_epoch(capability, epoch, || {
+                    if capability.facts().publish_if_association_current(
+                        crate::private_link::LinkFact::TerminalRevocation,
+                        epoch,
+                    ) {
+                        self.inner.revoked.store(true, Ordering::Release);
+                    }
+                });
                 custody_failure(ErrorType::Auth, Some(StatusCode::FORBIDDEN.as_u16()))
             }
             LinkOutcome::TransportUnavailable => custody_failure(ErrorType::Transient, None),
@@ -2042,8 +2125,7 @@ mod tests {
         assert_403_latches("upload").await;
     }
 
-    #[tokio::test]
-    async fn stale_forbidden_completion_does_not_revoke_replacement_capability() {
+    async fn assert_stale_forbidden_preserves_replacement(listing: bool) {
         let old_temp = TempDir::new().unwrap();
         let old_config = Config {
             config_dir: old_temp.path().join("config"),
@@ -2064,15 +2146,27 @@ mod tests {
         let media = write_file(&old_temp, "audio.flac", b"audio");
         let attempt = {
             let client = Arc::clone(&client);
-            tokio::spawn(async move { client.upload_segment("d", "s", &[media]).await })
+            tokio::spawn(async move {
+                if listing {
+                    let result = client.fetch_day_custody("20261017").await;
+                    assert!(!result.proof_available);
+                    assert_eq!(result.error_type, Some(ErrorType::Transient));
+                    None
+                } else {
+                    Some(client.upload_segment("d", "s", &[media]).await)
+                }
+            })
         };
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if old_peer
-                    .requests()
-                    .iter()
-                    .any(|request| request.path == "/app/devices/ingest")
-                {
+                if old_peer.requests().iter().any(|request| {
+                    request.path
+                        == if listing {
+                            "/app/devices/ingest/segments/20261017"
+                        } else {
+                            "/app/devices/ingest"
+                        }
+                }) {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -2095,7 +2189,9 @@ mod tests {
         gate.notify_one();
 
         let result = attempt.await.unwrap();
-        assert!(result.stale_capability);
+        if let Some(ref result) = result {
+            assert!(result.stale_capability);
+        }
         assert!(!client.is_revoked());
         assert!(
             !new_session
@@ -2104,15 +2200,28 @@ mod tests {
                 .snapshot()
                 .terminal_revocation
         );
-        assert_eq!(
-            result.captured_pairing_id.as_deref(),
-            Some(old_session.capability().writer().pairing_id())
-        );
+        if let Some(result) = result {
+            assert_eq!(
+                result.captured_pairing_id.as_deref(),
+                Some(old_session.capability().writer().pairing_id())
+            );
+        }
         old_session.shutdown().await.unwrap();
         new_session.shutdown().await.unwrap();
         old_peer.shutdown().await;
         new_peer.shutdown().await;
     }
+    #[tokio::test]
+    async fn stale_forbidden_completion_does_not_revoke_replacement_capability() {
+        assert_stale_forbidden_preserves_replacement(false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "loopback transport integration; run explicitly"]
+    async fn stale_forbidden_custody_read_does_not_revoke_replacement_capability() {
+        assert_stale_forbidden_preserves_replacement(true).await;
+    }
+
     // listing 403 latches revoked
     #[tokio::test]
     async fn listing_403_latches_revoked() {

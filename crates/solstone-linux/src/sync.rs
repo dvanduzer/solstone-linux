@@ -26,7 +26,7 @@ use crate::{
     sync_health::{
         ErrorType, ProcessEpoch, SyncFacts, SyncHealth, derive_health, load_facts, save_facts,
     },
-    upload::{FileDescriptor, ListingEntry, ListingFile, UploadClient},
+    upload::{CapturedAssociation, FileDescriptor, ListingEntry, ListingFile, UploadClient},
 };
 
 pub const CIRCUIT_THRESHOLD_AUTH: u32 = 1;
@@ -121,6 +121,7 @@ pub(crate) enum UploadOutcome {
     Acked,
     Bounded,
     Stop,
+    Stale,
 }
 
 struct LinkFactPersistence {
@@ -171,6 +172,9 @@ pub struct SyncService {
     task: JoinHandle<()>,
     #[allow(dead_code)]
     optional_jobs: Arc<crate::private_link_optional::OptionalJobs>,
+    state_dir: PathBuf,
+    shared_circuit_open_permanent: Arc<AtomicBool>,
+    circuit_unblock_requested: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -222,10 +226,48 @@ impl SyncSampler {
     }
 }
 
+#[derive(Clone)]
 struct SyncControl {
     notify: Arc<Notify>,
     pending_trigger: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
+    circuit_open_permanent: Arc<AtomicBool>,
+    circuit_unblock_requested: Arc<AtomicBool>,
+}
+
+impl SyncControl {
+    pub(crate) fn new(
+        notify: Arc<Notify>,
+        pending_trigger: Arc<AtomicBool>,
+        running: Arc<AtomicBool>,
+        circuit_open_permanent: Arc<AtomicBool>,
+        circuit_unblock_requested: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            notify,
+            pending_trigger,
+            running,
+            circuit_open_permanent,
+            circuit_unblock_requested,
+        }
+    }
+}
+
+#[cfg(test)]
+impl SyncControl {
+    pub(crate) fn test_new(
+        notify: Arc<Notify>,
+        pending_trigger: Arc<AtomicBool>,
+        running: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            notify,
+            pending_trigger,
+            running,
+            circuit_open_permanent: Arc::new(AtomicBool::new(false)),
+            circuit_unblock_requested: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 impl SyncService {
@@ -258,6 +300,8 @@ impl SyncService {
         let notify = Arc::new(Notify::new());
         let pending_trigger = Arc::new(AtomicBool::new(false));
         let running = Arc::new(AtomicBool::new(true));
+        let shared_circuit_open_permanent = Arc::new(AtomicBool::new(false));
+        let circuit_unblock_requested = Arc::new(AtomicBool::new(false));
         let link_facts = client.link_facts();
         let mut facts = load_facts(&config.state_dir());
         facts.in_progress = false;
@@ -295,11 +339,13 @@ impl SyncService {
             config.clone(),
             Arc::clone(&client),
             Arc::clone(&clock),
-            SyncControl {
-                notify: Arc::clone(&notify),
-                pending_trigger: Arc::clone(&pending_trigger),
-                running: Arc::clone(&running),
-            },
+            SyncControl::new(
+                Arc::clone(&notify),
+                Arc::clone(&pending_trigger),
+                Arc::clone(&running),
+                Arc::clone(&shared_circuit_open_permanent),
+                Arc::clone(&circuit_unblock_requested),
+            ),
             Arc::clone(&facts),
             Arc::clone(&recent_error_count),
             browser_custody,
@@ -318,6 +364,9 @@ impl SyncService {
             abort,
             task,
             optional_jobs,
+            state_dir: config.state_dir(),
+            shared_circuit_open_permanent,
+            circuit_unblock_requested,
         }
     }
 
@@ -330,6 +379,18 @@ impl SyncService {
         SyncTrigger {
             notify: Arc::clone(&self.notify),
             pending_trigger: Arc::clone(&self.pending_trigger),
+        }
+    }
+
+    pub(crate) fn reset_handle(&self) -> SyncResetHandle {
+        SyncResetHandle {
+            facts: Arc::clone(&self.facts),
+            link_facts: self.link_facts.clone(),
+            state_dir: self.state_dir.clone(),
+            shared_circuit_open_permanent: Arc::clone(&self.shared_circuit_open_permanent),
+            circuit_unblock_requested: Arc::clone(&self.circuit_unblock_requested),
+            clock: Arc::clone(&self.clock),
+            stale_threshold: self.stale_threshold,
         }
     }
 
@@ -374,6 +435,78 @@ impl SyncService {
 }
 
 #[derive(Clone)]
+pub(crate) struct SyncResetHandle {
+    clock: Arc<dyn Clock + Send + Sync>,
+    stale_threshold: f64,
+    facts: Arc<Mutex<SyncFacts>>,
+    link_facts: LinkFacts,
+    state_dir: PathBuf,
+    shared_circuit_open_permanent: Arc<AtomicBool>,
+    circuit_unblock_requested: Arc<AtomicBool>,
+}
+
+impl SyncResetHandle {
+    pub(crate) fn sampler_handle(&self) -> SyncSampler {
+        SyncSampler {
+            facts: self.facts.clone(),
+            clock: self.clock.clone(),
+            stale_threshold: self.stale_threshold,
+            poison_reports: Arc::new(AtomicUsize::new(0)),
+            link_facts: self.link_facts.clone(),
+        }
+    }
+
+    pub(crate) fn reset_association_blockers(&self) {
+        self.shared_circuit_open_permanent
+            .store(false, Ordering::Release);
+        self.circuit_unblock_requested
+            .store(true, Ordering::Release);
+        self.link_facts.clear_terminal_revocation();
+        {
+            let mut facts = self.facts.lock().unwrap_or_else(|p| p.into_inner());
+            facts.link = Some(self.link_facts.snapshot());
+            facts.last_error_class = None;
+            facts.last_error_code = None;
+            facts.last_successful_contact = None;
+            facts.last_successful_sync = None;
+            facts.pending_confirmed = None;
+            facts.in_progress = false;
+            facts.progress.clear();
+            if let Err(error) = crate::sync_health::save_facts(&self.state_dir, &facts) {
+                tracing::warn!(%error, "Failed to persist cleared sync facts during association reset");
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        facts: Arc<Mutex<SyncFacts>>,
+        link_facts: LinkFacts,
+        state_dir: PathBuf,
+    ) -> Self {
+        Self {
+            clock: Arc::new(crate::run::SystemClock::new()),
+            stale_threshold: 600.0,
+            facts,
+            link_facts,
+            state_dir,
+            shared_circuit_open_permanent: Arc::new(AtomicBool::new(false)),
+            circuit_unblock_requested: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn circuit_unblock_requested(&self) -> &Arc<AtomicBool> {
+        &self.circuit_unblock_requested
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared_circuit_open_permanent(&self) -> &Arc<AtomicBool> {
+        &self.shared_circuit_open_permanent
+    }
+}
+
+#[derive(Clone)]
 pub struct SyncTrigger {
     notify: Arc<Notify>,
     pending_trigger: Arc<AtomicBool>,
@@ -393,10 +526,13 @@ struct SyncWorker {
     notify: Arc<Notify>,
     pending_trigger: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
+    shared_circuit_open_permanent: Arc<AtomicBool>,
+    circuit_unblock_requested: Arc<AtomicBool>,
     facts: Arc<Mutex<SyncFacts>>,
     recent_error_count: Arc<AtomicU8>,
     browser_custody: Option<Arc<Mutex<crate::browser::custody::Custody>>>,
     link_facts: LinkFacts,
+    association: CapturedAssociation,
     consecutive_failures: u32,
     last_error_type: Option<ErrorType>,
     last_error_code: Option<i64>,
@@ -436,6 +572,7 @@ impl SyncWorker {
         browser_custody: Option<Arc<Mutex<crate::browser::custody::Custody>>>,
     ) -> Self {
         let link_facts = client.link_facts();
+        let association = client.capture_association();
         Self {
             config,
             client,
@@ -443,10 +580,13 @@ impl SyncWorker {
             notify: control.notify,
             pending_trigger: control.pending_trigger,
             running: control.running,
+            shared_circuit_open_permanent: control.circuit_open_permanent,
+            circuit_unblock_requested: control.circuit_unblock_requested,
             facts,
             recent_error_count,
             browser_custody,
             link_facts,
+            association,
             consecutive_failures: 0,
             last_error_type: None,
             last_error_code: None,
@@ -467,6 +607,12 @@ impl SyncWorker {
         loop {
             let _ = tokio::time::timeout(Duration::from_secs(60), self.notify.notified()).await;
             let completion_pending = self.pending_trigger.swap(false, Ordering::AcqRel);
+            self.refresh_association();
+            if self.circuit_unblock_requested.swap(false, Ordering::AcqRel) {
+                self.circuit_open_permanent = false;
+                self.shared_circuit_open_permanent
+                    .store(false, Ordering::Release);
+            }
             if !self.is_running() {
                 // A completion can race shutdown. Give the final local segment one bounded
                 // reconciliation pass before the walker exits. A paired keyless observer uses
@@ -508,6 +654,24 @@ impl SyncWorker {
                 tracing::error!(error, "Sync error");
                 continue;
             }
+        }
+    }
+
+    fn association_is_current(&self) -> bool {
+        self.client.association_is_current(&self.association)
+    }
+
+    fn refresh_association(&mut self) {
+        if !self.association_is_current() {
+            self.association = self.client.capture_association();
+            self.link_facts = self.client.link_facts();
+            self.reset_failures();
+            self.circuit_open = false;
+            self.circuit_open_permanent = false;
+            self.circuit_open_since = 0.0;
+            self.circuit_cooldown = CIRCUIT_COOLDOWN_INITIAL;
+            self.last_contact_flush = 0.0;
+            self.retry_floors.clear();
         }
     }
 
@@ -554,8 +718,9 @@ impl SyncWorker {
     }
 
     fn current_identity_and_pairing(&self) -> (Option<String>, Option<String>) {
-        self.client
-            .capability()
+        self.association
+            .capability
+            .as_ref()
             .map(|cap| {
                 let writer = cap.writer();
                 (
@@ -589,6 +754,12 @@ impl SyncWorker {
     }
 
     async fn try_probe(&mut self) -> bool {
+        self.refresh_association();
+        if self.circuit_unblock_requested.swap(false, Ordering::AcqRel) {
+            self.circuit_open_permanent = false;
+            self.shared_circuit_open_permanent
+                .store(false, Ordering::Release);
+        }
         if self.circuit_open_permanent {
             self.clear_progress();
             return false;
@@ -607,22 +778,29 @@ impl SyncWorker {
         } else {
             Err(crate::private_link::LinkOutcome::TransportUnavailable)
         };
+        if !self.association_is_current() {
+            return false;
+        }
         match outcome {
             Ok(_) => {
-                self.record_contact(true);
+                let mut facts = self.facts.lock().unwrap();
+                if !self.association_is_current() {
+                    return false;
+                }
+                facts.last_successful_contact = Some(self.clock.wall_seconds());
+                facts.last_error_class = None;
+                facts.last_error_code = None;
                 self.circuit_open = false;
                 self.circuit_open_permanent = false;
+                self.shared_circuit_open_permanent
+                    .store(false, Ordering::Release);
                 self.circuit_open_since = 0.0;
                 self.circuit_cooldown = CIRCUIT_COOLDOWN_INITIAL;
                 self.consecutive_failures = 0;
                 self.recent_error_count.store(0, Ordering::Release);
                 self.last_error_type = None;
                 self.last_error_code = None;
-                {
-                    let mut facts = self.facts.lock().unwrap();
-                    facts.last_error_class = None;
-                    facts.last_error_code = None;
-                }
+                drop(facts);
                 self.set_progress("syncing...".to_owned(), true);
                 true
             }
@@ -646,6 +824,7 @@ impl SyncWorker {
     }
 
     async fn sync_pass(&mut self) {
+        self.refresh_association();
         self.facts.lock().unwrap().link = self.client.link_fact_state();
         self.finish_confirmed_locally();
         let now = self.clock.wall_seconds();
@@ -746,6 +925,7 @@ impl SyncWorker {
                         pass_error_code = self.last_error_code;
                         break 'phase1;
                     }
+                    UploadOutcome::Stale => return,
                 }
             }
         }
@@ -824,6 +1004,9 @@ impl SyncWorker {
                 self.set_progress(format!("checking {day}..."), true);
                 requests_made += 1;
                 let custody = self.client.fetch_source_day_custody(&day, source).await;
+                if !self.association_is_current() {
+                    return;
+                }
                 if custody.error_type == Some(ErrorType::Auth) {
                     pass_stopped = true;
                     pass_error_type = custody.error_type;
@@ -886,6 +1069,7 @@ impl SyncWorker {
                                             pass_error_code = self.last_error_code;
                                             break;
                                         }
+                                        UploadOutcome::Stale => return,
                                     }
                                 }
                             }
@@ -985,7 +1169,16 @@ impl SyncWorker {
                                         );
                                         Ok(())
                                     };
-                                    let _ = build_ack_and_unlink();
+                                    if self
+                                        .client
+                                        .with_association_current(
+                                            &self.association,
+                                            build_ack_and_unlink,
+                                        )
+                                        .is_none()
+                                    {
+                                        return;
+                                    }
                                 }
                             }
                         } else if physical_entries.is_empty() {
@@ -1021,6 +1214,7 @@ impl SyncWorker {
                                     pass_error_code = self.last_error_code;
                                     break;
                                 }
+                                UploadOutcome::Stale => return,
                             }
                         }
                     }
@@ -1040,7 +1234,11 @@ impl SyncWorker {
             if now - last_contact >= stale_interval
                 && let Some(capability) = self.client.capability()
             {
-                match capability.system_status().await {
+                let outcome = capability.system_status().await;
+                if !self.association_is_current() {
+                    return;
+                }
+                match outcome {
                     Ok(_) => {
                         self.record_contact(true);
                     }
@@ -1081,6 +1279,9 @@ impl SyncWorker {
     }
 
     async fn upload_segment(&mut self, day: &str, segment_dir: &Path) -> UploadOutcome {
+        if !self.association_is_current() {
+            return UploadOutcome::Stale;
+        }
         let _reservation = match self.reserve_browser_segment(segment_dir) {
             Ok(reservation) => reservation,
             Err(_) => return UploadOutcome::Stop,
@@ -1126,8 +1327,8 @@ impl SyncWorker {
                 segment_source(segment_dir),
             )
             .await;
-        if !result.success && result.stale_capability {
-            return UploadOutcome::Stop;
+        if result.stale_capability || !self.association_is_current() {
+            return UploadOutcome::Stale;
         }
 
         if result.success {
@@ -1175,21 +1376,36 @@ impl SyncWorker {
                         physical_segment: None,
                         files: ack_files,
                     };
-                    #[cfg(test)]
-                    let write_ack_res = {
-                        let mut fault_dir = INGEST_ACK_WRITE_FAULT_DIR.lock().unwrap();
-                        if fault_dir.as_ref().is_some_and(|p| p == segment_dir)
-                            || INGEST_ACK_WRITE_FAULT.swap(false, Ordering::SeqCst)
-                        {
-                            *fault_dir = None;
-                            Err(io::Error::other("injected ack write fault"))
-                        } else {
-                            write_ack(segment_dir, &ack)
-                        }
-                    };
-                    #[cfg(not(test))]
-                    let write_ack_res = write_ack(segment_dir, &ack);
+                    let write_ack_res = self.client.with_association_current(
+                        &self.association,
+                        || -> io::Result<()> {
+                            #[cfg(test)]
+                            let write_ack_res = {
+                                let mut fault_dir = INGEST_ACK_WRITE_FAULT_DIR.lock().unwrap();
+                                if fault_dir.as_ref().is_some_and(|p| p == segment_dir)
+                                    || INGEST_ACK_WRITE_FAULT.swap(false, Ordering::SeqCst)
+                                {
+                                    *fault_dir = None;
+                                    Err(io::Error::other("injected ack write fault"))
+                                } else {
+                                    write_ack(segment_dir, &ack)
+                                }
+                            };
+                            #[cfg(not(test))]
+                            let write_ack_res = write_ack(segment_dir, &ack);
 
+                            write_ack_res?;
+                            let _ = remove_confirmed_segment(
+                                segment_dir,
+                                self.browser_custody.as_ref(),
+                            );
+                            remove_retry(segment_dir);
+                            Ok(())
+                        },
+                    );
+                    let Some(write_ack_res) = write_ack_res else {
+                        return UploadOutcome::Stale;
+                    };
                     if let Err(error) = write_ack_res {
                         tracing::warn!(%error, "Failed to write ingest ack marker");
                         self.retry_floors.insert(
@@ -1199,8 +1415,6 @@ impl SyncWorker {
                         self.record_bounded(None, segment_dir, 3600.0, result.status_code, None);
                         return UploadOutcome::Bounded;
                     }
-                    let _ = remove_confirmed_segment(segment_dir, self.browser_custody.as_ref());
-                    remove_retry(segment_dir);
                     self.record_contact(false);
                     self.reset_failures();
                     return UploadOutcome::Acked;
@@ -1227,7 +1441,13 @@ impl SyncWorker {
             if result.status_code == Some(500)
                 && result.reason_code.as_deref() == Some("segment_removed")
             {
-                if remove_segment_removed(segment_dir).is_err() {
+                let removed = self.client.with_association_current(&self.association, || {
+                    remove_segment_removed(segment_dir)
+                });
+                let Some(removed) = removed else {
+                    return UploadOutcome::Stale;
+                };
+                if removed.is_err() {
                     self.retry_floors.insert(
                         segment_dir.to_path_buf(),
                         self.clock.wall_seconds() + 3600.0,
@@ -1316,6 +1536,9 @@ impl SyncWorker {
         status_code: Option<u16>,
         reason_code: Option<String>,
     ) {
+        if !self.association_is_current() {
+            return;
+        }
         let now = self.clock.wall_seconds();
         let current_retry = read_retry(segment_dir);
         let (current_identity, current_pairing) = self.current_identity_and_pairing();
@@ -1364,6 +1587,9 @@ impl SyncWorker {
             self.last_error_type = Some(err);
             self.last_error_code = status_code.map(i64::from);
             let mut facts = self.facts.lock().unwrap();
+            if !self.association_is_current() {
+                return;
+            }
             facts.last_error_class = Some(err);
             facts.last_error_code = status_code.map(i64::from);
             facts.pending_confirmed = None;
@@ -1373,58 +1599,76 @@ impl SyncWorker {
     }
 
     fn finish_confirmed_locally(&self) {
+        // Scanning a large held backlog must not pin the owner/health locks.
         let segments_by_day = collect_segments(&self.config.captures_dir());
         let (current_identity, current_pairing) = self.current_identity_and_pairing();
         for segments in segments_by_day.values() {
             for segment_dir in segments {
-                let _reservation = match self.reserve_browser_segment(segment_dir) {
-                    Ok(reservation) => reservation,
-                    Err(_) => continue,
-                };
-                let ack = read_ack(segment_dir);
-                if is_ack_valid(
-                    segment_dir,
-                    ack,
-                    current_identity.as_deref(),
-                    current_pairing.as_deref(),
-                ) {
-                    let _ = remove_confirmed_segment(segment_dir, self.browser_custody.as_ref());
-                } else {
-                    let Ok(entries) = fs::read_dir(segment_dir) else {
-                        continue;
+                let finish = || {
+                    let _reservation = match self.reserve_browser_segment(segment_dir) {
+                        Ok(reservation) => reservation,
+                        Err(_) => return,
                     };
-                    let mut all_bookkeeping = true;
-                    for entry in entries {
-                        let Ok(entry) = entry else {
-                            all_bookkeeping = false;
-                            break;
-                        };
-                        let Ok(meta) = entry.metadata() else {
-                            all_bookkeeping = false;
-                            break;
-                        };
-                        if meta.is_dir() {
-                            all_bookkeeping = false;
-                            break;
-                        }
-                        let name = entry.file_name();
-                        let name_str = name.to_string_lossy();
-                        if !is_bookkeeping_file(&name_str) {
-                            all_bookkeeping = false;
-                            break;
-                        }
-                    }
-                    if all_bookkeeping {
+                    let ack = read_ack(segment_dir);
+                    if is_ack_valid(
+                        segment_dir,
+                        ack,
+                        current_identity.as_deref(),
+                        current_pairing.as_deref(),
+                    ) {
                         let _ =
                             remove_confirmed_segment(segment_dir, self.browser_custody.as_ref());
+                    } else {
+                        let Ok(entries) = fs::read_dir(segment_dir) else {
+                            return;
+                        };
+                        let mut all_bookkeeping = true;
+                        for entry in entries {
+                            let Ok(entry) = entry else {
+                                all_bookkeeping = false;
+                                break;
+                            };
+                            let Ok(meta) = entry.metadata() else {
+                                all_bookkeeping = false;
+                                break;
+                            };
+                            if meta.is_dir() {
+                                all_bookkeeping = false;
+                                break;
+                            }
+                            let name = entry.file_name();
+                            if !is_bookkeeping_file(&name.to_string_lossy()) {
+                                all_bookkeeping = false;
+                                break;
+                            }
+                        }
+                        if all_bookkeeping {
+                            let _ = remove_confirmed_segment(
+                                segment_dir,
+                                self.browser_custody.as_ref(),
+                            );
+                        }
                     }
+                };
+                if self
+                    .client
+                    .with_association_current(&self.association, finish)
+                    .is_none()
+                {
+                    return;
                 }
             }
         }
     }
 
     fn record_contact(&mut self, force: bool) {
-        self.facts.lock().unwrap().last_successful_contact = Some(self.clock.wall_seconds());
+        {
+            let mut facts = self.facts.lock().unwrap();
+            if !self.association_is_current() {
+                return;
+            }
+            facts.last_successful_contact = Some(self.clock.wall_seconds());
+        }
         let mono = self.clock.monotonic_seconds();
         if force || mono - self.last_contact_flush >= CONTACT_FLUSH_INTERVAL {
             self.last_contact_flush = mono;
@@ -1434,27 +1678,33 @@ impl SyncWorker {
 
     fn record_failure(&mut self, error_type: Option<ErrorType>, status_code: Option<i64>) {
         let Some(error_type) = error_type else { return };
-        self.last_error_type = Some(error_type);
-        self.last_error_code = status_code;
-        {
-            let mut facts = self.facts.lock().unwrap();
-            facts.last_error_class = Some(error_type);
-            facts.last_error_code = status_code;
-            facts.pending_confirmed = None;
-        }
-        self.save_health();
-        if error_type == ErrorType::Client {
+        let mut facts = self.facts.lock().unwrap();
+        if !self.association_is_current() {
             return;
         }
-        self.consecutive_failures += 1;
-        self.recent_error_count
-            .store(self.consecutive_failures.min(99) as u8, Ordering::Release);
-        if self.consecutive_failures >= self.circuit_threshold() {
-            self.circuit_open = true;
-            self.circuit_open_permanent = error_type == ErrorType::Auth && self.client.is_revoked();
-            self.circuit_open_since = self.clock.monotonic_seconds();
-            self.circuit_cooldown = CIRCUIT_COOLDOWN_INITIAL;
+        self.last_error_type = Some(error_type);
+        self.last_error_code = status_code;
+        facts.last_error_class = Some(error_type);
+        facts.last_error_code = status_code;
+        facts.pending_confirmed = None;
+        if error_type != ErrorType::Client {
+            self.consecutive_failures += 1;
+            self.recent_error_count
+                .store(self.consecutive_failures.min(99) as u8, Ordering::Release);
+            if self.consecutive_failures >= self.circuit_threshold() {
+                self.circuit_open = true;
+                let is_perm = error_type == ErrorType::Auth && self.client.is_revoked();
+                self.circuit_open_permanent = is_perm;
+                if is_perm {
+                    self.shared_circuit_open_permanent
+                        .store(true, Ordering::Release);
+                }
+                self.circuit_open_since = self.clock.monotonic_seconds();
+                self.circuit_cooldown = CIRCUIT_COOLDOWN_INITIAL;
+            }
         }
+        drop(facts);
+        self.save_health();
     }
 
     fn reset_failures(&mut self) {
@@ -1472,6 +1722,9 @@ impl SyncWorker {
         pending_count: Option<i64>,
     ) {
         let mut facts = self.facts.lock().unwrap();
+        if !self.association_is_current() {
+            return;
+        }
         facts.in_progress = false;
         facts.progress.clear();
         if success && error_type.is_none() {
@@ -1507,6 +1760,9 @@ impl SyncWorker {
 
     fn set_progress(&self, progress: String, in_progress: bool) {
         let mut facts = self.facts.lock().unwrap();
+        if !self.association_is_current() {
+            return;
+        }
         facts.progress = progress;
         facts.in_progress = in_progress;
         drop(facts);
@@ -1519,6 +1775,9 @@ impl SyncWorker {
 
     fn save_health(&self) {
         let mut facts = self.facts.lock().unwrap();
+        if !self.association_is_current() {
+            return;
+        }
         facts.link = Some(self.link_facts.snapshot());
         if let Err(error) = save_facts(&self.config.state_dir(), &facts) {
             tracing::warn!(%error, "Failed to save sync health");
@@ -2076,11 +2335,11 @@ pub(crate) async fn cleanup_synced_day_for_composition(
         config,
         client,
         clock,
-        SyncControl {
-            notify: Arc::new(Notify::new()),
-            pending_trigger: Arc::new(AtomicBool::new(false)),
-            running: Arc::new(AtomicBool::new(true)),
-        },
+        SyncControl::test_new(
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+        ),
         Arc::clone(&facts),
         Arc::new(AtomicU8::new(0)),
         None,
@@ -2428,11 +2687,11 @@ mod tests {
             config,
             client,
             clock,
-            SyncControl {
-                notify: Arc::new(Notify::new()),
-                pending_trigger: Arc::new(AtomicBool::new(false)),
-                running: Arc::new(AtomicBool::new(true)),
-            },
+            SyncControl::test_new(
+                Arc::new(Notify::new()),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+            ),
             Arc::new(Mutex::new(SyncFacts::default())),
             Arc::new(AtomicU8::new(0)),
             None,
@@ -4497,11 +4756,11 @@ mod tests {
             config,
             client,
             clock,
-            SyncControl {
-                notify: Arc::new(Notify::new()),
-                pending_trigger: Arc::new(AtomicBool::new(false)),
-                running: Arc::new(AtomicBool::new(true)),
-            },
+            SyncControl::test_new(
+                Arc::new(Notify::new()),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+            ),
             Arc::new(Mutex::new(SyncFacts::default())),
             Arc::new(AtomicU8::new(0)),
             None,
@@ -5252,11 +5511,11 @@ mod tests {
                 wall: 1_800_000_000.0,
                 mono: 0.0,
             }),
-            SyncControl {
-                notify: notify.clone(),
-                pending_trigger: Arc::new(AtomicBool::new(false)),
-                running: running.clone(),
-            },
+            SyncControl::test_new(
+                notify.clone(),
+                Arc::new(AtomicBool::new(false)),
+                running.clone(),
+            ),
             Arc::new(Mutex::new(SyncFacts::default())),
             Arc::new(AtomicU8::new(0)),
             None,
@@ -7231,11 +7490,11 @@ mod tests {
         assert_eq!(fs::read(&pages).unwrap(), original_bytes);
         clock.set_wall(at(16).timestamp() as f64);
 
-        let control = SyncControl {
-            notify: Arc::new(Notify::new()),
-            pending_trigger: Arc::new(AtomicBool::new(false)),
-            running: Arc::new(AtomicBool::new(true)),
-        };
+        let control = SyncControl::test_new(
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+        );
         let mut worker = SyncWorker::new(
             config.clone(),
             Arc::clone(&upload),
@@ -7373,8 +7632,103 @@ mod tests {
         peer_b.shutdown().await;
     }
 
+    #[tokio::test]
+    #[ignore = "loopback transport integration; run explicitly"]
+    async fn stale_idle_and_circuit_probes_cannot_publish_replacement_health() {
+        for idle in [false, true] {
+            for status in [200, 403] {
+                let temp = tempfile::tempdir().unwrap();
+                let config = Config {
+                    base_dir: temp.path().into(),
+                    config_dir: temp.path().join("config"),
+                    stream: "desktop".into(),
+                    ..Config::default()
+                };
+                config.ensure_dirs().unwrap();
+                let old_peer = PrivateLinkPeer::start().await;
+                let new_peer = PrivateLinkPeer::start().await;
+                let old_session = start_private_link_session(
+                    &config.config_dir,
+                    old_peer.credential(),
+                    "desktop",
+                )
+                .await
+                .unwrap();
+                let new_session = start_private_link_session(
+                    &temp.path().join("new-config"),
+                    new_peer.credential(),
+                    "desktop",
+                )
+                .await
+                .unwrap();
+                let clock = Arc::new(MutableClock::new(1_800_000_000.0, 1000.0));
+                let client = Arc::new(UploadClient::new(
+                    &config,
+                    old_session.capability(),
+                    clock.clone(),
+                ));
+                let facts = Arc::new(Mutex::new(SyncFacts::default()));
+                let mut worker = SyncWorker::new(
+                    config,
+                    client.clone(),
+                    clock,
+                    SyncControl::test_new(
+                        Arc::new(Notify::new()),
+                        Arc::new(AtomicBool::new(false)),
+                        Arc::new(AtomicBool::new(true)),
+                    ),
+                    facts.clone(),
+                    Arc::new(AtomicU8::new(0)),
+                    None,
+                );
+                worker.circuit_open = !idle;
+                worker.circuit_cooldown = 0.0;
+                let gate = Arc::new(Notify::new());
+                old_peer.enqueue_gated_response(
+                    status,
+                    br#"{"version":{"current":"2.0.0"}}"#.to_vec(),
+                    gate.clone(),
+                );
+                let probe = tokio::spawn(async move {
+                    if idle {
+                        worker.sync_pass().await;
+                    } else {
+                        assert!(!worker.try_probe().await);
+                    }
+                });
+                old_peer.wait_for_requests(1).await;
+                client.prepare_new_owner();
+                client.install_capability(new_session.capability());
+                {
+                    let mut facts = facts.lock().unwrap();
+                    facts.last_error_class = None;
+                    facts.last_error_code = None;
+                    facts.last_successful_contact = Some(1234.0);
+                    facts.last_successful_sync = Some(2345.0);
+                    facts.pending_confirmed = Some(42);
+                }
+                gate.notify_one();
+                probe.await.unwrap();
+                {
+                    let facts = facts.lock().unwrap();
+                    assert!(facts.last_error_class.is_none());
+                    assert!(facts.last_error_code.is_none());
+                    assert_eq!(facts.last_successful_contact, Some(1234.0));
+                    assert_eq!(facts.last_successful_sync, Some(2345.0));
+                    assert_eq!(facts.pending_confirmed, Some(42));
+                }
+                assert!(!client.is_revoked());
+                assert!(new_peer.requests().is_empty());
+                old_session.shutdown().await.unwrap();
+                new_session.shutdown().await.unwrap();
+                old_peer.shutdown().await;
+                new_peer.shutdown().await;
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn stale_success_keeps_the_captured_ack_and_finishes_browser_cleanup() {
+    async fn stale_success_retains_browser_material_without_acknowledgement() {
         let temp = tempfile::tempdir().unwrap();
         let config = Config {
             base_dir: temp.path().to_path_buf(),
@@ -7397,10 +7751,6 @@ mod tests {
         )
         .await
         .unwrap();
-        let captured_writer = session_a.capability().writer();
-        let captured_identity = captured_writer.identity_key().to_owned();
-        let captured_pairing = captured_writer.pairing_id().to_owned();
-
         let segment = browser_period(&temp);
         let pages = segment.join(crate::browser::PAGES_FILENAME);
         let bytes = fs::read(&pages).unwrap();
@@ -7439,11 +7789,11 @@ mod tests {
             config,
             Arc::clone(&client),
             clock,
-            SyncControl {
-                notify: Arc::new(Notify::new()),
-                pending_trigger: Arc::new(AtomicBool::new(false)),
-                running: Arc::new(AtomicBool::new(true)),
-            },
+            SyncControl::test_new(
+                Arc::new(Notify::new()),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+            ),
             Arc::new(Mutex::new(SyncFacts::default())),
             Arc::new(AtomicU8::new(0)),
             Some(Arc::clone(&custody)),
@@ -7457,19 +7807,11 @@ mod tests {
         client.install_capability(session_b.capability());
         gate.notify_one();
 
-        assert_eq!(upload.await.unwrap(), UploadOutcome::Acked);
+        assert_eq!(upload.await.unwrap(), UploadOutcome::Stale);
         assert!(!client.is_revoked());
         assert!(segment.exists());
         assert_eq!(fs::read(&pages).unwrap(), bytes);
-        let ack = read_ack(&segment).unwrap();
-        assert_eq!(ack.identity_key, captured_identity);
-        assert_eq!(ack.pairing_id, captured_pairing);
-        custody
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .evidence_fault = None;
-        remove_confirmed_segment(&segment, Some(&custody)).unwrap();
-        assert!(!segment.exists());
+        assert!(read_ack(&segment).is_none());
         assert!(peer_b.requests().is_empty());
         session_a.shutdown().await.unwrap();
         session_b.shutdown().await.unwrap();
@@ -7555,11 +7897,11 @@ mod tests {
             config.clone(),
             Arc::clone(&client),
             clock.clone(),
-            SyncControl {
-                notify: Arc::new(Notify::new()),
-                pending_trigger: Arc::new(AtomicBool::new(false)),
-                running: Arc::new(AtomicBool::new(true)),
-            },
+            SyncControl::test_new(
+                Arc::new(Notify::new()),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+            ),
             Arc::new(Mutex::new(SyncFacts::default())),
             Arc::new(AtomicU8::new(0)),
             Some(Arc::clone(&custody)),
@@ -7642,11 +7984,11 @@ mod tests {
             config.clone(),
             success_client,
             clock.clone(),
-            SyncControl {
-                notify: Arc::new(Notify::new()),
-                pending_trigger: Arc::new(AtomicBool::new(false)),
-                running: Arc::new(AtomicBool::new(true)),
-            },
+            SyncControl::test_new(
+                Arc::new(Notify::new()),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+            ),
             Arc::new(Mutex::new(SyncFacts::default())),
             Arc::new(AtomicU8::new(0)),
             Some(Arc::clone(&custody)),
@@ -7721,11 +8063,11 @@ mod tests {
                 wall: 0.0,
                 mono: 0.0,
             }),
-            SyncControl {
-                notify: Arc::new(Notify::new()),
-                pending_trigger: Arc::new(AtomicBool::new(false)),
-                running: Arc::new(AtomicBool::new(true)),
-            },
+            SyncControl::test_new(
+                Arc::new(Notify::new()),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+            ),
             Arc::new(Mutex::new(SyncFacts::default())),
             Arc::new(AtomicU8::new(0)),
             Some(Arc::clone(&abort_custody)),
