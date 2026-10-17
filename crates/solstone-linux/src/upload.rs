@@ -141,6 +141,7 @@ pub(crate) struct Inner {
 #[derive(Clone)]
 pub(crate) struct CapturedAssociation {
     pub(crate) capability: Option<PrivateLinkCapability>,
+    installation: std::sync::Weak<Inner>,
     facts: crate::private_link::LinkFacts,
     epoch: u64,
     installation_generation: u64,
@@ -241,6 +242,7 @@ impl UploadClient {
             |capability| capability.facts(),
         );
         CapturedAssociation {
+            installation: Arc::downgrade(&self.inner),
             epoch: facts.association_epoch(),
             facts,
             capability,
@@ -249,8 +251,9 @@ impl UploadClient {
     }
 
     pub(crate) fn association_is_current(&self, captured: &CapturedAssociation) -> bool {
-        self.inner.installation_generation.load(Ordering::Acquire)
-            == captured.installation_generation
+        std::sync::Weak::ptr_eq(&captured.installation, &Arc::downgrade(&self.inner))
+            && self.inner.installation_generation.load(Ordering::Acquire)
+                == captured.installation_generation
             && captured.facts.association_epoch() == captured.epoch
     }
 
@@ -2123,6 +2126,19 @@ mod tests {
     #[tokio::test]
     async fn upload_403_latches_revoked() {
         assert_403_latches("upload").await;
+    }
+
+    #[test]
+    fn captured_associations_are_scoped_to_client_installation() {
+        let config = Config::default();
+        let clock = Arc::new(MutableClock::new(0.0, 0.0));
+        let first = UploadClient::new(&config, None::<PrivateLinkCapability>, clock.clone());
+        let second = UploadClient::new(&config, None::<PrivateLinkCapability>, clock);
+        let captured = first.capture_association();
+        assert!(first.association_is_current(&captured));
+        assert!(!second.association_is_current(&captured));
+        first.prepare_new_owner();
+        assert!(!first.association_is_current(&captured));
     }
 
     async fn assert_stale_forbidden_preserves_replacement(listing: bool) {

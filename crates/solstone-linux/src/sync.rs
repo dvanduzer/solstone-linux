@@ -7574,10 +7574,8 @@ mod tests {
             })
             .to_string(),
         );
-        assert_eq!(
-            worker.upload_segment("20261002", &segment).await,
-            UploadOutcome::Acked
-        );
+        // The real pass refreshes the worker's association before delivering held material.
+        worker.sync_pass().await;
         let ingest = peer_b
             .requests()
             .into_iter()
