@@ -396,7 +396,7 @@ fn package_payload_authority_matches_both_manifest_dialects() {
         .collect::<Vec<_>>();
     assert_eq!(deb, rpm);
     assert_eq!(deb, expected);
-    assert_eq!(expected.len(), 21);
+    assert_eq!(expected.len(), 22);
 }
 
 fn audit_fixture_bytes(
@@ -415,6 +415,9 @@ fn audit_fixture_bytes(
             include_bytes!("../../../packaging/INSTALL-NOTES").to_vec()
         }
         crate::package_audit::PayloadRole::License => b"audit fixture license\n".to_vec(),
+        crate::package_audit::PayloadRole::MarkFontLicense => {
+            include_bytes!("../../solstone-linux-window/assets/Comfortaa-OFL.txt").to_vec()
+        }
         crate::package_audit::PayloadRole::DependencyNotices => {
             include_bytes!("../../../RUST_DEPENDENCY_NOTICES.txt").to_vec()
         }
@@ -451,6 +454,7 @@ fn audit_tar_with_payload(
                 "share/applications/org.solpbc.solstone.Window.desktop".to_owned()
             }
             crate::package_audit::PayloadRole::License => "LICENSE".to_owned(),
+            crate::package_audit::PayloadRole::MarkFontLicense => "Comfortaa-OFL.txt".to_owned(),
             crate::package_audit::PayloadRole::InstallNotes => "INSTALL-NOTES".to_owned(),
             crate::package_audit::PayloadRole::DependencyNotices => {
                 "RUST_DEPENDENCY_NOTICES.txt".to_owned()
@@ -838,6 +842,7 @@ fn package_audit_real_artifacts_cover_payload_rejection_matrix() {
                                 "share/applications/org.solpbc.solstone.Window.desktop".to_owned()
                             }
                             PayloadRole::License => "LICENSE".to_owned(),
+                            PayloadRole::MarkFontLicense => "Comfortaa-OFL.txt".to_owned(),
                             PayloadRole::InstallNotes => "INSTALL-NOTES".to_owned(),
                             PayloadRole::DependencyNotices => {
                                 "RUST_DEPENDENCY_NOTICES.txt".to_owned()
@@ -866,6 +871,7 @@ fn package_audit_real_artifacts_cover_payload_rejection_matrix() {
                                 "share/applications/org.solpbc.solstone.Window.desktop".to_owned()
                             }
                             PayloadRole::License => "LICENSE".to_owned(),
+                            PayloadRole::MarkFontLicense => "Comfortaa-OFL.txt".to_owned(),
                             PayloadRole::InstallNotes => "INSTALL-NOTES".to_owned(),
                             PayloadRole::DependencyNotices => {
                                 "RUST_DEPENDENCY_NOTICES.txt".to_owned()

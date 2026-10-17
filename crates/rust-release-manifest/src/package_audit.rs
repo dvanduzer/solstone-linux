@@ -24,6 +24,8 @@ use xz2::read::XzDecoder;
 const MAX_MEMBER_BYTES: u64 = 256 * 1024 * 1024;
 const INSTALL_NOTES: &[u8] = include_bytes!("../../../packaging/INSTALL-NOTES");
 const RUST_DEPENDENCY_NOTICES: &[u8] = include_bytes!("../../../RUST_DEPENDENCY_NOTICES.txt");
+const MARK_FONT_LICENSE: &[u8] =
+    include_bytes!("../../solstone-linux-window/assets/Comfortaa-OFL.txt");
 const DESKTOP_ENTRY: &[u8] =
     include_bytes!("../../../packaging/org.solpbc.solstone.Window.desktop");
 pub(crate) const DEB_COPYRIGHT: &[u8] = concat!(
@@ -62,6 +64,7 @@ pub(crate) enum PayloadRole {
     WindowExecutable,
     DesktopEntry,
     License,
+    MarkFontLicense,
     InstallNotes,
     DependencyNotices,
     Icon,
@@ -75,7 +78,7 @@ pub(crate) struct PayloadAuthority {
     pub(crate) role: PayloadRole,
 }
 
-pub(crate) const PAYLOAD_AUTHORITY: [PayloadAuthority; 21] = [
+pub(crate) const PAYLOAD_AUTHORITY: [PayloadAuthority; 22] = [
     PayloadAuthority {
         source: "target/release/solstone-linux",
         installed: "/usr/bin/solstone-linux",
@@ -99,6 +102,12 @@ pub(crate) const PAYLOAD_AUTHORITY: [PayloadAuthority; 21] = [
         installed: "/usr/share/doc/solstone-linux/LICENSE",
         mode: 0o644,
         role: PayloadRole::License,
+    },
+    PayloadAuthority {
+        source: "crates/solstone-linux-window/assets/Comfortaa-OFL.txt",
+        installed: "/usr/share/doc/solstone-linux/Comfortaa-OFL.txt",
+        mode: 0o644,
+        role: PayloadRole::MarkFontLicense,
     },
     PayloadAuthority {
         source: "packaging/INSTALL-NOTES",
@@ -809,6 +818,7 @@ fn expected_path(format: Format, authority: PayloadAuthority) -> String {
                 "share/applications/org.solpbc.solstone.Window.desktop".to_owned()
             }
             PayloadRole::License => "LICENSE".to_owned(),
+            PayloadRole::MarkFontLicense => "Comfortaa-OFL.txt".to_owned(),
             PayloadRole::InstallNotes => "INSTALL-NOTES".to_owned(),
             PayloadRole::DependencyNotices => "RUST_DEPENDENCY_NOTICES.txt".to_owned(),
             PayloadRole::Icon => authority
@@ -894,6 +904,17 @@ fn inspect_payload(
                         path,
                         "DivergentPayload",
                         "desktop-entry",
+                        &expected,
+                    ));
+                }
+                nonbinary.insert(authority.source.to_owned(), digest(&member.bytes));
+            }
+            PayloadRole::MarkFontLicense => {
+                if member.bytes != MARK_FONT_LICENSE {
+                    return Err(audit_error(
+                        path,
+                        "DivergentPayload",
+                        "mark-font-license",
                         &expected,
                     ));
                 }
@@ -1139,6 +1160,7 @@ mod tests {
                     PayloadRole::DesktopEntry => DESKTOP_ENTRY.to_vec(),
                     PayloadRole::InstallNotes => INSTALL_NOTES.to_vec(),
                     PayloadRole::License => b"license\n".to_vec(),
+                    PayloadRole::MarkFontLicense => MARK_FONT_LICENSE.to_vec(),
                     PayloadRole::DependencyNotices => RUST_DEPENDENCY_NOTICES.to_vec(),
                     PayloadRole::Icon => authority.source.as_bytes().to_vec(),
                 };
@@ -1368,6 +1390,7 @@ mod tests {
     fn missing_notes_and_executable_are_rejected_in_all_formats() {
         for (role, member) in [
             (PayloadRole::InstallNotes, "missing"),
+            (PayloadRole::MarkFontLicense, "missing"),
             (PayloadRole::DependencyNotices, "missing"),
             (PayloadRole::Executable, "missing"),
         ] {

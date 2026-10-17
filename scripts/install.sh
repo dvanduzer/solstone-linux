@@ -128,6 +128,7 @@ for REQUIRED in \
   "$TOP/bin/solstone-linux-window" \
   "$TOP/LICENSE" \
   "$TOP/INSTALL-NOTES" \
+  "$TOP/Comfortaa-OFL.txt" \
   "$TOP/RUST_DEPENDENCY_NOTICES.txt" \
   "$TOP/share/icons/hicolor/scalable/apps/solstone-observer.svg" \
   "$TOP/share/applications/org.solpbc.solstone.Window.desktop"; do
@@ -173,6 +174,7 @@ mkdir -p \
 install -m 0755 "$SOURCE/bin/solstone-linux" "$PREFIX/bin/solstone-linux"
 install -m 0755 "$SOURCE/bin/solstone-linux-window" "$PREFIX/bin/solstone-linux-window"
 install -m 0644 "$SOURCE/LICENSE" "$PREFIX/share/doc/solstone-linux/LICENSE"
+install -m 0644 "$SOURCE/Comfortaa-OFL.txt" "$PREFIX/share/doc/solstone-linux/Comfortaa-OFL.txt"
 install -m 0644 "$SOURCE/INSTALL-NOTES" "$PREFIX/share/doc/solstone-linux/INSTALL-NOTES"
 install -m 0644 "$SOURCE/RUST_DEPENDENCY_NOTICES.txt" "$PREFIX/share/doc/solstone-linux/RUST_DEPENDENCY_NOTICES.txt"
 while IFS= read -r -d '' ICON; do
