@@ -52,8 +52,7 @@ systemctl --user start solstone-linux
 
 Pairing is the only setup path, including when your journal is on this machine.
 There is no URL, key, local installation of the journal or Python, or direct
-fallback to configure. The solstone app takes in what you share with it while
-unpaired or offline. Setup asks you to confirm your journal's mark, or takes `--mark` when
+fallback to configure. Setup asks you to confirm your journal's mark, or takes `--mark` when
 there is no terminal. Nothing goes into your journal until you confirm.
 `solstone-linux confirm` confirms a mark while the solstone app is running.
 Setup still needs the app stopped, because setup takes the private-state lock.
