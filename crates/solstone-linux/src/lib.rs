@@ -4,6 +4,7 @@
 pub mod about;
 pub mod activity;
 pub mod audio;
+pub mod bounded_process;
 pub mod browser;
 pub mod capture_stats;
 pub mod chunking;

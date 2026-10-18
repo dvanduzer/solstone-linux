@@ -211,4 +211,4 @@ done < "$SOURCE/share/applications/org.solpbc.solstone.Window.desktop" > "$PREFI
 chmod 0644 "$PREFIX/share/applications/org.solpbc.solstone.Window.desktop"
 
 echo "installed solstone-linux $RELEASE_VERSION under $PREFIX"
-echo "next: solstone-linux install-service"
+echo "next: solstone-linux window"

@@ -113,9 +113,7 @@ impl Tray for KsniTray {
             StandardItem {
                 label: crate::copy::WINDOW_TITLE.into(),
                 activate: Box::new(|_: &mut KsniTray| {
-                    if let Ok(exe) = std::env::current_exe() {
-                        let _ = std::process::Command::new(exe).arg("window").spawn();
-                    }
+                    crate::cli::spawn_window_from_tray();
                 }),
                 ..Default::default()
             }

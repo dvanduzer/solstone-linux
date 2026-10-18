@@ -11,29 +11,29 @@ screen ([details](INSTALL.md#which-desktop-session-it-takes-in)).
 
 **Fedora:**
 ```
-sudo dnf install pulseaudio-libs gstreamer1 gstreamer1-plugins-base gstreamer1-plugins-good pipewire-gstreamer pipewire-pulseaudio xdg-desktop-portal xdg-utils
+sudo dnf install gtk4 glib2 pulseaudio-libs gstreamer1 gstreamer1-plugins-base gstreamer1-plugins-good pipewire-gstreamer pipewire-pulseaudio xdg-desktop-portal xdg-utils
 ```
 
 **Debian / Ubuntu:**
 ```
-sudo apt install libpulse0 libgstreamer1.0-0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-pipewire gstreamer1.0-x pipewire-pulse xdg-desktop-portal xdg-utils
+sudo apt install libgtk-4-1 libglib2.0-bin libpulse0 libgstreamer1.0-0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-pipewire gstreamer1.0-x pipewire-pulse xdg-desktop-portal xdg-utils
 ```
 
 **Arch:**
 ```
-sudo pacman -S libpulse gstreamer gst-plugins-base gst-plugins-good gst-plugin-pipewire pipewire-pulse xdg-desktop-portal xdg-utils
+sudo pacman -S gtk4 glib2 libpulse gstreamer gst-plugins-base gst-plugins-good gst-plugin-pipewire pipewire-pulse xdg-desktop-portal xdg-utils
 ```
 
 **openSUSE:**
 ```
-sudo zypper install libpulse0 gstreamer gstreamer-plugins-base gstreamer-plugins-good gstreamer-plugin-pipewire pipewire-pulseaudio xdg-desktop-portal xdg-utils
+sudo zypper install libgtk-4-1 glib2-tools libpulse0 gstreamer gstreamer-plugins-base gstreamer-plugins-good gstreamer-plugin-pipewire pipewire-pulseaudio xdg-desktop-portal xdg-utils
 ```
 
 ## Install
 
 Your journal must already be available. If it is not, start with the
-[solstone install](https://solstone.app/install). In your journal, create a pair
-link for this device and save it as `pair-link.txt`.
+[solstone install](https://solstone.app/install). In your journal, create a pairing
+link for this device and save it as `pairing-link.txt`.
 
 Install a native Debian or RPM package from `updates.solstone.app`. Read
 `https://updates.solstone.app/solstone-linux/release/latest` for the current
@@ -43,20 +43,33 @@ portable archive installer is:
 
 ```bash
 scripts/install.sh solstone-linux-<VERSION>-linux-x86_64.tar.gz
-solstone-linux install-service
-systemctl --user stop solstone-linux
-solstone-linux setup < pair-link.txt
-systemctl --user start solstone-linux
 ```
 
 The installer is distributed in the source repository, not inside the
 tarball. If you downloaded only the tarball, obtain `scripts/install.sh` from
-the matching release source, or extract it and manually copy `bin/solstone-linux`
-to a directory on `PATH` and `share/icons/hicolor` beneath the same prefix.
+the matching release source, or follow the manual-copy instructions in `INSTALL.md`.
 
-The archive includes `packaging/INSTALL-NOTES`, the canonical runtime-dependency list, and `RUST_DEPENDENCY_NOTICES.txt`, reproducing third-party crate license texts. See `INSTALL.md` for package installation, tray notes, and troubleshooting.
+Check the changelog entry for your installed version. If it does not include
+the window, use [terminal setup](#setup-from-a-terminal).
 
-Pairing is the only setup path. The pair link comes from your journal. A journal
+Open solstone from your app menu or the panel icon. The window shows status,
+pause and resume, journal pairing, settings and help. If the solstone app isn't
+running, choose `start the solstone app` when you're ready. Opening or closing
+the window does not start or stop intake. Choose `pair a device` in the `journal` tab, then compare
+the mark with the one in your journal before confirming it. `open your journal`
+opens your browser.
+
+The window needs GTK 4.6 or newer. The Debian and RPM packages declare that
+dependency; install it yourself for the portable archive. Intake runs in a
+separate process without GTK. Settings remain in
+`$XDG_CONFIG_HOME/solstone-linux/config.json` (normally
+`~/.config/solstone-linux/config.json`). The window keeps hand-added keys and
+tells you when a saved setting needs a restart. Help lets you preview recent
+logs and save exactly that preview to a file you choose.
+
+The archive includes `INSTALL-NOTES`, the canonical runtime-dependency list, and `RUST_DEPENDENCY_NOTICES.txt`, reproducing third-party crate license texts. See `INSTALL.md` for package installation, tray notes, and troubleshooting.
+
+Pairing is the only setup path. The pairing link comes from your journal. A journal
 on the same machine connects through the same private network path as any other journal;
 There is no URL, key, local Python installation, or direct fallback to configure.
 The solstone app can continue taking in what you share while unpaired or offline.
@@ -67,29 +80,30 @@ Setup asks you to confirm your journal's mark, or takes `--mark` when there is n
 ```bash
 git clone https://github.com/solpbc/solstone-linux.git
 cd solstone-linux
-make install-service
+make install
+solstone-linux window
+```
+
+## Setup from a terminal
+
+```bash
+solstone-linux install-service
 systemctl --user stop solstone-linux
-solstone-linux setup < pair-link.txt
+solstone-linux setup < pairing-link.txt
 systemctl --user start solstone-linux
 ```
 
-## Setup
-
 ```bash
-solstone-linux setup < pair-link.txt
+solstone-linux setup --mark "word word" < pairing-link.txt
 ```
 
-```bash
-solstone-linux setup --mark "word word" < pair-link.txt
-```
+Setup and runtime deliberately share one private-state lock. Confirm changes pairing state while the solstone app is running, and setup still needs the app stopped because it takes the lock. If the solstone app is running, setup exits before consuming the pairing link and leaves intake state, configuration, and private state unchanged.
 
-Setup and runtime deliberately share one private-state lock. Confirm changes pairing state while the solstone app is running, and setup still needs the app stopped because it takes the lock. If the solstone app is running, setup exits before consuming the pair link and leaves intake state, configuration, and private state unchanged.
-
-For an upgrade that needs a new pair link:
+For an upgrade that needs a new pairing link:
 
 ```bash
 systemctl --user stop solstone-linux
-solstone-linux setup < pair-link.txt
+solstone-linux setup < pairing-link.txt
 systemctl --user start solstone-linux
 ```
 

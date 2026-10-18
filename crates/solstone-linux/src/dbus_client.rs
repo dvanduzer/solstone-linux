@@ -85,15 +85,26 @@ pub fn verify_owner(
 
 pub struct ControlClient {
     connection: Connection,
+    expected_owner: Option<String>,
 }
 
 impl ControlClient {
     pub fn new(connection: Connection) -> Self {
-        Self { connection }
+        Self {
+            connection,
+            expected_owner: None,
+        }
+    }
+
+    pub fn expect_owner(mut self, owner: String) -> Self {
+        self.expected_owner = Some(owner);
+        self
     }
 
     pub async fn session() -> Result<Self, ControlClientError> {
-        let connection = Connection::session().await?;
+        let connection = tokio::time::timeout(DEFAULT_TIMEOUT, Connection::session())
+            .await
+            .map_err(|_| ControlClientError::Timeout)??;
         Ok(Self::new(connection))
     }
 
@@ -102,6 +113,12 @@ impl ControlClient {
     }
 
     pub async fn get_owner(&self) -> Result<String, ControlClientError> {
+        tokio::time::timeout(DEFAULT_TIMEOUT, self.get_owner_inner())
+            .await
+            .map_err(|_| ControlClientError::Timeout)?
+    }
+
+    async fn get_owner_inner(&self) -> Result<String, ControlClientError> {
         let dbus_proxy = zbus::fdo::DBusProxy::new(&self.connection).await?;
         let name: zbus::names::BusName = crate::desktop_component::OBSERVER_BUS_NAME
             .try_into()
@@ -116,6 +133,12 @@ impl ControlClient {
         &self,
         bus_name: &str,
     ) -> Result<u32, ControlClientError> {
+        tokio::time::timeout(DEFAULT_TIMEOUT, self.get_pid_inner(bus_name))
+            .await
+            .map_err(|_| ControlClientError::Timeout)?
+    }
+
+    async fn get_pid_inner(&self, bus_name: &str) -> Result<u32, ControlClientError> {
         let dbus_proxy = zbus::fdo::DBusProxy::new(&self.connection).await?;
         let name: zbus::names::BusName = bus_name
             .try_into()
@@ -133,9 +156,12 @@ impl ControlClient {
         timeout: Duration,
     ) -> Result<String, ControlClientError> {
         let initial_owner = self.get_owner().await?;
+        if let Some(expected) = &self.expected_owner {
+            verify_owner(Some(&initial_owner), expected)?;
+        }
 
         let call_future = self.connection.call_method(
-            Some(crate::desktop_component::OBSERVER_BUS_NAME),
+            Some(initial_owner.as_str()),
             crate::shell::OBSERVER_PATH,
             Some(crate::desktop_component::OBSERVER_BUS_NAME),
             method,

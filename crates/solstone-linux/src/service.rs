@@ -32,6 +32,14 @@ pub struct ServicePaths {
 }
 
 impl ServicePaths {
+    pub fn for_window() -> io::Result<Self> {
+        let executable = env::current_exe()?;
+        let binary = executable
+            .parent()
+            .ok_or_else(|| io::Error::other("missing executable directory"))?
+            .join("solstone-linux");
+        Self::from_environment(env::var_os("HOME"), binary, env::var("PATH").ok())
+    }
     pub fn production() -> io::Result<Self> {
         Self::from_environment(
             env::var_os("HOME"),
@@ -301,9 +309,13 @@ pub fn start_for_window(
         ServicePresence::Active => WindowStart::AlreadyActive,
         ServicePresence::Uncertain => WindowStart::Uncertain,
         ServicePresence::Inactive => {
-            match systemctl(runner, &["--user", "start", "solstone-linux.service"]) {
+            match systemctl(
+                runner,
+                &["--user", "enable", "--now", "solstone-linux.service"],
+            ) {
                 Ok(out) if out.success => WindowStart::Started,
-                Ok(_) => {
+                Ok(out) => {
+                    let _ = writeln!(output, "{}", out.stdout);
                     let _ = writeln!(
                         output,
                         "Warning: systemctl start failed; run 'systemctl --user start solstone-linux.service' to inspect the error"
@@ -368,7 +380,8 @@ pub fn start_for_window(
                 &["--user", "enable", "--now", "solstone-linux.service"],
             ) {
                 Ok(out) if out.success => WindowStart::Started,
-                Ok(_) => {
+                Ok(out) => {
+                    let _ = writeln!(output, "{}", out.stdout);
                     let _ = writeln!(
                         output,
                         "Warning: systemctl enable --now failed; run 'systemctl --user enable --now solstone-linux.service' to inspect the error"
@@ -392,7 +405,39 @@ pub fn restart_matching_pid(
     expected_pid: u32,
     output: &mut dyn io::Write,
 ) -> MatchingRestart {
-    let out = match systemctl(
+    restart_matching_pid_guarded(runner, expected_pid, output, &|| true)
+}
+
+pub fn restart_matching_pid_guarded(
+    runner: &dyn Runner,
+    expected_pid: u32,
+    output: &mut dyn io::Write,
+    owner_matches: &dyn Fn() -> bool,
+) -> MatchingRestart {
+    match user_service_pid(runner) {
+        Err(_) => MatchingRestart::Uncertain,
+        Ok(pid) if expected_pid == 0 || pid != expected_pid => MatchingRestart::NotMatching,
+        Ok(_) if !owner_matches() => MatchingRestart::NotMatching,
+        Ok(_) => match systemctl(runner, &["--user", "restart", "solstone-linux.service"]) {
+            Ok(out) if out.success => MatchingRestart::Restarted,
+            Ok(out) => {
+                let _ = writeln!(
+                    output,
+                    "systemctl could not restart solstone-linux.service:\n{}",
+                    out.stdout
+                );
+                MatchingRestart::Failed
+            }
+            Err(error) => {
+                let _ = writeln!(output, "Service restart failed: {error}");
+                MatchingRestart::Uncertain
+            }
+        },
+    }
+}
+
+pub fn user_service_pid(runner: &dyn Runner) -> io::Result<u32> {
+    let out = systemctl(
         runner,
         &[
             "--user",
@@ -402,45 +447,15 @@ pub fn restart_matching_pid(
             "--no-pager",
             "solstone-linux.service",
         ],
-    ) {
-        Ok(out) if out.success => out,
-        _ => return MatchingRestart::Uncertain,
-    };
-
-    let mut main_pid = None;
-    for line in out.stdout.lines() {
-        if let Some(val) = line.strip_prefix("MainPID=") {
-            let trimmed = val.trim();
-            if let Ok(pid) = trimmed.parse::<u32>() {
-                main_pid = Some(pid);
-            } else {
-                return MatchingRestart::Uncertain;
-            }
-        }
+    )?;
+    if !out.success {
+        return Err(io::Error::other("service PID unavailable"));
     }
-
-    match main_pid {
-        None => MatchingRestart::NotMatching,
-        Some(0) => MatchingRestart::NotMatching,
-        Some(pid) if pid != expected_pid => MatchingRestart::NotMatching,
-        Some(_) => match systemctl(runner, &["--user", "restart", "solstone-linux.service"]) {
-            Ok(res) if res.success => MatchingRestart::Restarted,
-            Ok(_) => {
-                let _ = writeln!(
-                    output,
-                    "Warning: systemctl restart failed; run 'systemctl --user restart solstone-linux.service' to inspect the error"
-                );
-                MatchingRestart::Failed
-            }
-            Err(error) => {
-                let _ = writeln!(
-                    output,
-                    "Warning: systemctl restart failed: {error}; run 'systemctl --user restart solstone-linux.service' after systemd is available"
-                );
-                MatchingRestart::Uncertain
-            }
-        },
-    }
+    out.stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("MainPID="))
+        .and_then(|pid| pid.trim().parse().ok())
+        .ok_or_else(|| io::Error::other("invalid service PID"))
 }
 
 #[cfg(test)]
@@ -758,7 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn start_for_window_inactive_and_failed_is_start_only() {
+    fn start_for_window_inactive_and_failed_enables_without_restarting() {
         for state in ["inactive", "failed"] {
             let t = tempfile::tempdir().unwrap();
             let paths = fixture(&t, None);
@@ -777,7 +792,10 @@ mod tests {
             );
             let calls = runner.calls.borrow();
             assert_eq!(calls.len(), 2);
-            assert_eq!(calls[1], ["--user", "start", "solstone-linux.service"]);
+            assert_eq!(
+                calls[1],
+                ["--user", "enable", "--now", "solstone-linux.service"]
+            );
             assert!(
                 calls
                     .iter()
@@ -815,6 +833,24 @@ mod tests {
                     .any(|arg| arg == "start" || arg == "stop" || arg == "restart")
             }));
         }
+    }
+
+    #[test]
+    fn restart_rechecks_the_bus_owner_after_the_service_pid_probe() {
+        let runner = FakeRunner {
+            found: true,
+            success: true,
+            active: true,
+            stdout: "MainPID=1234\n".into(),
+            error: false,
+            calls: RefCell::new(Vec::new()),
+        };
+        let result = restart_matching_pid_guarded(&runner, 1234, &mut Vec::new(), &|| {
+            assert_eq!(runner.calls.borrow().len(), 1);
+            false
+        });
+        assert_eq!(result, MatchingRestart::NotMatching);
+        assert_eq!(runner.calls.borrow().len(), 1);
     }
 
     #[test]

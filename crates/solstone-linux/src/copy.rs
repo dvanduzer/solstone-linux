@@ -17,7 +17,7 @@ pub const STATUS_OFF_DETAIL: &str = "intake isn't running.";
 pub const STATUS_ATTENTION: &str = "needs attention";
 pub const STATUS_UNAVAILABLE: &str = "status unavailable";
 pub const STATUS_UNAVAILABLE_DETAIL: &str =
-    "couldn't reach the solstone app. check whether it's running, then try again.";
+    "couldn't read the solstone app's status. check whether it's running, then try again.";
 pub const STATUS_CHECKING: &str = "checking status…";
 pub const STATUS_INTAKE_LABEL: &str = "intake";
 pub const STATUS_SCREEN_LABEL: &str = "screen";
@@ -114,6 +114,10 @@ pub const SETTINGS_RESTART_RECOVERY_FAILED: &str =
     "couldn't restart the solstone app. check the details, then try again.";
 pub const SETTINGS_SAVE_FAILED: &str =
     "couldn't save your settings. check the details, then try again.";
+pub const SETTINGS_SAVE_INCOMPLETE: &str =
+    "couldn't save all your settings. your edits are still here. try again.";
+pub const SETTINGS_SAVE_UNAVAILABLE: &str =
+    "couldn't check whether all your settings were saved. read them again before trying again.";
 pub const SETTINGS_LOAD_FAILED: &str =
     "couldn't read your settings. try again before making changes.";
 pub const SETTINGS_FRAME_INVALID: &str = "enter a whole number from 1 to 10.";
@@ -161,12 +165,33 @@ pub const LAUNCH_RETAINED_DIAGNOSTIC_TEMPLATE: &str =
 
 pub const NOT_YET: &str = "not yet";
 
-pub fn attention_count(count: usize) -> &'static str {
-    if count == 1 {
-        "needs attention"
-    } else {
-        "need attention"
-    }
+pub enum PluralKey {
+    Attention,
+    OmittedBytes,
+}
+
+pub fn plural_copy(key: PluralKey, count: usize, formatted_count: &str) -> String {
+    let template = match (key, count == 1) {
+        (PluralKey::Attention, true) => "{count} needs attention",
+        (PluralKey::Attention, false) => "{count} need attention",
+        (PluralKey::OmittedBytes, true) => "\n[omitted {count} byte]\n",
+        (PluralKey::OmittedBytes, false) => "\n[omitted {count} bytes]\n",
+    };
+    template.replace("{count}", formatted_count)
+}
+
+pub enum ValueKey {
+    Waiting,
+    LastDelivery,
+    Version,
+}
+pub fn value_copy(key: ValueKey, value: &str) -> String {
+    let template = match key {
+        ValueKey::Waiting => "waiting to sync: {value}",
+        ValueKey::LastDelivery => "last delivery: {value}",
+        ValueKey::Version => "app version: {value}",
+    };
+    template.replace("{value}", value)
 }
 
 pub fn journal_mark_speech(tint1: &str, tint2: &str, word1: &str, word2: &str) -> String {
@@ -228,6 +253,8 @@ pub enum CopyKey {
     ActionViewJournal,
     StatusPauseFailed,
     StatusResumeFailed,
+    StatusPauseUnavailable,
+    StatusResumeUnavailable,
     BrowserOpenFailed,
     JournalConnected,
     JournalOffline,
@@ -291,6 +318,8 @@ pub enum CopyKey {
     SettingsRestartFailed,
     SettingsRestartRecoveryFailed,
     SettingsSaveFailed,
+    SettingsSaveIncomplete,
+    SettingsSaveUnavailable,
     SettingsLoadFailed,
     SettingsFrameInvalid,
     SettingsSegmentInvalid,
@@ -317,6 +346,14 @@ pub enum CopyKey {
     LogsSaved,
     LogsSaveFailed,
     LogsFilename,
+    LogsGap,
+    MarkGenericFirst,
+    MarkGenericSecond,
+    MarkGenericSpeech,
+    MarkUnavailableFirst,
+    MarkUnavailableSecond,
+    MarkUnavailableSpeech,
+    HelpLinkFailed,
     ActionStart,
     ActionStarting,
     StatusStartDisclosure,
@@ -365,6 +402,12 @@ impl CopyKey {
             Self::ActionViewJournal => ACTION_VIEW_JOURNAL,
             Self::StatusPauseFailed => STATUS_PAUSE_FAILED,
             Self::StatusResumeFailed => STATUS_RESUME_FAILED,
+            Self::StatusPauseUnavailable => {
+                "couldn't check whether intake paused. check status before trying again."
+            }
+            Self::StatusResumeUnavailable => {
+                "couldn't check whether intake resumed. check status before trying again."
+            }
             Self::BrowserOpenFailed => BROWSER_OPEN_FAILED,
             Self::JournalConnected => JOURNAL_CONNECTED,
             Self::JournalOffline => JOURNAL_OFFLINE,
@@ -428,6 +471,8 @@ impl CopyKey {
             Self::SettingsRestartFailed => SETTINGS_RESTART_FAILED,
             Self::SettingsRestartRecoveryFailed => SETTINGS_RESTART_RECOVERY_FAILED,
             Self::SettingsSaveFailed => SETTINGS_SAVE_FAILED,
+            Self::SettingsSaveIncomplete => SETTINGS_SAVE_INCOMPLETE,
+            Self::SettingsSaveUnavailable => SETTINGS_SAVE_UNAVAILABLE,
             Self::SettingsLoadFailed => SETTINGS_LOAD_FAILED,
             Self::SettingsFrameInvalid => SETTINGS_FRAME_INVALID,
             Self::SettingsSegmentInvalid => SETTINGS_SEGMENT_INVALID,
@@ -454,6 +499,16 @@ impl CopyKey {
             Self::LogsSaved => LOGS_SAVED,
             Self::LogsSaveFailed => LOGS_SAVE_FAILED,
             Self::LogsFilename => LOGS_FILENAME,
+            Self::LogsGap => "\n[the log preview was limited; more log text may be available]\n",
+            Self::MarkGenericFirst => "your",
+            Self::MarkGenericSecond => "journal",
+            Self::MarkGenericSpeech => "your journal, not set up yet",
+            Self::MarkUnavailableFirst => "mark",
+            Self::MarkUnavailableSecond => "unavailable",
+            Self::MarkUnavailableSpeech => "your journal's mark, unavailable right now",
+            Self::HelpLinkFailed => {
+                "couldn't open that link. visit support.solstone.app or email support@solstone.app."
+            }
             Self::ActionStart => ACTION_START,
             Self::ActionStarting => ACTION_STARTING,
             Self::StatusStartDisclosure => STATUS_START_DISCLOSURE,

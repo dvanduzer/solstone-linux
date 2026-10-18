@@ -4,6 +4,7 @@
 use gtk::cairo;
 use gtk::prelude::*;
 use resvg::usvg::{Options, Tree, fontdb};
+use solstone_linux::copy::CopyKey;
 use solstone_linux::window_control::MarkRenderDocument;
 use std::sync::Arc;
 
@@ -28,13 +29,13 @@ pub fn build_mark_card_svg(mark: &MarkRenderDocument) -> String {
     let total_width = 240.0;
     let total_height = 130.0;
     let chip_y = 20.0;
-    let chip1_cx = 20.0 + 24.0;
+    let chip1_cx = (total_width - (48.0 * 2.0 + 11.0)) / 2.0 + 24.0;
     let chip1_cy = chip_y + 24.0;
     let chip2_cx = chip1_cx + 48.0 + 11.0;
     let chip2_cy = chip_y + 24.0;
 
-    let w1 = mark.words[0].to_lowercase();
-    let w2 = mark.words[1].to_lowercase();
+    let w1 = gtk::glib::markup_escape_text(&mark.words[0].to_lowercase());
+    let w2 = gtk::glib::markup_escape_text(&mark.words[1].to_lowercase());
 
     format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="{total_width}" height="{total_height}" viewBox="0 0 {total_width} {total_height}">
@@ -42,7 +43,7 @@ pub fn build_mark_card_svg(mark: &MarkRenderDocument) -> String {
   <g transform="rotate({}, {chip1_cx}, {chip1_cy})">
     <rect x="{}" y="{}" width="48" height="48" rx="12" fill="{}" fill-opacity="0.12" stroke="{}" stroke-width="2"/>
     <g transform="translate({}, {})">
-      <svg width="28" height="28" viewBox="0 0 28 28">
+      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="{}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         {}
       </svg>
     </g>
@@ -50,14 +51,12 @@ pub fn build_mark_card_svg(mark: &MarkRenderDocument) -> String {
   <g transform="rotate({}, {chip2_cx}, {chip2_cy})">
     <rect x="{}" y="{}" width="48" height="48" rx="12" fill="{}" fill-opacity="0.12" stroke="{}" stroke-width="2"/>
     <g transform="translate({}, {})">
-      <svg width="28" height="28" viewBox="0 0 28 28">
+      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="{}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         {}
       </svg>
     </g>
   </g>
-  <text x="{}" y="105" font-family="Comfortaa" font-size="18" text-anchor="middle">
-    <tspan fill="#1A1A1A">{w1}</tspan><tspan fill="#6E6453">·</tspan><tspan fill="#1A1A1A">{w2}</tspan>
-  </text>
+  <text x="{}" y="105" font-family="Comfortaa" font-weight="700" font-size="18" text-anchor="middle" xml:space="preserve"><tspan fill="#1A1A1A">{w1}</tspan><tspan fill="#6E6453"> · </tspan><tspan fill="#1A1A1A">{w2}</tspan></text>
 </svg>"##,
         total_width - 1.0,
         total_height - 1.0,
@@ -68,6 +67,7 @@ pub fn build_mark_card_svg(mark: &MarkRenderDocument) -> String {
         mark.icon1.color.hex,
         chip1_cx - 14.0,
         chip1_cy - 14.0,
+        mark.icon1.color.hex,
         mark.icon1.svg,
         mark.icon2.rot,
         chip2_cx - 24.0,
@@ -76,6 +76,7 @@ pub fn build_mark_card_svg(mark: &MarkRenderDocument) -> String {
         mark.icon2.color.hex,
         chip2_cx - 14.0,
         chip2_cy - 14.0,
+        mark.icon2.color.hex,
         mark.icon2.svg,
         total_width / 2.0,
     )
@@ -97,16 +98,71 @@ pub fn render_mark_card_svg(svg_str: &str, scale: f32) -> Option<resvg::tiny_ski
 }
 
 pub fn create_mark_card_widget(mark: MarkRenderDocument) -> gtk::Widget {
-    let area = gtk::DrawingArea::new();
+    let accessible_name = mark_card_accessible_name(&mark);
+    create_card_widget(build_mark_card_svg(&mark), accessible_name)
+}
+
+fn empty_mark_card_svg(unavailable: bool) -> (String, &'static str) {
+    let (first, second, speech, fill1, fill2, border1, border2, alpha, dash, rotation, glyph) =
+        if unavailable {
+            (
+                CopyKey::MarkUnavailableFirst,
+                CopyKey::MarkUnavailableSecond,
+                CopyKey::MarkUnavailableSpeech,
+                "#FEFCF8",
+                "#FEFCF8",
+                "#ECE3D0",
+                "#ECE3D0",
+                "1",
+                "none",
+                0,
+                "?",
+            )
+        } else {
+            (
+                CopyKey::MarkGenericFirst,
+                CopyKey::MarkGenericSecond,
+                CopyKey::MarkGenericSpeech,
+                "#E8913A",
+                "#D4A017",
+                "#E8913A",
+                "#D4A017",
+                "0.07",
+                "5.69 4.27",
+                45,
+                "",
+            )
+        };
+    let w1 = gtk::glib::markup_escape_text(first.as_str());
+    let w2 = gtk::glib::markup_escape_text(second.as_str());
+    let svg = format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="240" height="130" viewBox="0 0 240 130">
+<rect x="0.5" y="0.5" width="239" height="129" rx="12" fill="#fffdf9" stroke="#e7d8c6"/>
+<rect x="66.5" y="20" width="48" height="48" rx="12" fill="{fill1}" fill-opacity="{alpha}" stroke="{border1}" stroke-width="2" stroke-dasharray="{dash}"/>
+<g transform="rotate({rotation},149.5,44)"><rect x="125.5" y="20" width="48" height="48" rx="12" fill="{fill2}" fill-opacity="{alpha}" stroke="{border2}" stroke-width="2" stroke-dasharray="{dash}"/></g>
+<text x="90.5" y="53" font-family="Comfortaa" font-size="28" text-anchor="middle" fill="#6E6453">{glyph}</text>
+<text x="149.5" y="53" font-family="Comfortaa" font-size="28" text-anchor="middle" fill="#6E6453">{glyph}</text>
+<text x="120" y="105" font-family="Comfortaa" font-weight="700" font-size="18" text-anchor="middle" xml:space="preserve"><tspan fill="#1A1A1A">{w1}</tspan><tspan fill="#6E6453"> · </tspan><tspan fill="#1A1A1A">{w2}</tspan></text></svg>"##
+    );
+    (svg, speech.as_str())
+}
+
+pub fn create_empty_mark_widget(unavailable: bool) -> gtk::Widget {
+    let (svg, speech) = empty_mark_card_svg(unavailable);
+    create_card_widget(svg, speech.into())
+}
+
+fn create_card_widget(svg: String, accessible_name: String) -> gtk::Widget {
+    let area = gtk::DrawingArea::builder()
+        .accessible_role(gtk::AccessibleRole::Presentation)
+        .build();
     area.set_content_width(240);
     area.set_content_height(130);
 
-    let accessible_name = mark_card_accessible_name(&mark);
     let label = gtk::Label::new(Some(&accessible_name));
-    label.set_opacity(0.0);
-    label.set_can_target(false);
-
-    let svg = build_mark_card_svg(&mark);
+    label.set_wrap(true);
+    label.set_max_width_chars(32);
+    label.set_focusable(true);
 
     area.set_draw_func(move |widget, cr, _width, _height| {
         let scale = widget.scale_factor() as f32;
@@ -142,6 +198,7 @@ pub fn create_mark_card_widget(mark: MarkRenderDocument) -> gtk::Widget {
     });
 
     let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    container.set_halign(gtk::Align::Center);
     container.append(&area);
     container.append(&label);
     container.upcast()
@@ -151,6 +208,44 @@ pub fn create_mark_card_widget(mark: MarkRenderDocument) -> gtk::Widget {
 mod tests {
     use super::*;
     use solstone_linux::window_control::{MarkColorDocument, MarkIconDocument, MarkRenderDocument};
+
+    fn dark_pixels(
+        pixmap: &resvg::tiny_skia::Pixmap,
+        xs: std::ops::Range<u32>,
+        ys: std::ops::Range<u32>,
+    ) -> usize {
+        ys.flat_map(|y| xs.clone().map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let pixel = pixmap.pixel(x, y).unwrap();
+                pixel.alpha() > 200
+                    && pixel.red() < 140
+                    && pixel.green() < 140
+                    && pixel.blue() < 140
+            })
+            .count()
+    }
+
+    #[test]
+    fn empty_mark_words_and_unavailable_questions_draw_visible_ink() {
+        for unavailable in [false, true] {
+            let (svg, _) = empty_mark_card_svg(unavailable);
+            let pixmap = render_mark_card_svg(&svg, 1.0).unwrap();
+            assert!(
+                dark_pixels(&pixmap, 20..220, 85..115) > 50,
+                "empty mark words must remain visible"
+            );
+            if unavailable {
+                assert!(
+                    dark_pixels(&pixmap, 75..105, 25..60) > 10,
+                    "first unavailable chip must contain its question mark"
+                );
+                assert!(
+                    dark_pixels(&pixmap, 135..165, 25..60) > 10,
+                    "second unavailable chip must contain its question mark"
+                );
+            }
+        }
+    }
 
     #[test]
     fn accessible_name_matches_speech() {
@@ -181,7 +276,26 @@ mod tests {
 
         let svg = build_mark_card_svg(&mark);
         assert!(!svg.is_empty());
-        let pixmap = render_mark_card_svg(&svg, 1.0);
-        assert!(pixmap.is_some());
+        let database = create_font_database();
+        let faces: Vec<_> = database
+            .faces()
+            .map(|face| (&face.families, face.weight))
+            .collect();
+        assert!(
+            database
+                .query(&fontdb::Query {
+                    families: &[fontdb::Family::Name("Comfortaa")],
+                    weight: fontdb::Weight::BOLD,
+                    ..Default::default()
+                })
+                .is_some(),
+            "bundled Comfortaa must resolve: {faces:?}"
+        );
+        let pixmap = render_mark_card_svg(&svg, 1.0).unwrap();
+        let dark_word_pixels = dark_pixels(&pixmap, 20..220, 85..115);
+        assert!(
+            dark_word_pixels > 50,
+            "mark words must draw visible ink; got {dark_word_pixels}, fonts {faces:?}"
+        );
     }
 }

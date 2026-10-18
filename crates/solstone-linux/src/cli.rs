@@ -21,9 +21,9 @@ use std::{
     env, fs, io,
     io::{BufRead, Read, Write},
     os::unix::fs::PermissionsExt,
-    process::{Command, Stdio},
+    process::Command,
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Debug, Parser)]
@@ -99,7 +99,7 @@ enum Commands {
     DiscardBrowserPages,
 }
 
-struct SystemRunner;
+pub struct SystemRunner;
 
 fn is_executable_file(path: &str) -> bool {
     fs::metadata(path)
@@ -122,41 +122,27 @@ impl Runner for SystemRunner {
         timeout: Duration,
         environment: &HashMap<String, String>,
     ) -> io::Result<Output> {
-        // Only `success` and stdout reach the caller, so an inherited stderr cannot inform
-        // any decision — it can only interleave a probe's complaint into our own output.
-        // `gnome-extensions list` on a non-GNOME desktop is the standard case: it prints
-        // "Failed to connect to GNOME Shell" in the middle of the doctor report while the
-        // check itself correctly resolves to "not applicable".
-        let mut child = Command::new(program)
-            .args(args)
-            .envs(environment)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
-        let mut stdout = child.stdout.take().expect("piped stdout must be present");
-        let reader = thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stdout.read_to_end(&mut bytes).map(|_| bytes)
-        });
-        let started = Instant::now();
-        loop {
-            if let Some(status) = child.try_wait()? {
-                let bytes = reader
-                    .join()
-                    .map_err(|_| io::Error::other("stdout reader panicked"))??;
-                return Ok(Output {
-                    success: status.success(),
-                    stdout: String::from_utf8_lossy(&bytes).into_owned(),
-                });
-            }
-            if started.elapsed() >= timeout {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "command timed out"));
-            }
-            thread::sleep(Duration::from_millis(10));
+        let output = crate::bounded_process::run(
+            Command::new(program).args(args).envs(environment),
+            Some(timeout),
+            64 * 1024,
+        )?;
+        if output.timed_out {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "command timed out"));
         }
+        if output.truncated {
+            return Err(io::Error::other("command output exceeded its bound"));
+        }
+        Ok(Output {
+            success: output.status.success(),
+            stdout: if output.status.success() {
+                String::from_utf8_lossy(&output.stdout).into_owned()
+            } else {
+                let mut diagnostic = String::from_utf8_lossy(&output.stdout).into_owned();
+                diagnostic.push_str(&String::from_utf8_lossy(&output.stderr));
+                diagnostic
+            },
+        })
     }
 }
 
@@ -246,7 +232,7 @@ pub(crate) enum WindowLaunchNotice {
 
 pub(crate) fn window_launch_notice(
     child_success: bool,
-    stderr: &str,
+    runtime_unavailable: bool,
     diagnostic_path: Option<&str>,
     notify_success: bool,
 ) -> WindowLaunchNotice {
@@ -260,7 +246,7 @@ pub(crate) fn window_launch_notice(
                 WindowLaunchNotice::Retained {
                     path: path.to_string(),
                 }
-            } else if stderr.contains("libgtk-4") {
+            } else if runtime_unavailable {
                 WindowLaunchNotice::Runtime {
                     path: path.to_string(),
                 }
@@ -273,43 +259,62 @@ pub(crate) fn window_launch_notice(
     }
 }
 
-fn launch_window() -> i32 {
-    let current = match env::current_exe() {
-        Ok(exe) => exe,
-        Err(_) => return 1,
-    };
-    let window_exe = current
-        .parent()
-        .map(|p| p.join("solstone-linux-window"))
-        .unwrap_or_else(|| std::path::PathBuf::from("solstone-linux-window"));
-
-    let child = Command::new(&window_exe).stderr(Stdio::piped()).spawn();
-
-    let output = match child {
-        Ok(c) => match c.wait_with_output() {
-            Ok(o) => o,
-            Err(_) => return 1,
-        },
-        Err(e) => {
-            let stderr_str = e.to_string();
-            return handle_window_failure(&stderr_str);
-        }
-    };
-
-    if output.status.success() {
-        return 0;
-    }
-
-    let stderr_str = String::from_utf8_lossy(&output.stderr);
-    handle_window_failure(&stderr_str)
+pub(crate) fn spawn_window_from_tray() {
+    thread::spawn(|| {
+        let _ = launch_window(false);
+    });
 }
 
-fn handle_window_failure(stderr_str: &str) -> i32 {
+fn launch_window(in_scope: bool) -> i32 {
+    let current = match env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => return handle_window_failure(&error.to_string(), false),
+    };
+    if !in_scope {
+        // A scope inherits this desktop's environment and survives capture-service restarts.
+        // Its descendants (including a newly started browser) may finish independently.
+        return match Command::new("systemd-run")
+            .args(["--user", "--scope", "--collect", "--quiet", "--"])
+            .arg(&current)
+            .args(["window", "--in-scope"])
+            .status()
+        {
+            Ok(status) if status.success() => 0,
+            Ok(status) if status.code() == Some(80) => 1,
+            Ok(status) => handle_window_failure(&format!("window scope exited: {status}"), false),
+            Err(error) => handle_window_failure(&error.to_string(), false),
+        };
+    }
+    let Some(parent) = current.parent() else {
+        return handle_window_failure("missing executable directory", false);
+    };
+    let result = crate::bounded_process::run(
+        &mut Command::new(parent.join("solstone-linux-window")),
+        None,
+        64 * 1024,
+    );
+    match result {
+        Ok(output) if output.status.success() => 0,
+        Ok(output) => {
+            handle_window_failure(
+                &String::from_utf8_lossy(&output.stderr),
+                matches!(output.status.code(), Some(127 | 78)),
+            );
+            80
+        }
+        Err(error) => {
+            handle_window_failure(&error.to_string(), false);
+            80
+        }
+    }
+}
+
+fn handle_window_failure(stderr_str: &str, runtime_unavailable: bool) -> i32 {
+    eprintln!("{stderr_str}");
     let state_dir = Config::default().state_dir();
     let diagnostic_file = state_dir.join("window-launch.err");
-    let write_ok = fs::create_dir_all(&state_dir)
-        .and_then(|_| fs::write(&diagnostic_file, stderr_str.as_bytes()))
-        .is_ok();
+    let write_ok = fs::create_dir_all(&state_dir).is_ok()
+        && crate::private_file::atomic_write_bytes(&diagnostic_file, stderr_str.as_bytes()).is_ok();
 
     let diag_path = if write_ok {
         diagnostic_file.to_str()
@@ -317,7 +322,7 @@ fn handle_window_failure(stderr_str: &str) -> i32 {
         None
     };
 
-    let body = match window_launch_notice(false, stderr_str, diag_path, true) {
+    let body = match window_launch_notice(false, runtime_unavailable, diag_path, true) {
         WindowLaunchNotice::Runtime { path } => crate::copy::launch_runtime_unavailable(&path),
         WindowLaunchNotice::Failed { path } => crate::copy::launch_failed(&path),
         WindowLaunchNotice::FailedWithoutDiagnostic => {
@@ -334,22 +339,45 @@ fn handle_window_failure(stderr_str: &str) -> i32 {
         .show();
 
     if let WindowLaunchNotice::Retained { path } =
-        window_launch_notice(false, stderr_str, diag_path, notif_res.is_ok())
+        window_launch_notice(false, runtime_unavailable, diag_path, notif_res.is_ok())
     {
         let retained_file = state_dir.join("window-retained.txt");
-        let _ = fs::write(
+        let _ = crate::private_file::atomic_write_bytes(
             &retained_file,
-            crate::copy::launch_retained_diagnostic(&path),
+            crate::copy::launch_retained_diagnostic(&path).as_bytes(),
         );
     }
 
     1
 }
 
+fn open_journal_in_scope(runner: &dyn Runner, target: &str) -> i32 {
+    let Some(program) = runner.which("gio") else {
+        return 1;
+    };
+    match runner.run(
+        &program,
+        &["open", "--", target],
+        Duration::from_secs(5),
+        &HashMap::new(),
+    ) {
+        Ok(output) if output.success => 0,
+        _ => 1,
+    }
+}
+
 pub fn run() -> i32 {
     let arguments: Vec<_> = env::args_os().skip(1).collect();
+    if arguments.len() == 2 && arguments[0] == "open-journal-in-scope" {
+        return arguments[1]
+            .to_str()
+            .map_or(1, |target| open_journal_in_scope(&SystemRunner, target));
+    }
+    if arguments.len() == 2 && arguments[0] == "window" && arguments[1] == "--in-scope" {
+        return launch_window(true);
+    }
     if arguments.len() == 1 && arguments[0] == "window" {
-        return launch_window();
+        return launch_window(false);
     }
     // A browser's native-messaging launch is recognised from argv alone, before any
     // other startup work: no logging, no config, and no credential lock.
@@ -3542,58 +3570,81 @@ mod tests {
     }
 
     #[test]
+    fn browser_dispatch_checks_the_desktop_opener_exit_without_exposing_its_output() {
+        struct Opener(bool);
+        impl Runner for Opener {
+            fn which(&self, name: &str) -> Option<String> {
+                assert_eq!(name, "gio");
+                Some("/usr/bin/gio".into())
+            }
+            fn run(
+                &self,
+                _: &str,
+                args: &[&str],
+                timeout: Duration,
+                _: &HashMap<String, String>,
+            ) -> io::Result<Output> {
+                assert_eq!(args, ["open", "--", "https://journal.example/owner"]);
+                assert_eq!(timeout, Duration::from_secs(5));
+                Ok(Output {
+                    success: self.0,
+                    stdout: "private opener diagnostics".into(),
+                })
+            }
+        }
+        assert_eq!(
+            open_journal_in_scope(&Opener(false), "https://journal.example/owner"),
+            1
+        );
+        assert_eq!(
+            open_journal_in_scope(&Opener(true), "https://journal.example/owner"),
+            0
+        );
+    }
+
+    #[test]
     fn test_window_launch_notice_outcomes() {
         assert_eq!(
-            window_launch_notice(true, "", None, true),
+            window_launch_notice(true, false, None, true),
             WindowLaunchNotice::Silent
         );
         assert_eq!(
-            window_launch_notice(true, "some stderr", Some("/tmp/diag"), false),
+            window_launch_notice(true, false, Some("/tmp/diag"), false),
             WindowLaunchNotice::Silent
         );
 
         assert_eq!(
-            window_launch_notice(false, "any error", None, true),
+            window_launch_notice(false, false, None, true),
             WindowLaunchNotice::FailedWithoutDiagnostic
         );
         assert_eq!(
-            window_launch_notice(false, "any error", None, false),
+            window_launch_notice(false, false, None, false),
             WindowLaunchNotice::FailedWithoutDiagnostic
         );
 
         assert_eq!(
-            window_launch_notice(
-                false,
-                "error while loading shared libraries: libgtk-4.so.1",
-                Some("/tmp/diag"),
-                true
-            ),
+            window_launch_notice(false, true, Some("/tmp/diag"), true),
             WindowLaunchNotice::Runtime {
                 path: "/tmp/diag".into()
             }
         );
 
         assert_eq!(
-            window_launch_notice(false, "unrelated gtk failure", Some("/tmp/diag"), true),
+            window_launch_notice(false, false, Some("/tmp/diag"), true),
             WindowLaunchNotice::Failed {
                 path: "/tmp/diag".into()
             }
         );
 
         assert_eq!(
-            window_launch_notice(
-                false,
-                "error while loading shared libraries: libgtk-4.so.1",
-                Some("/tmp/diag"),
-                false
-            ),
+            window_launch_notice(false, true, Some("/tmp/diag"), false),
             WindowLaunchNotice::Retained {
                 path: "/tmp/diag".into()
             }
         );
 
         assert_eq!(
-            window_launch_notice(false, "some error", Some("/tmp/diag"), false),
+            window_launch_notice(false, false, Some("/tmp/diag"), false),
             WindowLaunchNotice::Retained {
                 path: "/tmp/diag".into()
             }

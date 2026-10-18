@@ -5,29 +5,29 @@ solstone app on linux takes in what you share with it using PipeWire and
 GStreamer, and all of it goes into your journal.
 
 Your journal must already be available. If it is not, start there:
-https://solstone.app/install. Create a pair link for this device in your journal
-and save it as `pair-link.txt`.
+https://solstone.app/install. Create a pairing link for this device in your journal
+and save it as `pairing-link.txt`.
 
 ## System dependencies
 
 **Fedora:**
 ```
-sudo dnf install pulseaudio-libs gstreamer1 gstreamer1-plugins-base gstreamer1-plugins-good pipewire-gstreamer pipewire-pulseaudio xdg-desktop-portal xdg-utils
+sudo dnf install gtk4 glib2 pulseaudio-libs gstreamer1 gstreamer1-plugins-base gstreamer1-plugins-good pipewire-gstreamer pipewire-pulseaudio xdg-desktop-portal xdg-utils
 ```
 
 **Debian / Ubuntu:**
 ```
-sudo apt install libpulse0 libgstreamer1.0-0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-pipewire gstreamer1.0-x pipewire-pulse xdg-desktop-portal xdg-utils
+sudo apt install libgtk-4-1 libglib2.0-bin libpulse0 libgstreamer1.0-0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-pipewire gstreamer1.0-x pipewire-pulse xdg-desktop-portal xdg-utils
 ```
 
 **Arch:**
 ```
-sudo pacman -S libpulse gstreamer gst-plugins-base gst-plugins-good gst-plugin-pipewire pipewire-pulse xdg-desktop-portal xdg-utils
+sudo pacman -S gtk4 glib2 libpulse gstreamer gst-plugins-base gst-plugins-good gst-plugin-pipewire pipewire-pulse xdg-desktop-portal xdg-utils
 ```
 
 **openSUSE:**
 ```
-sudo zypper install libpulse0 gstreamer gstreamer-plugins-base gstreamer-plugins-good gstreamer-plugin-pipewire pipewire-pulseaudio xdg-desktop-portal xdg-utils
+sudo zypper install libgtk-4-1 glib2-tools libpulse0 gstreamer gstreamer-plugins-base gstreamer-plugins-good gstreamer-plugin-pipewire pipewire-pulseaudio xdg-desktop-portal xdg-utils
 ```
 
 ## Install a release
@@ -101,51 +101,85 @@ installer is in the matching release source checkout, not inside the archive:
 
 ```bash
 scripts/install.sh solstone-linux-<VERSION>-linux-x86_64.tar.gz
-solstone-linux install-service
-systemctl --user stop solstone-linux
-solstone-linux setup < pair-link.txt
-systemctl --user start solstone-linux
 ```
 
 If you downloaded only the tarball, obtain `scripts/install.sh` from the
 matching release source. Alternatively, extract the archive, copy
-`bin/solstone-linux` to a directory on `PATH`, and copy `share/icons/hicolor`
-beneath the same installation prefix before running the service and setup
-commands.
+the files from `bin/` to a directory on `PATH`, and copy `share/icons/hicolor`
+beneath the same installation prefix. Copy `share/applications` there when it
+is included. Copy the bundled license notices and `INSTALL-NOTES` to
+`share/doc/solstone-linux` beneath that prefix.
 
 The archive includes `INSTALL-NOTES`, which is the canonical cross-distribution
-runtime dependency list, and `RUST_DEPENDENCY_NOTICES.txt`, reproducing third-party crate license texts. Native packages install the same binary, icon set, and documentation files under `/usr/share/doc/solstone-linux/` (or `$PREFIX/share/doc/solstone-linux/`).
+runtime dependency list, and `RUST_DEPENDENCY_NOTICES.txt`, reproducing third-party crate license texts. Native packages install the app under the system prefix.
+
+### Open the window
+
+Use this section when your version's changelog includes the window. For
+earlier releases, use [terminal pairing](#pair-from-a-terminal).
+
+Open solstone from your app menu or the panel icon. No panel icon extension is
+needed for the window. It has four tabs: `status`, `journal`, `settings` and `help`.
+If the solstone app isn't running, choose `start the solstone app` when you're
+ready. This sets it up to run now and when you sign in. Opening or closing the
+window does not start or stop intake.
+
+In `journal`, paste the pairing link from your journal. Compare the displayed mark
+with your journal's mark before confirming it. You can pair again while intake
+continues. `open your journal` opens it in your browser.
+
+In `settings`, change frame rate, whether to show the cursor, whether to start
+paused, or segment duration. The config file remains the source of truth:
+`$XDG_CONFIG_HOME/solstone-linux/config.json`, normally
+`~/.config/solstone-linux/config.json`. Saving keeps unknown and hand-added keys.
+The window says when a saved change needs a restart and offers to restart the
+solstone app when it can safely do so.
+
+In `help`, read recent logs before choosing `save a copy…`. The saved file is
+exactly the preview you read. Saving does not send it anywhere.
+
+The window requires GTK 4.6 or newer. Debian and RPM declare the dependency;
+the portable archive needs it installed separately. The intake process has no
+GTK dependency and keeps running when the window closes or cannot start.
+
+### Pair from a terminal
+
 The service command writes the systemd user unit and desktop autostart entry,
-enables the unit, and starts the solstone app.
+enables the unit, and starts the solstone app:
+
+```bash
+solstone-linux install-service
+systemctl --user stop solstone-linux
+solstone-linux setup < pairing-link.txt
+systemctl --user start solstone-linux
+```
 
 Pairing is the only setup path:
 
 ```bash
-solstone-linux setup < pair-link.txt
+solstone-linux setup < pairing-link.txt
 ```
 
 ```bash
-solstone-linux setup --mark "word word" < pair-link.txt
+solstone-linux setup --mark "word word" < pairing-link.txt
 ```
 
-The pair link comes from your journal. A journal on the same machine uses the
+The pairing link comes from your journal. A journal on the same machine uses the
 same private network path as any other journal. There is no URL, key, local installation
 of the journal or Python, or direct fallback to configure. The solstone app can
 continue taking in what you share while unpaired or offline. Setup asks you to confirm your journal's mark, or takes `--mark` when there is no terminal. Nothing goes into your journal until you confirm. `solstone-linux confirm` confirms a mark while the solstone app is running. Setup still needs the app stopped, because setup takes the private-state lock.
 
 ## Build from source
 
-Install rustup, a C toolchain, CMake, pkg-config, GLib/GStreamer development headers, and PulseAudio development headers. Then:
+Install rustup, a C toolchain, CMake, pkg-config, GTK4/GLib/GStreamer development headers, and PulseAudio development headers. Then:
 
 ```bash
 git clone https://github.com/solpbc/solstone-linux.git
 cd solstone-linux
 make bootstrap
 make ci
-make install-service
-systemctl --user stop solstone-linux
-solstone-linux setup < pair-link.txt
-systemctl --user start solstone-linux
+make install
+solstone-linux window
 ```
 
 `rust-toolchain.toml` selects the exact compiler, components, and target. `make
@@ -156,10 +190,8 @@ install` explicitly establishes them and cargo-deny before installing the app.
 ```bash
 git pull
 make ci
-make install-service
-systemctl --user stop solstone-linux
-solstone-linux setup < pair-link.txt
-systemctl --user start solstone-linux
+make install
+solstone-linux window
 ```
 
 Setup and runtime deliberately share one private-state lock. Confirm changes pairing state while the solstone app is running, and setup still needs the app stopped because it takes the lock. If the solstone app is running, setup exits before consuming any input and leaves intake state, configuration, and private state unchanged.
@@ -196,7 +228,7 @@ solstone app can't connect to it. Log out and back in to fix that. `solstone-lin
 ### The panel icon
 
 The panel icon is the tray icon on KDE and an icon in the top panel on GNOME. It is
-where pause and resume live. It uses the StatusNotifierItem D-Bus protocol: KDE supports
+one way to reach pause and resume. It uses the StatusNotifierItem D-Bus protocol: KDE supports
 that directly, GNOME does not, and GNOME needs the AppIndicator extension before an icon
 can appear at all.
 
@@ -233,7 +265,7 @@ While the panel icon is missing, the solstone app offers to set it up once per r
 to see the offer again.
 
 Without a panel icon the solstone app keeps working normally, and everything you share
-with it still reaches your journal. Pause and resume stay reachable from a terminal:
+with it still reaches your journal. Use a terminal:
 
 ```bash
 solstone-linux pause               # until you resume

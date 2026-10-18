@@ -1,51 +1,61 @@
 solstone-linux Rust release install notes
 
-This package contains the solstone app for linux and its canonical icons. It intentionally
-does not install a systemd unit: service ownership
-belongs to the optional `solstone-linux install-service` command.
+This package contains the solstone app for linux, its window and canonical icons.
+Open solstone from the app menu. If the app isn't running, choose
+`start the solstone app` when you're ready; this sets it up to run now and when
+you sign in. Opening or closing the window does not start or stop intake.
+Packages do not run service installation scripts. Service setup happens only
+when you choose it in the window or run `solstone-linux install-service`.
 
 Runtime requirements:
 
 - glibc 2.35 or newer
+- GTK 4.6 or newer for the window; intake runs separately without GTK
 - libpulse and a PulseAudio-compatible server (PipeWire Pulse is supported)
 - GStreamer 1.0 core, base, good, PipeWire, and X11 plugins
 - PipeWire and xdg-desktop-portal with ScreenCast support for Wayland screen frames
-- xdg-utils for opening links
+- GIO tools for opening your journal in the browser
+- xdg-utils for desktop integration
 - a desktop notification service; a StatusNotifier host is what shows the panel icon.
   KDE has one. On GNOME, run `solstone-linux panel-icon` after installing this package
 
 Typical package families:
 
-- Debian/Ubuntu: libpulse0, libgstreamer1.0-0,
+- Debian/Ubuntu: libgtk-4-1, libglib2.0-bin, libpulse0, libgstreamer1.0-0,
   gstreamer1.0-plugins-base, gstreamer1.0-plugins-good,
   gstreamer1.0-pipewire, gstreamer1.0-x, pipewire-pulse,
   xdg-desktop-portal, xdg-utils
-- Fedora/RHEL: pulseaudio-libs, gstreamer1,
+- Fedora/RHEL: gtk4, glib2, pulseaudio-libs, gstreamer1,
   gstreamer1-plugins-base, gstreamer1-plugins-good, pipewire-gstreamer,
   pipewire-pulseaudio, xdg-desktop-portal, xdg-utils
-- openSUSE: libpulse0, gstreamer, gstreamer-plugins-base,
+- openSUSE: libgtk-4-1, glib2-tools, libpulse0, gstreamer, gstreamer-plugins-base,
   gstreamer-plugins-good, gstreamer-plugin-pipewire, pipewire-pulseaudio,
   xdg-desktop-portal, xdg-utils
-- Arch: libpulse, gstreamer, gst-plugins-base, gst-plugins-good,
+- Arch: gtk4, glib2, libpulse, gstreamer, gst-plugins-base, gst-plugins-good,
   gst-plugin-pipewire, pipewire-pulse, xdg-desktop-portal, xdg-utils
 
-Create a pair link for this device in your journal, save it as
-`pair-link.txt`, then pair and start the solstone app:
+Create a pairing link for this device in your journal, paste it in the window's
+`journal` tab, then compare your journal's mark before confirming it.
+The window also has status, pause and resume, settings, and recent logs you can
+preview and save. `open your journal` opens your browser. Saved settings remain
+in config.json, including hand-added keys; the window says when a restart is
+needed. The portable archive needs the runtime packages installed separately.
+
+To pair from a terminal, save the link as `pairing-link.txt`, then:
 
 ```bash
 solstone-linux install-service
 systemctl --user stop solstone-linux
-solstone-linux setup < pair-link.txt
+solstone-linux setup < pairing-link.txt
 systemctl --user start solstone-linux
 ```
 
 Pairing is the only setup path, including when your journal is on this machine.
 There is no URL, key, local installation of the journal or Python, or direct
 fallback to configure. The solstone app takes in what you share with it while
-unpaired or offline, holding segments on this device until they reach your
-journal. Setup asks you to confirm your journal's mark, or takes `--mark` when
+unpaired or offline. Setup asks you to confirm your journal's mark, or takes `--mark` when
 there is no terminal. Nothing goes into your journal until you confirm.
 `solstone-linux confirm` confirms a mark while the solstone app is running.
 Setup still needs the app stopped, because setup takes the private-state lock.
 
-Setup and runtime share one private-state lock. If the app is running, setup exits before consuming input and leaves intake, config, and private state unchanged. Use the same stop, setup, start sequence when an upgrade requires a new pair link.
+Setup and runtime share one private-state lock. If the app is running, setup exits before consuming input and leaves intake, config, and private state unchanged. Use the same stop, setup, start sequence when an upgrade requires a new pairing link.

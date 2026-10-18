@@ -17,10 +17,23 @@ fn main() {
         return;
     }
 
+    if gtk::major_version() < 4 || (gtk::major_version() == 4 && gtk::minor_version() < 6) {
+        std::process::exit(78);
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(70);
+        });
+    let _runtime_context = runtime.enter();
+
     let app = gtk::Application::builder()
         .application_id("org.solpbc.solstone.Window")
         .build();
 
     app.connect_activate(ui::build_ui);
-    app.run();
+    std::process::exit(app.run().into());
 }

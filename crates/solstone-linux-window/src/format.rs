@@ -18,11 +18,25 @@ pub fn format_integer<T: ToFormattedStr>(n: T) -> String {
 
 pub fn format_timestamp(epoch_secs: f64) -> String {
     if let Ok(dt) = glib::DateTime::from_unix_local(epoch_secs as i64)
-        && let Ok(s) = dt.format("%Y-%m-%d %H:%M:%S")
+        && let Ok(s) = dt.format("%c")
     {
         return s.to_string();
     }
-    format!("{epoch_secs:.0}")
+    format_integer(epoch_secs as i64)
+}
+
+pub fn parse_integer(text: &str) -> Option<i64> {
+    let text = text.trim();
+    if let Ok(value) = text.parse() {
+        return Some(value);
+    }
+    let locale = SystemLocale::default().ok()?;
+    let separator = locale.separator();
+    if separator.is_empty() {
+        return None;
+    }
+    let value = text.replace(separator, "").parse::<i64>().ok()?;
+    (format_integer(value) == text).then_some(value)
 }
 
 #[cfg(test)]

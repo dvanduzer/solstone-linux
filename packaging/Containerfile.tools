@@ -126,6 +126,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libglib2.0-0 \
         libgtk-4-1 \
+        libglib2.0-bin \
         libgstreamer1.0-0 \
         libpulse0 \
     && rm -rf /var/lib/apt/lists/*

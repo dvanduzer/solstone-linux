@@ -1788,7 +1788,33 @@ impl OpenJournalCapability {
         // Opening necessarily hands the approved target to the desktop browser.
         // The target is accepted in child argv here; it remains excluded from the
         // secrecy contract's logs, errors, status, clipboard, D-Bus, state, and Debug surfaces.
-        self.open_inner(|target| open::that_detached(target).map_err(|_| ()))
+        self.open_inner(|target| {
+            let executable = std::env::current_exe().map_err(|_| ())?;
+            // Scope metadata carries only a fixed description and PIDs. The approved URL
+            // stays in child argv, never in a transient service's ExecStart properties.
+            let output = crate::bounded_process::run(
+                std::process::Command::new("systemd-run")
+                    .args([
+                        "--user",
+                        "--scope",
+                        "--collect",
+                        "--quiet",
+                        "--description=solstone journal browser",
+                        "--",
+                    ])
+                    .arg(executable)
+                    .arg("open-journal-in-scope")
+                    .arg(target),
+                Some(std::time::Duration::from_secs(5)),
+                4096,
+            )
+            .map_err(|_| ())?;
+            if output.status.success() && !output.timed_out {
+                Ok(())
+            } else {
+                Err(())
+            }
+        })
     }
 
     fn open_inner(&self, opener: impl FnOnce(&str) -> Result<(), ()>) -> Result<(), ()> {

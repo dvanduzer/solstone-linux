@@ -12,6 +12,7 @@ This is **not** part of the solstone monorepo. It is a standalone Rust package w
 
 ```
 crates/solstone-linux/src/  Shipping Rust observer, CLI, service, sync, and capture code
+crates/solstone-linux-window/src/ Separate GTK4 desktop window
 crates/rust-release-manifest/src/transparency.rs  Release-transparency publisher (not active)
 transparency-head-log.jsonl Tracked transparency head witness
 packaging/                  Native package Containerfile and install notes
@@ -112,6 +113,7 @@ markdown, TOML, or config files.
 
 Shipping system packages:
 - glibc 2.35 or newer
+- GTK 4.6 or newer for the separate window; the daemon remains GTK-free
 - libpulse and a PulseAudio-compatible server such as PipeWire Pulse
 - GStreamer 1.0 core, base, good, PipeWire, and X11 plugins
 - PipeWire and xdg-desktop-portal with ScreenCast support for Wayland screen frames
