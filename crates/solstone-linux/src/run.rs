@@ -431,6 +431,10 @@ fn run_capture(
     } else {
         Ok(())
     };
+    // The supervisor closes the link when the last handler drops or on the notify below.
+    // The desktop shell drops its handler as it stops, so hold one until sync has drained
+    // the final segment over that link (runtime order step 7).
+    let window_control_until_linked_stage = window_control.clone();
     let desktop_shell = crate::shell::start(
         runtime,
         ShellInputs {
@@ -497,7 +501,11 @@ fn run_capture(
     if let Some(browser) = browser {
         runtime.block_on(browser.shutdown());
     }
-    linked_shutdown_notify.notify_one();
+    let linked_start = async move {
+        linked_shutdown_notify.notify_one();
+        drop(window_control_until_linked_stage);
+        linked_start.await
+    };
     let (shutdown, sync_shutdown, linked_shutdown) = runtime.block_on(shutdown_in_order(
         observer,
         (Observer::shutdown, || open_journal.close_current()),
