@@ -720,11 +720,46 @@ fn dependency_policy_denies_wildcards_and_unknown_sources() {
     assert_eq!(deny["bans"]["wildcards"].as_str(), Some("deny"));
     assert_eq!(deny["sources"]["unknown-registry"].as_str(), Some("deny"));
     assert_eq!(deny["sources"]["unknown-git"].as_str(), Some("deny"));
-    for ignored in deny["advisories"]["ignore"].as_array().unwrap() {
+    let ignores = deny["advisories"]["ignore"].as_array().unwrap();
+    let ids: std::collections::BTreeSet<_> = ignores
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ignores.len(), ids.len(), "duplicate advisory exception");
+    assert_eq!(
+        ids,
+        std::collections::BTreeSet::from([
+            "RUSTSEC-2026-0194",
+            "RUSTSEC-2026-0195",
+            "RUSTSEC-2026-0370",
+            "RUSTSEC-2026-0371",
+            "RUSTSEC-2026-0372",
+        ])
+    );
+    for ignored in ignores {
+        let id = ignored["id"].as_str().unwrap();
         let reason = ignored["reason"].as_str().unwrap();
         assert!(reason.contains("Owner: sol pbc engineering."));
-        assert!(reason.contains("Build-only via wayland-scanner; it parses crate-bundled protocol XML, not runtime or untrusted input."));
-        assert!(reason.contains("Remove when wayland-scanner accepts quick-xml >=0.41."));
+        match id {
+            "RUSTSEC-2026-0194" | "RUSTSEC-2026-0195" => {
+                assert!(reason.contains("Build-only via wayland-scanner; it parses crate-bundled protocol XML, not runtime or untrusted input."));
+                assert!(reason.contains("Remove when wayland-scanner accepts quick-xml >=0.41."));
+            }
+            "RUSTSEC-2026-0370" | "RUSTSEC-2026-0371" | "RUSTSEC-2026-0372" => {
+                let package = match id {
+                    "RUSTSEC-2026-0370" => "zvariant 5.13.0",
+                    "RUSTSEC-2026-0371" => "zbus_names 4.3.3",
+                    _ => "zvariant_derive 5.13.0",
+                };
+                assert!(reason.contains(package));
+                assert!(reason.contains("require zbus 5"));
+                assert!(reason.contains("input-boundary changes, new advisories"));
+                assert!(reason.contains("consumer releases that eliminate zbus 5"));
+                assert!(reason.contains("remove with this package"));
+                assert!(reason.contains("https://github.com/z-galaxy/zbus/issues/2043"));
+            }
+            _ => unreachable!("unreviewed advisory exception"),
+        }
     }
 }
 

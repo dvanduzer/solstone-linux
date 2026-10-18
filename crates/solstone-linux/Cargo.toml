@@ -51,7 +51,7 @@ browser = []
 browser-dev-host = ["browser"]
 
 [build-dependencies]
-resvg = { version = "0.47", default-features = false }
+resvg = { version = "0.48.1", default-features = false }
 
 [dev-dependencies]
 rustix = { version = "1", features = ["pty", "termios"] }

@@ -57,6 +57,20 @@ const EXPECTED_NEEDED: [&str; 8] = [
     "libm.so.6",
     "libc.so.6",
 ];
+// Closed GTK4/Cairo/GLib and Rust/C runtime surface. The optimized candidate's
+// actual imports are checked against this set; no other native library is
+// admitted just because GTK4 is present.
+const WINDOW_ALLOWED_NEEDED: [&str; 9] = [
+    "libgtk-4.so.1",
+    "libcairo.so.2",
+    "libgio-2.0.so.0",
+    "libgobject-2.0.so.0",
+    "libglib-2.0.so.0",
+    "libgcc_s.so.1",
+    "libm.so.6",
+    "libc.so.6",
+    "ld-linux-x86-64.so.2",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PayloadRole {
@@ -1029,7 +1043,9 @@ fn inspect_window_elf(path: &Path, bytes: &[u8]) -> Result<()> {
         || parsed
             .needed
             .iter()
-            .any(|library| library.contains("webkit") || library.starts_with("libgtk-3"))
+            .any(|library| !WINDOW_ALLOWED_NEEDED.contains(&library.as_str()))
+        || !parsed.needed.iter().any(|library| library == "libc.so.6")
+        || parsed.needed.iter().collect::<BTreeSet<_>>().len() != parsed.needed.len()
         || parsed.soname.is_some()
         || parsed.rpath.is_some()
         || parsed.runpath.is_some()
@@ -1468,6 +1484,56 @@ mod tests {
         }
         for allowed in ["solstone-linux", "libsol", "journald", "libpython-free"] {
             assert_eq!(forbidden_dependency(allowed), None, "{allowed}");
+        }
+    }
+
+    #[test]
+    fn window_accepts_only_its_declared_runtime_surface() {
+        for format in [Format::Tar, Format::Deb, Format::Rpm] {
+            let elf = crate::elf64::linkage_elf64_for_test(
+                EXPECTED_INTERPRETER,
+                &WINDOW_ALLOWED_NEEDED,
+                None,
+                None,
+                None,
+            );
+            inspect_window_elf(artifact(format), &elf).unwrap();
+            for libraries in [
+                vec!["libc.so.6"],
+                vec!["libgtk-4.so.1"],
+                vec!["libgtk-4.so.1", "libc.so.6", "libgtk-4.so.1"],
+                vec!["libgtk-4.so.1", "libc.so.6", "libgtk-3.so.0"],
+                vec!["libgtk-4.so.1", "libc.so.6", "libwebkitgtk-6.0.so.4"],
+            ] {
+                let elf = crate::elf64::linkage_elf64_for_test(
+                    EXPECTED_INTERPRETER,
+                    &libraries,
+                    None,
+                    None,
+                    None,
+                );
+                assert!(inspect_window_elf(artifact(format), &elf).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn window_rejects_unexpected_dynamic_libraries() {
+        for format in [Format::Tar, Format::Deb, Format::Rpm] {
+            let elf = crate::elf64::linkage_elf64_for_test(
+                EXPECTED_INTERPRETER,
+                &["libgtk-4.so.1", "libc.so.6", "libextra-codec.so.1"],
+                None,
+                None,
+                None,
+            );
+            let error = inspect_window_elf(artifact(format), &elf).unwrap_err();
+            assert!(error.to_string().contains("class=UnexpectedImport"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("member=/usr/bin/solstone-linux-window")
+            );
         }
     }
 
