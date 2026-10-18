@@ -6,6 +6,8 @@ and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+## [2.0.23] - 2026-10-18
+
 ### Fixed
 
 - away from home, if you use the relay, the solstone app now reaches your journal through it on its first try after the connection drops. before, that first try could give up while it was still waiting on your home network, so sync showed offline for one to five more minutes.
