@@ -110,6 +110,16 @@ impl Tray for KsniTray {
             ..Default::default()
         };
         vec![
+            StandardItem {
+                label: crate::copy::WINDOW_TITLE.into(),
+                activate: Box::new(|_: &mut KsniTray| {
+                    if let Ok(exe) = std::env::current_exe() {
+                        let _ = std::process::Command::new(exe).arg("window").spawn();
+                    }
+                }),
+                ..Default::default()
+            }
+            .into(),
             item(self.model.header.clone(), false),
             MenuItem::Separator,
             pause.into(),
@@ -253,7 +263,7 @@ mod tests {
         let mut tray = tray();
         tray.model.open_journal_enabled = true;
         let menu = tray.menu();
-        assert_eq!(menu.len(), 11);
+        assert_eq!(menu.len(), 12);
         let labels: Vec<&str> = menu
             .iter()
             .map(|item| match item {
@@ -266,6 +276,7 @@ mod tests {
         assert_eq!(
             labels,
             [
+                "solstone",
                 tray.model.header.as_str(),
                 "<separator>",
                 "pause",
@@ -279,7 +290,7 @@ mod tests {
                 "managed via systemctl"
             ]
         );
-        let status = match &menu[5] {
+        let status = match &menu[6] {
             MenuItem::SubMenu(value) => value,
             _ => panic!("status submenu missing"),
         };
@@ -291,7 +302,7 @@ mod tests {
             },
             tray.model.header
         );
-        let pause = match &menu[2] {
+        let pause = match &menu[3] {
             MenuItem::SubMenu(value) => value,
             _ => panic!("pause submenu missing"),
         };
@@ -316,12 +327,12 @@ mod tests {
                 TrayCommand::PauseIndefinite
             ]
         );
-        if let MenuItem::Standard(value) = &menu[6] {
+        if let MenuItem::Standard(value) = &menu[7] {
             assert!(value.enabled);
             (value.activate)(&mut tray);
         }
         assert_eq!(receiver.try_recv(), Ok(TrayCommand::OpenJournal));
-        let about = match &menu[8] {
+        let about = match &menu[9] {
             MenuItem::SubMenu(value) => value,
             _ => panic!("about submenu missing"),
         };
@@ -361,7 +372,7 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         tray.commands = sender;
         let menu = tray.menu();
-        let MenuItem::SubMenu(about) = &menu[8] else {
+        let MenuItem::SubMenu(about) = &menu[9] else {
             panic!("about submenu missing");
         };
         let lines: Vec<_> = about.submenu[..2]
@@ -397,7 +408,7 @@ mod tests {
         for expected in [false, true, false] {
             tray.model.open_journal_enabled = expected;
             let menu = tray.menu();
-            let MenuItem::Standard(open_journal) = &menu[6] else {
+            let MenuItem::Standard(open_journal) = &menu[7] else {
                 panic!("open journal item missing");
             };
             assert_eq!(open_journal.enabled, expected);

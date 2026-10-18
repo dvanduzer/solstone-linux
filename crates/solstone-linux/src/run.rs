@@ -343,6 +343,13 @@ fn run_capture(
     let (linked_start, window_control) = if process_epoch.is_some() {
         let shutdown_notify = Arc::clone(&linked_shutdown_notify);
         let on_confirmed = Some(sync_trigger.clone());
+        let effective_settings = Some(crate::window_control::SettingsDocument {
+            capture_framerate: config.capture_framerate,
+            draw_cursor: config.draw_cursor,
+            start_paused: config.start_paused,
+            segment_interval: config.segment_interval,
+        });
+        let captures_dir = Some(config.captures_dir());
         let (supervisor, handler) = crate::window_control::WindowControlSupervisor::new(
             linked_state_lock,
             linked_upload,
@@ -363,6 +370,8 @@ fn run_capture(
             Arc::new(crate::private_file::NoWriteFault),
             Arc::clone(&health),
             Arc::clone(&snapshot),
+            effective_settings,
+            captures_dir,
         );
         (runtime.spawn(supervisor.run()), handler)
     } else {

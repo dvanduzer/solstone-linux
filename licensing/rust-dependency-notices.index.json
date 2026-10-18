@@ -1,6 +1,6 @@
 {
   "schema": "solstone-linux.rust-dependency-notices.v1",
-  "cargo_lock_sha256": "7f488a661b317ee7a723c9b05f284fb75a2ed11bba31e6eb8dffd41b90d7ad98",
+  "cargo_lock_sha256": "8ab263d7d8d10f944509a65bd92d044e6d956cef700f99ac1b28b77a3f11b42a",
   "notices_sha256": "083eebee5858cdd3b8dbddefeea3a912fc155f181899c547999f8f1e5558cb74",
   "population_query": "cargo metadata --locked --offline --format-version 1 --filter-platform x86_64-unknown-linux-gnu",
   "root_package": "solstone-linux-window",
@@ -2624,7 +2624,7 @@
     },
     {
       "name": "gio-sys",
-      "version": "0.22.8",
+      "version": "0.22.9",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "license": "MIT",
       "members": [

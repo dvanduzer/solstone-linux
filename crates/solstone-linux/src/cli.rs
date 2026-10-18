@@ -235,12 +235,126 @@ fn setup_logging(verbose: bool) {
     let _ = tracing_subscriber::fmt().with_max_level(level).try_init();
 }
 
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) enum WindowLaunchNotice {
+    Silent,
+    Runtime { path: String },
+    Failed { path: String },
+    FailedWithoutDiagnostic,
+    Retained { path: String },
+}
+
+pub(crate) fn window_launch_notice(
+    child_success: bool,
+    stderr: &str,
+    diagnostic_path: Option<&str>,
+    notify_success: bool,
+) -> WindowLaunchNotice {
+    if child_success {
+        return WindowLaunchNotice::Silent;
+    }
+    match diagnostic_path {
+        None => WindowLaunchNotice::FailedWithoutDiagnostic,
+        Some(path) => {
+            if !notify_success {
+                WindowLaunchNotice::Retained {
+                    path: path.to_string(),
+                }
+            } else if stderr.contains("libgtk-4") {
+                WindowLaunchNotice::Runtime {
+                    path: path.to_string(),
+                }
+            } else {
+                WindowLaunchNotice::Failed {
+                    path: path.to_string(),
+                }
+            }
+        }
+    }
+}
+
+fn launch_window() -> i32 {
+    let current = match env::current_exe() {
+        Ok(exe) => exe,
+        Err(_) => return 1,
+    };
+    let window_exe = current
+        .parent()
+        .map(|p| p.join("solstone-linux-window"))
+        .unwrap_or_else(|| std::path::PathBuf::from("solstone-linux-window"));
+
+    let child = Command::new(&window_exe).stderr(Stdio::piped()).spawn();
+
+    let output = match child {
+        Ok(c) => match c.wait_with_output() {
+            Ok(o) => o,
+            Err(_) => return 1,
+        },
+        Err(e) => {
+            let stderr_str = e.to_string();
+            return handle_window_failure(&stderr_str);
+        }
+    };
+
+    if output.status.success() {
+        return 0;
+    }
+
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    handle_window_failure(&stderr_str)
+}
+
+fn handle_window_failure(stderr_str: &str) -> i32 {
+    let state_dir = Config::default().state_dir();
+    let diagnostic_file = state_dir.join("window-launch.err");
+    let write_ok = fs::create_dir_all(&state_dir)
+        .and_then(|_| fs::write(&diagnostic_file, stderr_str.as_bytes()))
+        .is_ok();
+
+    let diag_path = if write_ok {
+        diagnostic_file.to_str()
+    } else {
+        None
+    };
+
+    let body = match window_launch_notice(false, stderr_str, diag_path, true) {
+        WindowLaunchNotice::Runtime { path } => crate::copy::launch_runtime_unavailable(&path),
+        WindowLaunchNotice::Failed { path } => crate::copy::launch_failed(&path),
+        WindowLaunchNotice::FailedWithoutDiagnostic => {
+            crate::copy::LAUNCH_FAILED_WITHOUT_DIAGNOSTIC.to_string()
+        }
+        WindowLaunchNotice::Retained { path } => crate::copy::launch_retained_diagnostic(&path),
+        WindowLaunchNotice::Silent => String::new(),
+    };
+
+    let notif_res = notify_rust::Notification::new()
+        .appname("solstone")
+        .summary(crate::copy::LAUNCH_FAILURE_TITLE)
+        .body(&body)
+        .show();
+
+    if let WindowLaunchNotice::Retained { path } =
+        window_launch_notice(false, stderr_str, diag_path, notif_res.is_ok())
+    {
+        let retained_file = state_dir.join("window-retained.txt");
+        let _ = fs::write(
+            &retained_file,
+            crate::copy::launch_retained_diagnostic(&path),
+        );
+    }
+
+    1
+}
+
 pub fn run() -> i32 {
+    let arguments: Vec<_> = env::args_os().skip(1).collect();
+    if arguments.len() == 1 && arguments[0] == "window" {
+        return launch_window();
+    }
     // A browser's native-messaging launch is recognised from argv alone, before any
     // other startup work: no logging, no config, and no credential lock.
     if crate::browser::ENABLED {
         use crate::browser::argv::{Recognition, recognize};
-        let arguments: Vec<_> = env::args_os().skip(1).collect();
         match recognize(&arguments, crate::browser::DEV_ENABLED) {
             Recognition::Host(invocation) => return crate::browser::host::run(invocation),
             Recognition::Refused => return crate::browser::host::refuse(&mut io::stdout()),
@@ -3425,5 +3539,64 @@ mod tests {
                 .is_none()
         );
         handle.shutdown().await;
+    }
+
+    #[test]
+    fn test_window_launch_notice_outcomes() {
+        assert_eq!(
+            window_launch_notice(true, "", None, true),
+            WindowLaunchNotice::Silent
+        );
+        assert_eq!(
+            window_launch_notice(true, "some stderr", Some("/tmp/diag"), false),
+            WindowLaunchNotice::Silent
+        );
+
+        assert_eq!(
+            window_launch_notice(false, "any error", None, true),
+            WindowLaunchNotice::FailedWithoutDiagnostic
+        );
+        assert_eq!(
+            window_launch_notice(false, "any error", None, false),
+            WindowLaunchNotice::FailedWithoutDiagnostic
+        );
+
+        assert_eq!(
+            window_launch_notice(
+                false,
+                "error while loading shared libraries: libgtk-4.so.1",
+                Some("/tmp/diag"),
+                true
+            ),
+            WindowLaunchNotice::Runtime {
+                path: "/tmp/diag".into()
+            }
+        );
+
+        assert_eq!(
+            window_launch_notice(false, "unrelated gtk failure", Some("/tmp/diag"), true),
+            WindowLaunchNotice::Failed {
+                path: "/tmp/diag".into()
+            }
+        );
+
+        assert_eq!(
+            window_launch_notice(
+                false,
+                "error while loading shared libraries: libgtk-4.so.1",
+                Some("/tmp/diag"),
+                false
+            ),
+            WindowLaunchNotice::Retained {
+                path: "/tmp/diag".into()
+            }
+        );
+
+        assert_eq!(
+            window_launch_notice(false, "some error", Some("/tmp/diag"), false),
+            WindowLaunchNotice::Retained {
+                path: "/tmp/diag".into()
+            }
+        );
     }
 }

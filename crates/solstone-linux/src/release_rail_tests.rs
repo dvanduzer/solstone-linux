@@ -67,6 +67,9 @@ fn committed_asset_set() -> BTreeSet<PathBuf> {
     let root = workspace_root();
     let mut paths = BTreeSet::from([
         root.join("LICENSE").canonicalize().unwrap(),
+        root.join("crates/solstone-linux-window/assets/Comfortaa-OFL.txt")
+            .canonicalize()
+            .unwrap(),
         root.join("packaging/INSTALL-NOTES").canonicalize().unwrap(),
         root.join("packaging/org.solpbc.solstone.Window.desktop")
             .canonicalize()
@@ -187,14 +190,14 @@ fn package_assets_exist_and_match() {
     let expected = committed_asset_set();
     assert_eq!(
         expected.len(),
-        19,
-        "LICENSE + INSTALL-NOTES + RUST_DEPENDENCY_NOTICES.txt + launcher + 15 icons"
+        20,
+        "LICENSE + Comfortaa-OFL.txt + INSTALL-NOTES + RUST_DEPENDENCY_NOTICES.txt + launcher + 15 icons"
     );
 
     let deb = deb_assets(&member);
     let rpm = rpm_assets(&member);
-    assert_eq!(deb.len(), 21);
-    assert_eq!(rpm.len(), 21);
+    assert_eq!(deb.len(), 22);
+    assert_eq!(rpm.len(), 22);
     assert_eq!(deb[0].0, "target/release/solstone-linux");
     assert_eq!(rpm[0].0, "target/release/solstone-linux");
     assert_eq!(deb[0].2, "755");
@@ -232,8 +235,8 @@ fn debian_sealing_enumerates_every_installed_payload() {
     let (_, member) = metadata();
     let payload_count = deb_assets(&member).len() + 1;
     assert_eq!(
-        payload_count, 22,
-        "21 declared assets + generated copyright"
+        payload_count, 23,
+        "22 declared assets + generated copyright"
     );
 
     let containerfile =
@@ -266,6 +269,11 @@ fn add_window_payload(root: &Path) {
     fs::copy(
         workspace_root().join("packaging/org.solpbc.solstone.Window.desktop"),
         root.join("share/applications/org.solpbc.solstone.Window.desktop"),
+    )
+    .unwrap();
+    fs::copy(
+        workspace_root().join("crates/solstone-linux-window/assets/Comfortaa-OFL.txt"),
+        root.join("Comfortaa-OFL.txt"),
     )
     .unwrap();
 }
@@ -505,6 +513,17 @@ fn installer_installs_archive_into_prefix() {
     );
     assert_eq!(
         fs::metadata(&notices_path).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    let ofl_path = prefix.join("share/doc/solstone-linux/Comfortaa-OFL.txt");
+    assert!(ofl_path.is_file());
+    assert_eq!(
+        fs::read(&ofl_path).unwrap(),
+        fs::read(workspace_root().join("crates/solstone-linux-window/assets/Comfortaa-OFL.txt"))
+            .unwrap()
+    );
+    assert_eq!(
+        fs::metadata(&ofl_path).unwrap().permissions().mode() & 0o777,
         0o644
     );
 }

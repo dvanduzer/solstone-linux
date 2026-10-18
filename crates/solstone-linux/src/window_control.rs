@@ -23,8 +23,8 @@ use crate::observer::{Mode, StateSnapshot};
 use crate::private_file::DurableWriteFault;
 use crate::private_link::{
     CREDENTIALS_FILENAME, LinkFact, LinkFacts, OpenJournalAccess, Pairer, PrivateLinkOwner,
-    PrivateStateError, PrivateStateLock, PrivateTargetKind, format_spoken_mark, pair_and_admit,
-    persist_credential_with_fault, read_private_file,
+    PrivateStateError, PrivateStateLock, PrivateTargetKind, format_spoken_mark, load_credential,
+    pair_and_admit, persist_credential_with_fault, read_private_file,
 };
 use crate::sync::{SyncResetHandle, SyncSampler, SyncTrigger};
 use crate::sync_health::SyncHealth;
@@ -39,7 +39,90 @@ pub const DEFAULT_DRAW_CURSOR: bool = true;
 pub const DEFAULT_START_PAUSED: bool = false;
 pub const DEFAULT_SEGMENT_INTERVAL: i64 = 300;
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GraphicalLinkError;
+
+impl std::fmt::Display for GraphicalLinkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "malformed pairing link")
+    }
+}
+
+impl std::error::Error for GraphicalLinkError {}
+
+pub fn adapt_graphical_link(input: &str) -> Result<String, GraphicalLinkError> {
+    let s = input.trim();
+    let (base, fragment) = s.split_once('#').ok_or(GraphicalLinkError)?;
+    if fragment.is_empty() {
+        return Err(GraphicalLinkError);
+    }
+    let (scheme, rest) = base.split_once("://").ok_or(GraphicalLinkError)?;
+    if rest.contains('@') || rest.contains('?') || rest.contains(':') {
+        return Err(GraphicalLinkError);
+    }
+    if scheme.eq_ignore_ascii_case("https") {
+        if rest == "go.solstone.app/p" {
+            return Ok(s.to_string());
+        }
+    } else if scheme.eq_ignore_ascii_case("solstone") && (rest == "pair" || rest == "pair/") {
+        return Ok(s.to_string());
+    }
+    Err(GraphicalLinkError)
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MarkColorDocument {
+    pub name: String,
+    pub hex: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MarkIconDocument {
+    pub name: String,
+    pub svg: String,
+    pub color: MarkColorDocument,
+    pub rot: u16,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MarkRenderDocument {
+    pub icon1: MarkIconDocument,
+    pub icon2: MarkIconDocument,
+    pub words: [String; 2],
+}
+
+impl From<spl_core::mark::MarkRenderSpec> for MarkRenderDocument {
+    fn from(spec: spl_core::mark::MarkRenderSpec) -> Self {
+        Self {
+            icon1: MarkIconDocument {
+                name: spec.icon1.name,
+                svg: spec.icon1.svg,
+                color: MarkColorDocument {
+                    name: spec.icon1.color.name,
+                    hex: spec.icon1.color.hex,
+                },
+                rot: spec.icon1.rot,
+            },
+            icon2: MarkIconDocument {
+                name: spec.icon2.name,
+                svg: spec.icon2.svg,
+                color: MarkColorDocument {
+                    name: spec.icon2.color.name,
+                    hex: spec.icon2.color.hex,
+                },
+                rot: spec.icon2.rot,
+            },
+            words: spec.words,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SampledInstantDocument {
+    pub at: Option<f64>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ControlDocument {
     pub v: u32,
     pub durable: String,
@@ -51,9 +134,31 @@ pub struct ControlDocument {
     pub restart_required: Option<bool>,
     pub open_journal: Option<String>,
     pub fault: Option<String>,
+    #[serde(default)]
+    pub saved_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective: Option<SettingsDocument>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_mark: Option<MarkRenderDocument>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_mark: Option<MarkRenderDocument>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_bounded: Option<bool>,
+    #[serde(default)]
+    pub capture_attention: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantine_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_delivery: Option<SampledInstantDocument>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct AttemptDocument {
     pub id: String,
     pub pairing_id: String,
@@ -61,7 +166,7 @@ pub struct AttemptDocument {
     pub mark: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SettingsDocument {
     pub capture_framerate: i64,
     pub draw_cursor: bool,
@@ -82,7 +187,7 @@ pub enum SessionView {
     Unknown,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ControlModel {
     pub view: SessionView,
     pub durable: String,
@@ -94,9 +199,20 @@ pub struct ControlModel {
     pub restart_required: Option<bool>,
     pub open_journal: Option<String>,
     pub fault: Option<String>,
+    pub saved_available: bool,
+    pub effective: Option<SettingsModel>,
+    pub pending_mark: Option<MarkRenderDocument>,
+    pub confirmed_mark: Option<MarkRenderDocument>,
+    pub pause_bounded: Option<bool>,
+    pub capture_attention: bool,
+    pub queue_count: Option<i64>,
+    pub quarantine_count: Option<u64>,
+    pub last_delivery: Option<SampledInstantDocument>,
+    pub daemon_version: Option<String>,
+    pub config_path: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttemptModel {
     pub id: String,
     pub pairing_id: String,
@@ -104,7 +220,7 @@ pub struct AttemptModel {
     pub mark: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SettingsModel {
     pub capture_framerate: i64,
     pub draw_cursor: bool,
@@ -148,6 +264,17 @@ impl ControlModel {
             restart_required: None,
             open_journal: None,
             fault: None,
+            saved_available: false,
+            effective: None,
+            pending_mark: None,
+            confirmed_mark: None,
+            pause_bounded: None,
+            capture_attention: false,
+            queue_count: None,
+            quarantine_count: None,
+            last_delivery: None,
+            daemon_version: None,
+            config_path: None,
         }
     }
 }
@@ -193,6 +320,22 @@ pub fn decode_control<E: std::fmt::Display>(
         restart_required: doc.restart_required,
         open_journal: doc.open_journal,
         fault: doc.fault,
+        saved_available: doc.saved_available,
+        effective: doc.effective.map(|s| SettingsModel {
+            capture_framerate: s.capture_framerate,
+            draw_cursor: s.draw_cursor,
+            start_paused: s.start_paused,
+            segment_interval: s.segment_interval,
+        }),
+        pending_mark: doc.pending_mark,
+        confirmed_mark: doc.confirmed_mark,
+        pause_bounded: doc.pause_bounded,
+        capture_attention: doc.capture_attention,
+        queue_count: doc.queue_count,
+        quarantine_count: doc.quarantine_count,
+        last_delivery: doc.last_delivery,
+        daemon_version: doc.daemon_version,
+        config_path: doc.config_path,
     })
 }
 
@@ -388,6 +531,7 @@ pub(crate) struct Phase {
     pub(crate) open_journal: Option<String>,
     pub(crate) failed_owner_pairing_id: Option<String>,
     pub(crate) current_owner_pairing_id: Option<String>,
+    pub(crate) pending_instance_id: Option<String>,
 }
 
 pub(crate) enum SupervisorCommand {
@@ -428,69 +572,155 @@ pub(crate) fn resolve_config_file(paths: &ConfigPaths) -> PathBuf {
     crate::config::resolve_config_paths(paths).config_path()
 }
 
-pub fn read_settings_defaults(config_paths: &ConfigPaths) -> (i64, bool, bool, i64) {
+pub fn read_saved_settings(config_paths: &ConfigPaths) -> (SettingsDocument, bool) {
     let config_path = resolve_config_file(config_paths);
-    let Ok(bytes) = fs::read(&config_path) else {
-        return (
-            DEFAULT_CAPTURE_FRAMERATE,
-            DEFAULT_DRAW_CURSOR,
-            DEFAULT_START_PAUSED,
-            DEFAULT_SEGMENT_INTERVAL,
-        );
+    let bytes = match fs::read(&config_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return (
+                SettingsDocument {
+                    capture_framerate: DEFAULT_CAPTURE_FRAMERATE,
+                    draw_cursor: DEFAULT_DRAW_CURSOR,
+                    start_paused: DEFAULT_START_PAUSED,
+                    segment_interval: DEFAULT_SEGMENT_INTERVAL,
+                },
+                true,
+            );
+        }
+        Err(_) => {
+            return (
+                SettingsDocument {
+                    capture_framerate: DEFAULT_CAPTURE_FRAMERATE,
+                    draw_cursor: DEFAULT_DRAW_CURSOR,
+                    start_paused: DEFAULT_START_PAUSED,
+                    segment_interval: DEFAULT_SEGMENT_INTERVAL,
+                },
+                false,
+            );
+        }
     };
+
     let Ok(val) = serde_json::from_slice::<Value>(&bytes) else {
         return (
-            DEFAULT_CAPTURE_FRAMERATE,
-            DEFAULT_DRAW_CURSOR,
-            DEFAULT_START_PAUSED,
-            DEFAULT_SEGMENT_INTERVAL,
+            SettingsDocument {
+                capture_framerate: DEFAULT_CAPTURE_FRAMERATE,
+                draw_cursor: DEFAULT_DRAW_CURSOR,
+                start_paused: DEFAULT_START_PAUSED,
+                segment_interval: DEFAULT_SEGMENT_INTERVAL,
+            },
+            false,
         );
     };
-    let framerate = val
-        .get("capture_framerate")
-        .and_then(Value::as_i64)
-        .map(|n| n.clamp(1, 10))
-        .unwrap_or(DEFAULT_CAPTURE_FRAMERATE);
-    let draw_cursor = val
-        .get("draw_cursor")
-        .map(|v| match v {
-            Value::Bool(b) => *b,
-            Value::String(s) => matches!(s.to_lowercase().as_str(), "true" | "yes" | "y"),
-            _ => DEFAULT_DRAW_CURSOR,
-        })
-        .unwrap_or(DEFAULT_DRAW_CURSOR);
-    let start_paused = val
-        .get("start_paused")
-        .map(|v| match v {
-            Value::Bool(b) => *b,
-            Value::String(s) => matches!(s.to_lowercase().as_str(), "true" | "yes" | "y"),
-            _ => DEFAULT_START_PAUSED,
-        })
-        .unwrap_or(DEFAULT_START_PAUSED);
-    let segment_interval = val
-        .get("segment_interval")
-        .and_then(Value::as_i64)
-        .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_SEGMENT_INTERVAL);
-    (framerate, draw_cursor, start_paused, segment_interval)
+
+    let Some(obj) = val.as_object() else {
+        return (
+            SettingsDocument {
+                capture_framerate: DEFAULT_CAPTURE_FRAMERATE,
+                draw_cursor: DEFAULT_DRAW_CURSOR,
+                start_paused: DEFAULT_START_PAUSED,
+                segment_interval: DEFAULT_SEGMENT_INTERVAL,
+            },
+            false,
+        );
+    };
+
+    let framerate = match obj.get("capture_framerate") {
+        None => Ok(DEFAULT_CAPTURE_FRAMERATE),
+        Some(Value::Number(n)) => n.as_i64().ok_or(()),
+        Some(_) => Err(()),
+    };
+    let draw_cursor = match obj.get("draw_cursor") {
+        None => Ok(DEFAULT_DRAW_CURSOR),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(()),
+    };
+    let start_paused = match obj.get("start_paused") {
+        None => Ok(DEFAULT_START_PAUSED),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(()),
+    };
+    let segment_interval = match obj.get("segment_interval") {
+        None => Ok(DEFAULT_SEGMENT_INTERVAL),
+        Some(Value::Number(n)) => n.as_i64().ok_or(()),
+        Some(_) => Err(()),
+    };
+
+    match (framerate, draw_cursor, start_paused, segment_interval) {
+        (Ok(f), Ok(d), Ok(p), Ok(s)) => (
+            SettingsDocument {
+                capture_framerate: f,
+                draw_cursor: d,
+                start_paused: p,
+                segment_interval: s,
+            },
+            true,
+        ),
+        _ => (
+            SettingsDocument {
+                capture_framerate: DEFAULT_CAPTURE_FRAMERATE,
+                draw_cursor: DEFAULT_DRAW_CURSOR,
+                start_paused: DEFAULT_START_PAUSED,
+                segment_interval: DEFAULT_SEGMENT_INTERVAL,
+            },
+            false,
+        ),
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble_document(
     phase: &Phase,
     health: &SyncHealth,
     snapshot: &StateSnapshot,
     config_paths: &ConfigPaths,
     restart_override: Option<bool>,
+    sampler: Option<&SyncSampler>,
+    effective: Option<&SettingsDocument>,
+    captures_dir: Option<&std::path::Path>,
 ) -> String {
-    let (framerate, draw_cursor, start_paused, segment_interval) =
-        read_settings_defaults(config_paths);
-    let settings = SettingsDocument {
-        capture_framerate: framerate,
-        draw_cursor,
-        start_paused,
-        segment_interval,
-    };
+    let (settings, saved_available) = read_saved_settings(config_paths);
     let capture_status = tray_model::status_name(tray_model::status(snapshot)).to_string();
+
+    let confirmed_mark = if phase.durable == "confirmed" {
+        let config_root = resolve_config_dir(config_paths);
+        match load_credential(&config_root) {
+            Ok(Some(cred)) => spl_core::mark::mark_from_jid(&cred.instance_id)
+                .ok()
+                .map(|m| m.to_render_spec().into()),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let pending_mark = phase.pending_instance_id.as_deref().and_then(|jid| {
+        spl_core::mark::mark_from_jid(jid)
+            .ok()
+            .map(|m| m.to_render_spec().into())
+    });
+
+    let pause_bounded = if snapshot.paused {
+        Some(snapshot.pause_until.is_some())
+    } else {
+        None
+    };
+
+    let capture_attention = tray_model::status(snapshot).needs_attention();
+
+    let (queue_count, last_delivery) = match sampler {
+        Some(s) => {
+            let facts = s.facts();
+            let q = facts.pending_confirmed;
+            let l = Some(SampledInstantDocument {
+                at: facts.last_successful_sync,
+            });
+            (q, l)
+        }
+        None => (None, None),
+    };
+
+    let quarantine_count = captures_dir.and_then(crate::capture_stats::strict_quarantine_count);
+
     let doc = ControlDocument {
         v: 1,
         durable: phase.durable.clone(),
@@ -502,9 +732,20 @@ pub(crate) fn assemble_document(
         restart_required: restart_override.or(phase.restart_required),
         open_journal: phase.open_journal.clone(),
         fault: phase.fault.clone(),
+        saved_available,
+        effective: effective.cloned(),
+        pending_mark,
+        confirmed_mark,
+        pause_bounded,
+        capture_attention,
+        queue_count,
+        quarantine_count,
+        last_delivery,
+        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        config_path: Some(resolve_config_file(config_paths).display().to_string()),
     };
     serde_json::to_string(&doc).unwrap_or_else(|_| {
-        "{\"v\":1,\"durable\":\"unavailable\",\"owner\":\"absent\",\"attempt\":null,\"health\":\"not-reported\",\"capture\":\"\",\"settings\":{\"capture_framerate\":1,\"draw_cursor\":true,\"start_paused\":false,\"segment_interval\":300},\"restart_required\":null,\"open_journal\":null,\"fault\":null}".to_string()
+        r#"{"v":1,"durable":"unavailable","owner":"absent","health":"not-reported","capture":"","settings":{"capture_framerate":1,"draw_cursor":true,"start_paused":false,"segment_interval":300},"saved_available":false}"#.into()
     })
 }
 
@@ -555,6 +796,8 @@ pub struct WindowControlSupervisor {
     health: Arc<Mutex<SyncHealth>>,
     sampler: Option<SyncSampler>,
     snapshot: Arc<Mutex<StateSnapshot>>,
+    effective_settings: Option<SettingsDocument>,
+    captures_dir: Option<PathBuf>,
     owner: Option<Box<dyn ManagedOwner>>,
     activation_blocked: bool,
     pending_candidate: Option<PendingCandidate>,
@@ -581,6 +824,8 @@ impl WindowControlSupervisor {
         durable_fault: Arc<dyn DurableWriteFault>,
         health: Arc<Mutex<SyncHealth>>,
         snapshot: Arc<Mutex<StateSnapshot>>,
+        effective_settings: Option<SettingsDocument>,
+        captures_dir: Option<PathBuf>,
     ) -> (Self, WindowControlHandler) {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let sampler = Some(sync_reset.sampler_handle());
@@ -593,6 +838,7 @@ impl WindowControlSupervisor {
             open_journal: None,
             failed_owner_pairing_id: None,
             current_owner_pairing_id: None,
+            pending_instance_id: None,
         }));
         let handler = WindowControlHandler {
             inner: Arc::new(WindowControlHandlerInner {
@@ -602,6 +848,8 @@ impl WindowControlSupervisor {
                 health: Arc::clone(&health),
                 sampler: sampler.clone(),
                 snapshot: Arc::clone(&snapshot),
+                effective_settings: effective_settings.clone(),
+                captures_dir: captures_dir.clone(),
                 custom_opener: None,
             }),
         };
@@ -624,6 +872,8 @@ impl WindowControlSupervisor {
             health,
             sampler,
             snapshot,
+            effective_settings,
+            captures_dir,
             owner: None,
             activation_blocked: false,
             pending_candidate: None,
@@ -651,6 +901,9 @@ impl WindowControlSupervisor {
             &snapshot,
             &self.config_paths,
             restart_override,
+            self.sampler.as_ref(),
+            self.effective_settings.as_ref(),
+            self.captures_dir.as_deref(),
         )
     }
 
@@ -807,6 +1060,7 @@ impl WindowControlSupervisor {
             let cand = self.pending_candidate.take().unwrap();
             retire_client_registration(&cand.credential).await;
             let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+            phase.pending_instance_id = None;
             phase.attempt = Some(AttemptDocument {
                 id: cand.attempt_id,
                 pairing_id: cand.pairing_id,
@@ -920,16 +1174,37 @@ impl WindowControlSupervisor {
     async fn handle_begin_pairing(&mut self, link: String) -> String {
         if let Some(cand) = self.pending_candidate.take() {
             retire_client_registration(&cand.credential).await;
+            let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+            phase.pending_instance_id = None;
         }
 
         self.attempt_counter += 1;
         let attempt_id = self.attempt_counter.to_string();
+
+        let link = match adapt_graphical_link(&link) {
+            Ok(adapted) => adapted,
+            Err(_) => {
+                {
+                    let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+                    phase.pending_instance_id = None;
+                    phase.attempt = Some(AttemptDocument {
+                        id: attempt_id,
+                        pairing_id: String::new(),
+                        state: "malformed".into(),
+                        mark: None,
+                    });
+                    phase.fault = Some("malformed-link".into());
+                }
+                return self.assemble_current(None);
+            }
+        };
 
         let _parsed_link = match pairlink::parse(&link) {
             Ok(p) => p,
             Err(_) => {
                 {
                     let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+                    phase.pending_instance_id = None;
                     phase.attempt = Some(AttemptDocument {
                         id: attempt_id,
                         pairing_id: String::new(),
@@ -959,6 +1234,7 @@ impl WindowControlSupervisor {
             Some(Err(_)) => {
                 {
                     let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+                    phase.pending_instance_id = None;
                     phase.attempt = Some(AttemptDocument {
                         id: attempt_id,
                         pairing_id: String::new(),
@@ -972,6 +1248,7 @@ impl WindowControlSupervisor {
             None => {
                 {
                     let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+                    phase.pending_instance_id = None;
                     phase.attempt = Some(AttemptDocument {
                         id: attempt_id,
                         pairing_id: String::new(),
@@ -992,6 +1269,7 @@ impl WindowControlSupervisor {
                 retire_client_registration(&credential).await;
                 {
                     let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+                    phase.pending_instance_id = None;
                     phase.attempt = Some(AttemptDocument {
                         id: attempt_id,
                         pairing_id,
@@ -1009,13 +1287,14 @@ impl WindowControlSupervisor {
         self.pending_candidate = Some(PendingCandidate {
             attempt_id: attempt_id.clone(),
             pairing_id: pairing_id.clone(),
-            credential,
+            credential: credential.clone(),
             spoken_mark: spoken_mark_str.clone(),
             expires_at,
         });
 
         {
             let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+            phase.pending_instance_id = Some(credential.instance_id.clone());
             phase.attempt = Some(AttemptDocument {
                 id: attempt_id,
                 pairing_id,
@@ -1052,6 +1331,7 @@ impl WindowControlSupervisor {
             retire_client_registration(&candidate.credential).await;
             {
                 let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+                phase.pending_instance_id = None;
                 phase.attempt = Some(AttemptDocument {
                     id: candidate.attempt_id,
                     pairing_id: candidate.pairing_id,
@@ -1073,6 +1353,7 @@ impl WindowControlSupervisor {
             retire_client_registration(&candidate.credential).await;
             {
                 let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+                phase.pending_instance_id = None;
                 phase.attempt = Some(AttemptDocument {
                     id: candidate.attempt_id,
                     pairing_id: candidate.pairing_id,
@@ -1095,6 +1376,7 @@ impl WindowControlSupervisor {
             retire_client_registration(&candidate.credential).await;
             {
                 let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+                phase.pending_instance_id = None;
                 phase.owner_status = "failed".into();
                 phase.fault = Some("owner-stop-failed".into());
                 phase.attempt = None;
@@ -1140,6 +1422,7 @@ impl WindowControlSupervisor {
             self.pending_candidate = None;
             {
                 let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+                phase.pending_instance_id = None;
                 phase.durable = durable_state;
                 phase.owner_status = "absent".into();
                 phase.fault = Some(
@@ -1176,6 +1459,7 @@ impl WindowControlSupervisor {
                 self.pending_candidate = None;
                 {
                     let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+                    phase.pending_instance_id = None;
                     phase.durable = "confirmed".into();
                     phase.owner_status = "failed".into();
                     phase.failed_owner_pairing_id = Some(cand.pairing_id.clone());
@@ -1206,6 +1490,7 @@ impl WindowControlSupervisor {
                 self.pending_candidate = None;
                 {
                     let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+                    phase.pending_instance_id = None;
                     phase.durable = "confirmed".into();
                     phase.owner_status = "running".into();
                     phase.current_owner_pairing_id = Some(cand.pairing_id.clone());
@@ -1220,6 +1505,7 @@ impl WindowControlSupervisor {
                 self.pending_candidate = None;
                 {
                     let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+                    phase.pending_instance_id = None;
                     phase.durable = "confirmed".into();
                     phase.owner_status = "failed".into();
                     phase.failed_owner_pairing_id = Some(cand.pairing_id.clone());
@@ -1239,6 +1525,7 @@ impl WindowControlSupervisor {
             self.pending_candidate = None;
             retire_client_registration(&candidate.credential).await;
             let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+            phase.pending_instance_id = None;
             phase.attempt = Some(AttemptDocument {
                 id: candidate.attempt_id,
                 pairing_id: candidate.pairing_id,
@@ -1257,6 +1544,7 @@ impl WindowControlSupervisor {
             self.pending_candidate = None;
             retire_client_registration(&candidate.credential).await;
             let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+            phase.pending_instance_id = None;
             phase.attempt = Some(AttemptDocument {
                 id: candidate.attempt_id,
                 pairing_id: candidate.pairing_id,
@@ -1344,6 +1632,8 @@ struct WindowControlHandlerInner {
     health: Arc<Mutex<SyncHealth>>,
     sampler: Option<SyncSampler>,
     snapshot: Arc<Mutex<StateSnapshot>>,
+    effective_settings: Option<SettingsDocument>,
+    captures_dir: Option<PathBuf>,
     custom_opener: Option<CustomOpener>,
 }
 
@@ -1364,6 +1654,7 @@ impl Default for WindowControlHandler {
             open_journal: None,
             failed_owner_pairing_id: None,
             current_owner_pairing_id: None,
+            pending_instance_id: None,
         }));
         Self {
             inner: Arc::new(WindowControlHandlerInner {
@@ -1387,6 +1678,8 @@ impl Default for WindowControlHandler {
                     process_start_mono: 0.0,
                     session: Default::default(),
                 })),
+                effective_settings: None,
+                captures_dir: None,
                 custom_opener: None,
             }),
         }
@@ -1403,6 +1696,8 @@ impl WindowControlHandler {
                 health: Arc::clone(&self.inner.health),
                 sampler: self.inner.sampler.clone(),
                 snapshot: Arc::clone(&self.inner.snapshot),
+                effective_settings: self.inner.effective_settings.clone(),
+                captures_dir: self.inner.captures_dir.clone(),
                 custom_opener: Some(opener),
             }),
         }
@@ -1425,7 +1720,16 @@ impl WindowControlHandler {
             .snapshot
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        assemble_document(&phase, &health, &snapshot, &self.inner.config_paths, None)
+        assemble_document(
+            &phase,
+            &health,
+            &snapshot,
+            &self.inner.config_paths,
+            None,
+            self.inner.sampler.as_ref(),
+            self.inner.effective_settings.as_ref(),
+            self.inner.captures_dir.as_deref(),
+        )
     }
 
     pub async fn begin_pairing(&self, link: String) -> String {
@@ -1578,9 +1882,9 @@ mod tests {
     use crate::observer::{Mode, StateSnapshot};
     use crate::private_file::{DurableWriteFault, DurableWriteStage, NoWriteFault};
     use crate::private_link::{
-        CREDENTIALS_FILENAME, DIRECT_PAIR_LINK_FOR_TEST, LinkFact, LinkFacts, OpenJournalAccess,
-        OpenJournalCapability, Pairer, PrivateLinkCapability, PrivateStateError, PrivateStateLock,
-        compute_pairing_id, open_journal_fixture,
+        CREDENTIALS_FILENAME, LinkFact, LinkFacts, OpenJournalAccess, OpenJournalCapability,
+        Pairer, PrivateLinkCapability, PrivateStateError, PrivateStateLock, compute_pairing_id,
+        open_journal_fixture,
     };
     use crate::run::SystemClock;
     use crate::sync::{SyncResetHandle, SyncSampler};
@@ -1886,6 +2190,8 @@ mod tests {
             .clone()
     }
 
+    const TEST_PAIR_LINK: &str = "https://go.solstone.app/p#0G0QY00004EYJ001081G81860W40J2GB1G6GW3X0M6HA7955MTKTHADANEPAVBNF";
+
     fn relay_pair_link_for(origin: &str) -> String {
         assert!(u8::try_from(origin.len()).is_ok());
         let mut blob = vec![0x06];
@@ -1894,7 +2200,10 @@ mod tests {
         blob.extend_from_slice(&[0xde; 16]);
         blob.push(origin.len() as u8);
         blob.extend_from_slice(origin.as_bytes());
-        spl_core::crockford::encode(&blob)
+        format!(
+            "https://go.solstone.app/p#{}",
+            spl_core::crockford::encode(&blob)
+        )
     }
 
     #[allow(dead_code)]
@@ -2003,6 +2312,8 @@ mod tests {
                 fault,
                 Arc::clone(&health),
                 Arc::clone(&snapshot),
+                None,
+                None,
             );
 
             let supervisor_task = tokio::spawn(supervisor.run());
@@ -2090,6 +2401,8 @@ mod tests {
                 Arc::new(NoWriteFault),
                 self.health.clone(),
                 self.snapshot.clone(),
+                None,
+                None,
             );
             self.handler = handler;
             self.supervisor_task = tokio::spawn(supervisor.run());
@@ -2120,7 +2433,7 @@ mod tests {
 
         let begin_doc = harness
             .handler
-            .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.to_string())
+            .begin_pairing(TEST_PAIR_LINK.to_string())
             .await;
         let begin_model = decode_control_str(&begin_doc).unwrap();
         assert_eq!(begin_model.view, SessionView::Pending);
@@ -2182,7 +2495,7 @@ mod tests {
         let harness = TestHarness::new(None, false, pairer, starter, Arc::new(NoWriteFault)).await;
         let begin_doc = harness
             .handler
-            .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.to_string())
+            .begin_pairing(TEST_PAIR_LINK.to_string())
             .await;
         let begin_model = decode_control_str(&begin_doc).unwrap();
         let att = begin_model.attempt.unwrap();
@@ -2266,7 +2579,7 @@ mod tests {
 
         let begin_doc = harness
             .handler
-            .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.to_string())
+            .begin_pairing(TEST_PAIR_LINK.to_string())
             .await;
         let begin_model = decode_control_str(&begin_doc).unwrap();
         let att = begin_model.attempt.unwrap();
@@ -2326,7 +2639,7 @@ mod tests {
                 TestHarness::new(None, false, pairer, starter, Arc::new(NoWriteFault)).await;
             let b = harness
                 .handler
-                .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.to_string())
+                .begin_pairing(TEST_PAIR_LINK.to_string())
                 .await;
             let att = decode_control_str(&b).unwrap().attempt.unwrap();
             let rej = harness
@@ -2354,7 +2667,7 @@ mod tests {
                 TestHarness::new(None, false, pairer, starter, Arc::new(NoWriteFault)).await;
             let b = harness
                 .handler
-                .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.to_string())
+                .begin_pairing(TEST_PAIR_LINK.to_string())
                 .await;
             let att = decode_control_str(&b).unwrap().attempt.unwrap();
             let can = harness.handler.cancel_pairing(att.id).await;
@@ -2379,7 +2692,7 @@ mod tests {
                 TestHarness::new(None, false, pairer, starter, Arc::new(NoWriteFault)).await;
             let b = harness
                 .handler
-                .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.to_string())
+                .begin_pairing(TEST_PAIR_LINK.to_string())
                 .await;
             let att = decode_control_str(&b).unwrap().attempt.unwrap();
             let ab = harness.handler.abandon_pairing(att.id).await;
@@ -2404,7 +2717,7 @@ mod tests {
                 TestHarness::new(None, false, pairer, starter, Arc::new(NoWriteFault)).await;
             let b = harness
                 .handler
-                .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.to_string())
+                .begin_pairing(TEST_PAIR_LINK.to_string())
                 .await;
             let m = decode_control_str(&b).unwrap();
             assert_eq!(m.attempt.as_ref().unwrap().state, "pending");
@@ -2448,7 +2761,7 @@ mod tests {
 
         let begin_doc = harness
             .handler
-            .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.to_string())
+            .begin_pairing(TEST_PAIR_LINK.to_string())
             .await;
         let begin_model = decode_control_str(&begin_doc).unwrap();
         assert_eq!(begin_model.view, SessionView::Failed);
@@ -2518,7 +2831,7 @@ mod tests {
 
         let b = harness
             .handler
-            .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.to_string())
+            .begin_pairing(TEST_PAIR_LINK.to_string())
             .await;
         let att = decode_control_str(&b).unwrap().attempt.unwrap();
         let ans = harness
@@ -2605,10 +2918,7 @@ mod tests {
             fault.clone(),
         )
         .await;
-        let begin = harness
-            .handler
-            .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.into())
-            .await;
+        let begin = harness.handler.begin_pairing(TEST_PAIR_LINK.into()).await;
         let att = decode_control_str(&begin).unwrap().attempt.unwrap();
         fault.armed.store(true, Ordering::SeqCst);
         let answer = harness
@@ -2689,10 +2999,7 @@ mod tests {
                         fault.clone(),
                     )
                     .await;
-                    let begin = harness
-                        .handler
-                        .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.into())
-                        .await;
+                    let begin = harness.handler.begin_pairing(TEST_PAIR_LINK.into()).await;
                     let att = decode_control_str(&begin).unwrap().attempt.unwrap();
                     fault.armed.store(true, Ordering::SeqCst);
                     let answer = harness
@@ -2719,10 +3026,7 @@ mod tests {
                         usize::from(replacement)
                     );
                     // A later deliberate ceremony recovers, without rollback or migration.
-                    let begin = harness
-                        .handler
-                        .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.into())
-                        .await;
+                    let begin = harness.handler.begin_pairing(TEST_PAIR_LINK.into()).await;
                     let att = decode_control_str(&begin).unwrap().attempt.unwrap();
                     let answer = harness
                         .handler
@@ -2748,10 +3052,7 @@ mod tests {
             Arc::new(NoWriteFault),
         )
         .await;
-        let begin = harness
-            .handler
-            .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.into())
-            .await;
+        let begin = harness.handler.begin_pairing(TEST_PAIR_LINK.into()).await;
         let att = decode_control_str(&begin).unwrap().attempt.unwrap();
         {
             let mut clock = harness.clock.inner.lock().unwrap();
@@ -2786,10 +3087,7 @@ mod tests {
         let before = fs::read(harness.config_root.join(CREDENTIALS_FILENAME)).unwrap();
         let before_answer = fs::read(harness.config_root.join(PAIRING_ANSWER_FILENAME)).unwrap();
         for _ in 0..2 {
-            let begin = harness
-                .handler
-                .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.into())
-                .await;
+            let begin = harness.handler.begin_pairing(TEST_PAIR_LINK.into()).await;
             let att = decode_control_str(&begin).unwrap().attempt.unwrap();
             starter.states.lock().unwrap()[0]
                 .shutdown_fails
@@ -2844,7 +3142,7 @@ mod tests {
 
         let b1 = harness
             .handler
-            .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.to_string())
+            .begin_pairing(TEST_PAIR_LINK.to_string())
             .await;
         let att1 = decode_control_str(&b1).unwrap().attempt.unwrap();
         let ans1 = harness
@@ -2861,7 +3159,7 @@ mod tests {
 
         let b2 = harness
             .handler
-            .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.to_string())
+            .begin_pairing(TEST_PAIR_LINK.to_string())
             .await;
         let att2 = decode_control_str(&b2).unwrap().attempt.unwrap();
         let ans2 = harness
@@ -2908,7 +3206,7 @@ mod tests {
 
         let b = harness
             .handler
-            .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.to_string())
+            .begin_pairing(TEST_PAIR_LINK.to_string())
             .await;
         let att = decode_control_str(&b).unwrap().attempt.unwrap();
         let _ = harness
@@ -2953,7 +3251,7 @@ mod tests {
 
         let b1 = harness
             .handler
-            .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.to_string())
+            .begin_pairing(TEST_PAIR_LINK.to_string())
             .await;
         let att1 = decode_control_str(&b1).unwrap().attempt.unwrap();
         let _ = harness
@@ -2970,7 +3268,7 @@ mod tests {
 
         let b2 = harness
             .handler
-            .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.to_string())
+            .begin_pairing(TEST_PAIR_LINK.to_string())
             .await;
         let att2 = decode_control_str(&b2).unwrap().attempt.unwrap();
         let _ = harness
@@ -3008,7 +3306,7 @@ mod tests {
 
         let b1 = harness
             .handler
-            .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.to_string())
+            .begin_pairing(TEST_PAIR_LINK.to_string())
             .await;
         let att1 = decode_control_str(&b1).unwrap().attempt.unwrap();
         let _ = harness
@@ -3027,7 +3325,7 @@ mod tests {
         *pairer.result.lock().unwrap() = Some(cred2.clone());
         let b2 = harness
             .handler
-            .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.to_string())
+            .begin_pairing(TEST_PAIR_LINK.to_string())
             .await;
         let att2 = decode_control_str(&b2).unwrap().attempt.unwrap();
         let _ = harness
@@ -3063,7 +3361,7 @@ mod tests {
 
         let b = harness
             .handler
-            .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.to_string())
+            .begin_pairing(TEST_PAIR_LINK.to_string())
             .await;
         let att = decode_control_str(&b).unwrap().attempt.unwrap();
         let _ = harness
@@ -3207,7 +3505,7 @@ mod tests {
 
         let b = harness
             .handler
-            .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.to_string())
+            .begin_pairing(TEST_PAIR_LINK.to_string())
             .await;
         let att = decode_control_str(&b).unwrap().attempt.unwrap();
         let _ = harness
@@ -3245,7 +3543,7 @@ mod tests {
 
         let b = harness
             .handler
-            .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.to_string())
+            .begin_pairing(TEST_PAIR_LINK.to_string())
             .await;
         let m_pending = decode_control_str(&b).unwrap();
         let spoken_mark = m_pending.attempt.as_ref().unwrap().mark.clone().unwrap();
@@ -3310,9 +3608,7 @@ mod tests {
         assert_eq!(m1.open_journal, Some("not-confirmed".into()));
         assert!(opened_target.lock().unwrap().is_none());
 
-        let b = handler
-            .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.to_string())
-            .await;
+        let b = handler.begin_pairing(TEST_PAIR_LINK.to_string()).await;
         let att = decode_control_str(&b).unwrap().attempt.unwrap();
         let _ = handler.answer_pairing(att.id, att.pairing_id, true).await;
 
@@ -3347,11 +3643,8 @@ mod tests {
         let harness = TestHarness::new(None, false, pairer, starter, Arc::new(NoWriteFault)).await;
 
         let handler = harness.handler.clone();
-        let begin_task = tokio::spawn(async move {
-            handler
-                .begin_pairing(DIRECT_PAIR_LINK_FOR_TEST.to_string())
-                .await
-        });
+        let begin_task =
+            tokio::spawn(async move { handler.begin_pairing(TEST_PAIR_LINK.to_string()).await });
 
         let mut sleeper_ready = false;
         for _ in 0..64 {
@@ -3440,5 +3733,144 @@ mod tests {
         assert_eq!(unparseable.view, SessionView::Unknown);
         assert_ne!(unparseable.view, SessionView::Confirmed);
         assert_ne!(unparseable.health, "connected");
+    }
+
+    #[test]
+    fn adapt_graphical_link_validates_and_normalizes() {
+        assert_eq!(
+            adapt_graphical_link("https://go.solstone.app/p#FRAG"),
+            Ok("https://go.solstone.app/p#FRAG".to_string())
+        );
+        assert_eq!(
+            adapt_graphical_link("https://go.solstone.app/p/#FRAG"),
+            Err(GraphicalLinkError)
+        );
+        assert_eq!(
+            adapt_graphical_link("solstone://pair#FRAG"),
+            Ok("solstone://pair#FRAG".to_string())
+        );
+        assert_eq!(
+            adapt_graphical_link("solstone://pair/#FRAG"),
+            Ok("solstone://pair/#FRAG".to_string())
+        );
+
+        assert_eq!(
+            adapt_graphical_link("HTTPS://go.solstone.app/p#FRAG"),
+            Ok("HTTPS://go.solstone.app/p#FRAG".to_string())
+        );
+        assert_eq!(
+            adapt_graphical_link("SoLsToNe://pair/#FRAG"),
+            Ok("SoLsToNe://pair/#FRAG".to_string())
+        );
+
+        assert_eq!(
+            adapt_graphical_link("   https://go.solstone.app/p#FRAG  \n"),
+            Ok("https://go.solstone.app/p#FRAG".to_string())
+        );
+
+        assert_eq!(adapt_graphical_link("FRAG"), Err(GraphicalLinkError));
+        assert_eq!(adapt_graphical_link("#FRAG"), Err(GraphicalLinkError));
+
+        assert_eq!(
+            adapt_graphical_link("https://go.solstone.app/p?query=1#FRAG"),
+            Err(GraphicalLinkError)
+        );
+
+        assert_eq!(
+            adapt_graphical_link("https://user@go.solstone.app/p#FRAG"),
+            Err(GraphicalLinkError)
+        );
+        assert_eq!(
+            adapt_graphical_link("https://go.solstone.app:443/p#FRAG"),
+            Err(GraphicalLinkError)
+        );
+
+        assert_eq!(
+            adapt_graphical_link("https://go.solstone.app/p#"),
+            Err(GraphicalLinkError)
+        );
+
+        assert_eq!(
+            adapt_graphical_link("https://evil.solstone.app/p#FRAG"),
+            Err(GraphicalLinkError)
+        );
+        assert_eq!(
+            adapt_graphical_link("http://go.solstone.app/p#FRAG"),
+            Err(GraphicalLinkError)
+        );
+        assert_eq!(adapt_graphical_link(""), Err(GraphicalLinkError));
+        assert_eq!(adapt_graphical_link("not-a-link"), Err(GraphicalLinkError));
+
+        let secret_link = "https://evil.com#super_secret_fragment_12345";
+        let err = adapt_graphical_link(secret_link).unwrap_err();
+        assert!(!format!("{err}").contains("super_secret_fragment"));
+        assert!(!format!("{err}").contains(secret_link));
+    }
+
+    #[test]
+    fn read_saved_settings_availability_and_fallback() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path().join("config");
+        let config_file = config_dir.join("config.json");
+        let paths = ConfigPaths {
+            config_dir: Some(config_dir.clone()),
+            base_dir: Some(temp_dir.path().to_path_buf()),
+        };
+
+        let (settings, available) = read_saved_settings(&paths);
+        assert!(available);
+        assert_eq!(settings.capture_framerate, DEFAULT_CAPTURE_FRAMERATE);
+        assert_eq!(settings.draw_cursor, DEFAULT_DRAW_CURSOR);
+        assert_eq!(settings.start_paused, DEFAULT_START_PAUSED);
+        assert_eq!(settings.segment_interval, DEFAULT_SEGMENT_INTERVAL);
+
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(&config_file, b"{}").unwrap();
+        let (settings, available) = read_saved_settings(&paths);
+        assert!(available);
+        assert_eq!(settings.capture_framerate, DEFAULT_CAPTURE_FRAMERATE);
+        assert_eq!(settings.draw_cursor, DEFAULT_DRAW_CURSOR);
+        assert_eq!(settings.start_paused, DEFAULT_START_PAUSED);
+        assert_eq!(settings.segment_interval, DEFAULT_SEGMENT_INTERVAL);
+
+        std::fs::write(&config_file, br#"{"capture_framerate": 5}"#).unwrap();
+        let (settings, available) = read_saved_settings(&paths);
+        assert!(available);
+        assert_eq!(settings.capture_framerate, 5);
+        assert_eq!(settings.draw_cursor, DEFAULT_DRAW_CURSOR);
+        assert_eq!(settings.start_paused, DEFAULT_START_PAUSED);
+        assert_eq!(settings.segment_interval, DEFAULT_SEGMENT_INTERVAL);
+
+        std::fs::write(
+            &config_file,
+            br#"{"capture_framerate": 99, "segment_interval": -50}"#,
+        )
+        .unwrap();
+        let (settings, available) = read_saved_settings(&paths);
+        assert!(available);
+        assert_eq!(settings.capture_framerate, 99);
+        assert_eq!(settings.segment_interval, -50);
+
+        std::fs::write(&config_file, b"not valid json").unwrap();
+        let (settings, available) = read_saved_settings(&paths);
+        assert!(!available);
+        assert_eq!(settings.capture_framerate, DEFAULT_CAPTURE_FRAMERATE);
+
+        std::fs::write(&config_file, b"[1, 2, 3]").unwrap();
+        let (_settings, available) = read_saved_settings(&paths);
+        assert!(!available);
+
+        std::fs::write(&config_file, br#"{"capture_framerate": "five"}"#).unwrap();
+        let (_settings, available) = read_saved_settings(&paths);
+        assert!(!available);
+
+        std::fs::write(&config_file, br#"{"draw_cursor": "true"}"#).unwrap();
+        let (_settings, available) = read_saved_settings(&paths);
+        assert!(!available);
+
+        std::fs::remove_file(&config_file).unwrap();
+        std::fs::create_dir(&config_file).unwrap();
+        let (_settings, available) = read_saved_settings(&paths);
+        assert!(!available);
     }
 }

@@ -208,6 +208,51 @@ pub fn compute_quarantine_stats(root: &Path, now: f64) -> QuarantineStats {
     }
 }
 
+fn holds_payload_strict(segment_dir: &Path) -> std::io::Result<bool> {
+    for entry in fs::read_dir(segment_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if !crate::recovery::is_segment_sidecar(&name) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub fn strict_quarantine_count(root: &Path) -> Option<u64> {
+    if !root.exists() {
+        return Some(0);
+    }
+    let mut count: u64 = 0;
+    let mut walk = || -> std::io::Result<u64> {
+        for day in fs::read_dir(root)? {
+            let day = day?;
+            if !day.file_type()?.is_dir() {
+                continue;
+            }
+            for stream in fs::read_dir(day.path())? {
+                let stream = stream?;
+                if !stream.file_type()?.is_dir() {
+                    continue;
+                }
+                for segment in fs::read_dir(stream.path())? {
+                    let segment = segment?;
+                    if !segment.file_type()?.is_dir()
+                        || classify_segment_name(&segment.file_name()) != SegmentClass::Failed
+                        || !holds_payload_strict(&segment.path())?
+                    {
+                        continue;
+                    }
+                    let _ = segment.metadata()?.modified()?;
+                    count = count.saturating_add(1);
+                }
+            }
+        }
+        Ok(count)
+    };
+    walk().ok()
+}
+
 /// A held segment has two possible histories and the suffix does not record which: the
 /// journal declined it, or startup recovery could not finalize an interrupted one and it
 /// was never sent at all. Naming either cause asserts something we cannot know — say only

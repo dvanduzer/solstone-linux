@@ -224,6 +224,10 @@ impl SyncSampler {
     pub fn progress(&self) -> String {
         self.sample().1
     }
+
+    pub fn facts(&self) -> SyncFacts {
+        self.with_facts(|facts| facts.clone())
+    }
 }
 
 #[derive(Clone)]

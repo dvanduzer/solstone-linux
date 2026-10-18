@@ -10,6 +10,8 @@ pub mod chunking;
 pub mod cli;
 pub mod clipboard;
 pub mod config;
+pub mod copy;
+pub mod dbus_client;
 pub mod dbus_service;
 pub mod desktop_component;
 pub mod desktop_session;

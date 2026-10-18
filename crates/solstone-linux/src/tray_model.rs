@@ -20,7 +20,7 @@ pub enum TrayStatus {
 
 impl TrayStatus {
     /// Waiting because something is wrong, not because the owner stepped away.
-    fn needs_attention(self) -> bool {
+    pub(crate) fn needs_attention(self) -> bool {
         matches!(
             self,
             Self::Waiting(SessionPresence::Unreachable | SessionPresence::LoginUnavailable)
