@@ -123,9 +123,7 @@ fn write_log_copy(content: &str, dest_path: &Path, temp: &Path) -> std::io::Resu
 pub fn collect_recent_logs() -> FrozenLog {
     let output = solstone_linux::bounded_process::run(
         std::process::Command::new("journalctl").args([
-            "--user",
-            "-u",
-            "solstone-linux.service",
+            "--user-unit=solstone-linux.service",
             "--no-pager",
             "--quiet",
             "-n",
