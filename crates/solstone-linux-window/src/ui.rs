@@ -644,8 +644,10 @@ fn create_settings_page(
         let ctrl = Rc::clone(&controller);
         framerate_entry.connect_changed(move |e| {
             if let Ok(v) = e.text().trim().parse::<i64>() {
-                ctrl.borrow_mut().settings_draft.framerate = Some(v);
-                ctrl.borrow_mut().settings_draft.framerate_dirty = true;
+                let mut c = ctrl.borrow_mut();
+                c.settings_draft.framerate = Some(v);
+                c.settings_draft.framerate_dirty =
+                    c.document.saved_available && v != c.document.settings.capture_framerate;
             }
         });
     }
@@ -654,8 +656,10 @@ fn create_settings_page(
         let ctrl = Rc::clone(&controller);
         segment_entry.connect_changed(move |e| {
             if let Ok(v) = e.text().trim().parse::<i64>() {
-                ctrl.borrow_mut().settings_draft.segment = Some(v);
-                ctrl.borrow_mut().settings_draft.segment_dirty = true;
+                let mut c = ctrl.borrow_mut();
+                c.settings_draft.segment = Some(v);
+                c.settings_draft.segment_dirty =
+                    c.document.saved_available && v != c.document.settings.segment_interval;
             }
         });
     }
@@ -663,8 +667,10 @@ fn create_settings_page(
     {
         let ctrl = Rc::clone(&controller);
         cursor_switch.connect_state_set(move |_, state| {
-            ctrl.borrow_mut().settings_draft.cursor = Some(state);
-            ctrl.borrow_mut().settings_draft.cursor_dirty = true;
+            let mut c = ctrl.borrow_mut();
+            c.settings_draft.cursor = Some(state);
+            c.settings_draft.cursor_dirty =
+                c.document.saved_available && state != c.document.settings.draw_cursor;
             glib::Propagation::Proceed
         });
     }
@@ -672,81 +678,64 @@ fn create_settings_page(
     {
         let ctrl = Rc::clone(&controller);
         start_paused_switch.connect_state_set(move |_, state| {
-            ctrl.borrow_mut().settings_draft.start_paused = Some(state);
-            ctrl.borrow_mut().settings_draft.start_paused_dirty = true;
+            let mut c = ctrl.borrow_mut();
+            c.settings_draft.start_paused = Some(state);
+            c.settings_draft.start_paused_dirty =
+                c.document.saved_available && state != c.document.settings.start_paused;
             glib::Propagation::Proceed
         });
     }
 
-    {
+    let update: Rc<dyn Fn()> = {
         let ctrl = Rc::clone(&controller);
+        let load_failed_label = load_failed_label.clone();
+        let reload_button = reload_button.clone();
+        let form_box = form_box.clone();
         let framerate_entry = framerate_entry.clone();
-        let segment_entry = segment_entry.clone();
         let cursor_switch = cursor_switch.clone();
         let start_paused_switch = start_paused_switch.clone();
+        let segment_entry = segment_entry.clone();
+        let saved_banner = saved_banner.clone();
+        let restart_needed_label = restart_needed_label.clone();
+        let restart_detail_label = restart_detail_label.clone();
+        let restart_button = restart_button.clone();
         let error_label = error_label.clone();
-        save_button.connect_clicked(move |_| {
-            let res = validate_settings_inputs(&framerate_entry.text(), &segment_entry.text());
-            match res {
-                Ok((fr, seg)) => {
-                    error_label.set_visible(false);
-                    let settings = SettingsModel {
-                        capture_framerate: fr,
-                        draw_cursor: cursor_switch.state(),
-                        start_paused: start_paused_switch.state(),
-                        segment_interval: seg,
-                    };
-                    let owner = ctrl.borrow().bus_owner.clone();
-                    if let Some(owner) = owner {
-                        let id = ctrl
-                            .borrow_mut()
-                            .start_settings_save(&owner, settings.clone());
-                        let c_inner = Rc::clone(&ctrl);
-                        glib::MainContext::default().spawn_local(async move {
-                            if let Ok(client) = ControlClient::session().await {
-                                let _ = client
-                                    .write_setting("capture_framerate", &fr.to_string())
-                                    .await;
-                                let _ = client
-                                    .write_setting("draw_cursor", &settings.draw_cursor.to_string())
-                                    .await;
-                                let _ = client
-                                    .write_setting(
-                                        "start_paused",
-                                        &settings.start_paused.to_string(),
-                                    )
-                                    .await;
-                                let final_res = client
-                                    .write_setting("segment_interval", &seg.to_string())
-                                    .await;
-                                c_inner
-                                    .borrow_mut()
-                                    .apply_settings_write_reply(id, &owner, final_res);
-                            }
-                        });
-                    }
-                }
-                Err(err_key) => {
-                    error_label.set_text(err_key.as_str());
-                    error_label.set_visible(true);
-                }
-            }
-        });
-    }
-
-    let update = {
-        let ctrl = Rc::clone(&controller);
         Rc::new(move || {
-            let c = ctrl.borrow();
-            let keys = map_settings_state(
-                c.document.saved_available,
-                &c.document.settings,
-                c.document.effective.as_ref(),
-                c.settings_draft.saved_verified,
-                c.bus_owner.is_some(),
-                false,
-                false,
-            );
+            let (
+                keys,
+                framerate_dirty,
+                cursor_dirty,
+                start_paused_dirty,
+                segment_dirty,
+                saved_framerate,
+                saved_cursor,
+                saved_start_paused,
+                saved_segment,
+                write_failed,
+            ) = {
+                let c = ctrl.borrow();
+                let keys = map_settings_state(
+                    c.document.saved_available,
+                    &c.document.settings,
+                    c.document.effective.as_ref(),
+                    c.settings_draft.saved_verified,
+                    c.bus_owner.is_some(),
+                    false,
+                    false,
+                );
+                (
+                    keys,
+                    c.settings_draft.framerate_dirty,
+                    c.settings_draft.cursor_dirty,
+                    c.settings_draft.start_paused_dirty,
+                    c.settings_draft.segment_dirty,
+                    c.document.settings.capture_framerate,
+                    c.document.settings.draw_cursor,
+                    c.document.settings.start_paused,
+                    c.document.settings.segment_interval,
+                    c.settings_draft.write_failed,
+                )
+            };
 
             if keys.load_failed.is_some() {
                 load_failed_label.set_visible(true);
@@ -758,26 +747,99 @@ fn create_settings_page(
                 form_box.set_visible(true);
 
                 // GTK must not replace a dirty or focused settings buffer
-                if !c.settings_draft.framerate_dirty && !framerate_entry.has_focus() {
-                    framerate_entry.set_text(&c.document.settings.capture_framerate.to_string());
+                if !framerate_dirty && !framerate_entry.has_focus() {
+                    framerate_entry.set_text(&saved_framerate.to_string());
                 }
-                if !c.settings_draft.cursor_dirty && !cursor_switch.has_focus() {
-                    cursor_switch.set_state(c.document.settings.draw_cursor);
+                if !cursor_dirty && !cursor_switch.has_focus() {
+                    cursor_switch.set_state(saved_cursor);
                 }
-                if !c.settings_draft.start_paused_dirty && !start_paused_switch.has_focus() {
-                    start_paused_switch.set_state(c.document.settings.start_paused);
+                if !start_paused_dirty && !start_paused_switch.has_focus() {
+                    start_paused_switch.set_state(saved_start_paused);
                 }
-                if !c.settings_draft.segment_dirty && !segment_entry.has_focus() {
-                    segment_entry.set_text(&c.document.settings.segment_interval.to_string());
+                if !segment_dirty && !segment_entry.has_focus() {
+                    segment_entry.set_text(&saved_segment.to_string());
                 }
 
                 saved_banner.set_visible(keys.saved_banner.is_some());
                 restart_needed_label.set_visible(keys.restart_needed.is_some());
                 restart_detail_label.set_visible(keys.restart_detail.is_some());
                 restart_button.set_visible(keys.restart_action.is_some());
+
+                if write_failed {
+                    error_label.set_text(CopyKey::SettingsSaveFailed.as_str());
+                    error_label.set_visible(true);
+                }
             }
         })
     };
+
+    {
+        let ctrl = Rc::clone(&controller);
+        let framerate_entry = framerate_entry.clone();
+        let segment_entry = segment_entry.clone();
+        let cursor_switch = cursor_switch.clone();
+        let start_paused_switch = start_paused_switch.clone();
+        let error_label = error_label.clone();
+        let update_fn = Rc::clone(&update);
+        save_button.connect_clicked(move |_| {
+            let res = validate_settings_inputs(&framerate_entry.text(), &segment_entry.text());
+            match res {
+                Ok((fr, seg)) => {
+                    error_label.set_visible(false);
+                    let writes = ctrl.borrow().settings_draft.changed_writes();
+                    if writes.is_empty() {
+                        return;
+                    }
+                    let settings = SettingsModel {
+                        capture_framerate: fr,
+                        draw_cursor: cursor_switch.state(),
+                        start_paused: start_paused_switch.state(),
+                        segment_interval: seg,
+                    };
+                    let owner = ctrl.borrow().bus_owner.clone();
+                    if let Some(owner) = owner {
+                        let id = ctrl.borrow_mut().start_settings_save(&owner, settings);
+                        let c_inner = Rc::clone(&ctrl);
+                        let upd = Rc::clone(&update_fn);
+                        glib::MainContext::default().spawn_local(async move {
+                            match ControlClient::session().await {
+                                Ok(client) => {
+                                    let mut write_res = Ok("ok".to_string());
+                                    for (field, value) in writes {
+                                        match client.write_setting(field, &value).await {
+                                            Ok(res) => {
+                                                write_res = Ok(res);
+                                            }
+                                            Err(e) => {
+                                                write_res = Err(e);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    c_inner
+                                        .borrow_mut()
+                                        .apply_settings_write_reply(id, &owner, write_res);
+                                    upd();
+                                }
+                                Err(e) => {
+                                    c_inner.borrow_mut().apply_settings_write_reply(
+                                        id,
+                                        &owner,
+                                        Err(e),
+                                    );
+                                    upd();
+                                }
+                            }
+                        });
+                    }
+                }
+                Err(err_key) => {
+                    error_label.set_text(err_key.as_str());
+                    error_label.set_visible(true);
+                }
+            }
+        });
+    }
 
     (scrolled, update)
 }

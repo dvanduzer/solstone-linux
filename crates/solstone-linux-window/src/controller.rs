@@ -42,12 +42,38 @@ pub struct SettingsDraft {
     pub segment_dirty: bool,
     pub in_flight: Option<InFlight<SettingsModel>>,
     pub saved_verified: bool,
-    pub last_error: Option<String>,
+    pub write_failed: bool,
+    pub waiting_confirming_read: bool,
 }
 
 impl SettingsDraft {
     pub fn is_dirty(&self) -> bool {
         self.framerate_dirty || self.cursor_dirty || self.start_paused_dirty || self.segment_dirty
+    }
+
+    pub fn changed_writes(&self) -> Vec<(&'static str, String)> {
+        let mut writes = Vec::new();
+        if self.framerate_dirty
+            && let Some(val) = self.framerate
+        {
+            writes.push(("capture_framerate", val.to_string()));
+        }
+        if self.cursor_dirty
+            && let Some(val) = self.cursor
+        {
+            writes.push(("draw_cursor", val.to_string()));
+        }
+        if self.start_paused_dirty
+            && let Some(val) = self.start_paused
+        {
+            writes.push(("start_paused", val.to_string()));
+        }
+        if self.segment_dirty
+            && let Some(val) = self.segment
+        {
+            writes.push(("segment_interval", val.to_string()));
+        }
+        writes
     }
 }
 
@@ -149,8 +175,9 @@ impl Controller {
             bus_owner: bus_owner.to_string(),
             payload: settings,
         });
-        self.settings_draft.last_error = None;
         self.settings_draft.saved_verified = false;
+        self.settings_draft.write_failed = false;
+        self.settings_draft.waiting_confirming_read = true;
         id
     }
 
@@ -207,36 +234,41 @@ impl Controller {
         self.document = model;
 
         // Dirty settings fields stay dirty until a fresh read shows that field's requested value
-        if self.settings_draft.framerate_dirty
-            && let Some(val) = self.settings_draft.framerate
-            && val == self.document.settings.capture_framerate
-        {
-            self.settings_draft.framerate_dirty = false;
-        }
-        if self.settings_draft.cursor_dirty
-            && let Some(val) = self.settings_draft.cursor
-            && val == self.document.settings.draw_cursor
-        {
-            self.settings_draft.cursor_dirty = false;
-        }
-        if self.settings_draft.start_paused_dirty
-            && let Some(val) = self.settings_draft.start_paused
-            && val == self.document.settings.start_paused
-        {
-            self.settings_draft.start_paused_dirty = false;
-        }
-        if self.settings_draft.segment_dirty
-            && let Some(val) = self.settings_draft.segment
-            && val == self.document.settings.segment_interval
-        {
-            self.settings_draft.segment_dirty = false;
+        if self.document.saved_available {
+            if self.settings_draft.framerate_dirty
+                && let Some(val) = self.settings_draft.framerate
+                && val == self.document.settings.capture_framerate
+            {
+                self.settings_draft.framerate_dirty = false;
+            }
+            if self.settings_draft.cursor_dirty
+                && let Some(val) = self.settings_draft.cursor
+                && val == self.document.settings.draw_cursor
+            {
+                self.settings_draft.cursor_dirty = false;
+            }
+            if self.settings_draft.start_paused_dirty
+                && let Some(val) = self.settings_draft.start_paused
+                && val == self.document.settings.start_paused
+            {
+                self.settings_draft.start_paused_dirty = false;
+            }
+            if self.settings_draft.segment_dirty
+                && let Some(val) = self.settings_draft.segment
+                && val == self.document.settings.segment_interval
+            {
+                self.settings_draft.segment_dirty = false;
+            }
         }
 
-        if !self.settings_draft.is_dirty()
-            && self.settings_draft.in_flight.is_none()
+        if self.settings_draft.waiting_confirming_read
             && self.document.saved_available
+            && self.settings_draft.in_flight.is_none()
+            && !self.settings_draft.write_failed
+            && !self.settings_draft.is_dirty()
         {
             self.settings_draft.saved_verified = true;
+            self.settings_draft.waiting_confirming_read = false;
         }
 
         // Completion of Pause/Resume: later document whose pause facts match the request
@@ -314,11 +346,11 @@ impl Controller {
             match reply {
                 Ok(_) => {
                     self.settings_draft.in_flight = None;
-                    self.settings_draft.last_error = None;
                 }
-                Err(e) => {
-                    self.settings_draft.last_error = Some(e.to_string());
+                Err(_) => {
                     self.settings_draft.in_flight = None;
+                    self.settings_draft.waiting_confirming_read = false;
+                    self.settings_draft.write_failed = true;
                 }
             }
         }
@@ -416,6 +448,30 @@ mod tests {
     }
 
     #[test]
+    fn test_clean_available_status_read_does_not_set_saved_verified() {
+        let mut controller = Controller::new();
+        controller.set_bus_owner(Some(":1.100".into()));
+
+        let doc_json = r#"{
+            "v": 1,
+            "durable": "confirmed",
+            "owner": ":1.100",
+            "health": "connected",
+            "capture": "recording",
+            "settings": {
+                "capture_framerate": 5,
+                "draw_cursor": true,
+                "start_paused": false,
+                "segment_interval": 10
+            },
+            "saved_available": true
+        }"#;
+
+        controller.apply_status_reply(1, ":1.100", Ok(doc_json.into()));
+        assert!(!controller.settings_draft.saved_verified);
+    }
+
+    #[test]
     fn test_dirty_fields_clear_when_read_matches_requested() {
         let mut controller = Controller::new();
         controller.set_bus_owner(Some(":1.100".into()));
@@ -440,7 +496,152 @@ mod tests {
 
         controller.apply_status_reply(1, ":1.100", Ok(doc_json.into()));
         assert!(!controller.settings_draft.framerate_dirty);
+        assert!(!controller.settings_draft.saved_verified);
+    }
+
+    #[test]
+    fn test_saved_verified_after_save_write_ok_and_matching_read() {
+        let mut controller = Controller::new();
+        controller.set_bus_owner(Some(":1.100".into()));
+
+        controller.settings_draft.framerate = Some(7);
+        controller.settings_draft.framerate_dirty = true;
+
+        let settings = SettingsModel {
+            capture_framerate: 7,
+            draw_cursor: true,
+            start_paused: false,
+            segment_interval: 10,
+        };
+        let save_id = controller.start_settings_save(":1.100", settings);
+        assert!(!controller.settings_draft.saved_verified);
+        assert!(controller.settings_draft.waiting_confirming_read);
+
+        controller.apply_settings_write_reply(save_id, ":1.100", Ok("ok".into()));
+        assert!(!controller.settings_draft.saved_verified);
+        assert!(controller.settings_draft.waiting_confirming_read);
+
+        let doc_json = r#"{
+            "v": 1,
+            "durable": "confirmed",
+            "owner": ":1.100",
+            "health": "connected",
+            "capture": "recording",
+            "settings": {
+                "capture_framerate": 7,
+                "draw_cursor": true,
+                "start_paused": false,
+                "segment_interval": 10
+            },
+            "saved_available": true
+        }"#;
+
+        controller.apply_status_reply(1, ":1.100", Ok(doc_json.into()));
+        assert!(!controller.settings_draft.framerate_dirty);
         assert!(controller.settings_draft.saved_verified);
+        assert!(!controller.settings_draft.waiting_confirming_read);
+    }
+
+    #[test]
+    fn test_status_err_after_write_ok_leaves_saved_verified_and_write_failure_false() {
+        let mut controller = Controller::new();
+        controller.set_bus_owner(Some(":1.100".into()));
+
+        controller.settings_draft.framerate = Some(7);
+        controller.settings_draft.framerate_dirty = true;
+
+        let settings = SettingsModel {
+            capture_framerate: 7,
+            draw_cursor: true,
+            start_paused: false,
+            segment_interval: 10,
+        };
+        let save_id = controller.start_settings_save(":1.100", settings);
+        controller.apply_settings_write_reply(save_id, ":1.100", Ok("ok".into()));
+
+        controller.apply_status_reply(
+            1,
+            ":1.100",
+            Err(ControlClientError::Call("transport failure".into())),
+        );
+        assert!(!controller.settings_draft.saved_verified);
+        assert!(!controller.settings_draft.write_failed);
+        assert!(controller.settings_draft.waiting_confirming_read);
+        assert!(controller.settings_draft.framerate_dirty);
+    }
+
+    #[test]
+    fn test_write_err_sets_write_failure_and_prevents_saved_verified() {
+        let mut controller = Controller::new();
+        controller.set_bus_owner(Some(":1.100".into()));
+
+        controller.settings_draft.framerate = Some(7);
+        controller.settings_draft.framerate_dirty = true;
+
+        let settings = SettingsModel {
+            capture_framerate: 7,
+            draw_cursor: true,
+            start_paused: false,
+            segment_interval: 10,
+        };
+        let save_id = controller.start_settings_save(":1.100", settings);
+        controller.apply_settings_write_reply(
+            save_id,
+            ":1.100",
+            Err(ControlClientError::Call("failed write".into())),
+        );
+        assert!(controller.settings_draft.write_failed);
+        assert!(!controller.settings_draft.waiting_confirming_read);
+
+        let doc_json = r#"{
+            "v": 1,
+            "durable": "confirmed",
+            "owner": ":1.100",
+            "health": "connected",
+            "capture": "recording",
+            "settings": {
+                "capture_framerate": 7,
+                "draw_cursor": true,
+                "start_paused": false,
+                "segment_interval": 10
+            },
+            "saved_available": true
+        }"#;
+
+        controller.apply_status_reply(1, ":1.100", Ok(doc_json.into()));
+        assert!(!controller.settings_draft.saved_verified);
+    }
+
+    #[test]
+    fn test_changed_writes_contains_only_dirty_fields() {
+        let mut draft = SettingsDraft::default();
+        assert!(draft.changed_writes().is_empty());
+
+        draft.framerate = Some(8);
+        assert!(draft.changed_writes().is_empty()); // not dirty yet
+
+        draft.framerate_dirty = true;
+        assert_eq!(
+            draft.changed_writes(),
+            vec![("capture_framerate", "8".to_string())]
+        );
+
+        draft.cursor = Some(false);
+        draft.cursor_dirty = true;
+        draft.start_paused = Some(true);
+        draft.start_paused_dirty = true;
+        draft.segment = Some(15);
+        draft.segment_dirty = true;
+
+        assert_eq!(
+            draft.changed_writes(),
+            vec![
+                ("capture_framerate", "8".to_string()),
+                ("draw_cursor", "false".to_string()),
+                ("start_paused", "true".to_string()),
+                ("segment_interval", "15".to_string()),
+            ]
+        );
     }
 
     #[test]
