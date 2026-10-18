@@ -9,6 +9,8 @@ pub const NAV_HELP: &str = "help";
 pub const ACTION_OPEN_JOURNAL: &str = "open your journal";
 pub const STATUS_ON: &str = "on";
 pub const STATUS_ON_DETAIL: &str = "intake is running.";
+pub const STATUS_SCREEN_WAITING: &str = "screen intake is waiting";
+pub const STATUS_SCREEN_WAITING_DETAIL: &str = "audio intake can continue.";
 pub const STATUS_PAUSED: &str = "paused";
 pub const STATUS_PAUSED_DETAIL: &str = "intake is paused until you resume.";
 pub const STATUS_STARTING: &str = "starting…";
@@ -226,6 +228,8 @@ pub enum CopyKey {
     ActionOpenJournal,
     StatusOn,
     StatusOnDetail,
+    StatusScreenWaiting,
+    StatusScreenWaitingDetail,
     StatusPaused,
     StatusPausedDetail,
     StatusStarting,
@@ -375,6 +379,8 @@ impl CopyKey {
             Self::ActionOpenJournal => ACTION_OPEN_JOURNAL,
             Self::StatusOn => STATUS_ON,
             Self::StatusOnDetail => STATUS_ON_DETAIL,
+            Self::StatusScreenWaiting => STATUS_SCREEN_WAITING,
+            Self::StatusScreenWaitingDetail => STATUS_SCREEN_WAITING_DETAIL,
             Self::StatusPaused => STATUS_PAUSED,
             Self::StatusPausedDetail => STATUS_PAUSED_DETAIL,
             Self::StatusStarting => STATUS_STARTING,

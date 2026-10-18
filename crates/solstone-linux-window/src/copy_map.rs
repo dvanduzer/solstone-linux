@@ -64,7 +64,14 @@ pub fn map_intake(model: &ControlModel) -> IntakeKeys {
             action: Some(CopyKey::ActionResume),
         };
     }
-    if matches!(model.capture.as_str(), "idle" | "waiting" | "stopped") {
+    if model.capture == "idle" {
+        return IntakeKeys {
+            headline: Some(CopyKey::StatusScreenWaiting),
+            detail: Some(CopyKey::StatusScreenWaitingDetail),
+            action: Some(CopyKey::ActionPause),
+        };
+    }
+    if matches!(model.capture.as_str(), "waiting" | "stopped") {
         IntakeKeys {
             headline: Some(CopyKey::StatusOff),
             detail: Some(CopyKey::StatusOffDetail),
@@ -707,6 +714,17 @@ mod tests {
         assert_eq!(k.headline, Some(CopyKey::StatusPaused));
         assert_eq!(k.detail, None);
         assert_eq!(k.action, Some(CopyKey::ActionResume));
+    }
+
+    #[test]
+    fn idle_screen_never_claims_audio_intake_is_off() {
+        let payload = r#"{"v":1,"durable":"unpaired","owner":"absent","health":"pairing-required","capture":"idle","settings":{"capture_framerate":1,"draw_cursor":true,"start_paused":false,"segment_interval":300},"saved_available":true}"#;
+        let model = solstone_linux::window_control::decode_control_str(payload).unwrap();
+        let keys = map_intake(&model);
+        assert_eq!(keys.headline, Some(CopyKey::StatusScreenWaiting));
+        assert_eq!(keys.detail, Some(CopyKey::StatusScreenWaitingDetail));
+        assert_eq!(keys.action, Some(CopyKey::ActionPause));
+        assert_ne!(keys.headline, Some(CopyKey::StatusOff));
     }
 
     #[test]
