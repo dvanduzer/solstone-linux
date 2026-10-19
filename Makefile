@@ -69,7 +69,10 @@ agent-setup: establish-toolchain rust-preflight
 	[ "$$actual" = "cargo-deny $(CARGO_DENY_VERSION)" ] || { echo "error: cargo-deny verification mismatch: expected 'cargo-deny $(CARGO_DENY_VERSION)', actual '$${actual:-unavailable}'" >&2; echo "repair: cargo install cargo-deny --version $(CARGO_DENY_VERSION) --locked" >&2; exit 1; }
 	$(CARGO) metadata $(CARGO_LOCKED) --format-version 1 > /dev/null
 
+# Build both binaries before installing either, so a build failure (such as a
+# missing GTK development package) leaves the installed app untouched.
 install: agent-setup
+	@$(CARGO) build --release $(CARGO_LOCKED) -p solstone-linux -p solstone-linux-window || { echo "error: build failed; nothing was installed and the installed app is unchanged" >&2; exit 1; }
 	@$(CARGO) install --path crates/solstone-linux $(CARGO_LOCKED) || { echo "error: observer installation mismatch: expected $(CARGO_BIN_DIR)/$(APP), actual installation failed" >&2; echo "repair: cargo install --path crates/solstone-linux --locked" >&2; exit 1; }
 	@$(CARGO) install --path crates/solstone-linux-window $(CARGO_LOCKED)
 

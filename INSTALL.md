@@ -185,7 +185,7 @@ continue taking in what you share while unpaired or offline. Setup asks you to c
 
 ## Build from source
 
-Install rustup, a C toolchain, CMake, pkg-config, GTK4/GLib/GStreamer development headers, PulseAudio development headers, and the `minisign` and `shellcheck` commands, which `make ci` runs. Then:
+Install rustup, a C toolchain, CMake, pkg-config, GTK4/GLib/GStreamer development headers (GTK4's are `gtk4-devel` on Fedora and `libgtk-4-dev` on Debian and Ubuntu), PulseAudio development headers, and the `minisign` and `shellcheck` commands, which `make ci` runs. Then:
 
 ```bash
 git clone https://github.com/solpbc/solstone-linux.git
@@ -199,14 +199,24 @@ solstone-linux window
 `rust-toolchain.toml` selects the exact compiler, components, and target. `make
 install` explicitly establishes them and cargo-deny before installing the app.
 
+A source install does not add solstone to your app menu. Open the window with
+`solstone-linux window`.
+
 ## Update from source
 
 ```bash
 git pull
+make agent-setup
 make ci
 make install
 solstone-linux window
 ```
+
+`make agent-setup` downloads any crates the new version added, which `make ci`
+needs because it runs offline. A new version can also need a new development
+package; if the build stops on a missing system library, install the headers
+listed under Build from source. `make install` builds both binaries before it
+installs either, so a failed build leaves the installed app unchanged.
 
 Setup and runtime deliberately share one private-state lock. Confirm changes pairing state while the solstone app is running, and setup still needs the app stopped because it takes the lock. If the solstone app is running, setup exits before consuming any input and leaves intake state, configuration, and private state unchanged.
 
