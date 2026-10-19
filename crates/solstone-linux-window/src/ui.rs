@@ -1488,10 +1488,16 @@ fn create_settings_page(
                 {
                     framerate_entry.set_text(&format_integer(saved_framerate));
                 }
-                if !cursor_dirty && !cursor_switch.has_focus() {
+                if !cursor_dirty
+                    && !cursor_switch.has_focus()
+                    && cursor_switch.is_active() != saved_cursor
+                {
                     cursor_switch.set_active(saved_cursor);
                 }
-                if !start_paused_dirty && !start_paused_switch.has_focus() {
+                if !start_paused_dirty
+                    && !start_paused_switch.has_focus()
+                    && start_paused_switch.is_active() != saved_start_paused
+                {
                     start_paused_switch.set_active(saved_start_paused);
                 }
                 if !segment_dirty
@@ -1502,13 +1508,22 @@ fn create_settings_page(
                 {
                     segment_entry.set_text(&format_integer(saved_segment));
                 }
-                if !activity_source_dirty && !activity_source_switch.has_focus() {
+                if !activity_source_dirty
+                    && !activity_source_switch.has_focus()
+                    && activity_source_switch.is_active() != saved_activity_source
+                {
                     activity_source_switch.set_active(saved_activity_source);
                 }
-                if !activity_titles_dirty && !activity_titles_switch.has_focus() {
+                if !activity_titles_dirty
+                    && !activity_titles_switch.has_focus()
+                    && activity_titles_switch.is_active() != saved_activity_titles
+                {
                     activity_titles_switch.set_active(saved_activity_titles);
                 }
-                if !activity_urls_dirty && !activity_urls_switch.has_focus() {
+                if !activity_urls_dirty
+                    && !activity_urls_switch.has_focus()
+                    && activity_urls_switch.is_active() != saved_activity_urls
+                {
                     activity_urls_switch.set_active(saved_activity_urls);
                 }
                 if !activity_exclude_apps_dirty
@@ -1531,7 +1546,10 @@ fn create_settings_page(
                         &join_exclusion_list(&saved_exclude_titles),
                     );
                 }
-                if !activity_only_dirty && !activity_only_switch.has_focus() {
+                if !activity_only_dirty
+                    && !activity_only_switch.has_focus()
+                    && activity_only_switch.is_active() != saved_activity_only
+                {
                     activity_only_switch.set_active(saved_activity_only);
                 }
                 let activity_only_selected = if activity_only_dirty {
