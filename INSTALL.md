@@ -5,8 +5,21 @@ solstone app on linux takes in what you share with it using PipeWire and
 GStreamer, and all of it goes into your journal.
 
 Your journal must already be available. If it is not, start there:
-https://solstone.app/install. Create a pairing link for this device in your journal
-and save it as `pairing-link.txt`.
+https://solstone.app/install. Create a pairing link for this device in your journal.
+
+## The quick way
+
+On x86_64, the solstone installer downloads the app, checks its signature, starts it
+and adds solstone to your app menu:
+
+```bash
+curl -fsSL https://solstone.app/install.sh | sh -s -- --components desktop
+```
+
+Install `minisign` and the system dependencies below first if your desktop
+doesn't have them. Then [open the window](#open-the-window) and paste your
+pairing link. The next sections install a release by hand; Verify and Desktop
+notes apply either way.
 
 ## System dependencies
 
@@ -115,8 +128,8 @@ runtime dependency list, and `RUST_DEPENDENCY_NOTICES.txt`, reproducing third-pa
 
 ### Open the window
 
-Use this section when your version's changelog includes the window. For
-earlier releases, use [terminal pairing](#pair-from-a-terminal).
+The window comes with version 2.0.24 and later. On an earlier version, use
+[terminal pairing](#pair-from-a-terminal).
 
 Open solstone from your app menu or the panel icon. No panel icon extension is
 needed for the window. It has four tabs: `status`, `journal`, `settings` and `help`.
@@ -144,8 +157,9 @@ GTK dependency and keeps running when the window closes or cannot start.
 
 ### Pair from a terminal
 
-The service command writes the systemd user unit and desktop autostart entry,
-enables the unit, and starts the solstone app:
+Save the pairing link as `pairing-link.txt`. The service command writes the
+systemd user unit and desktop autostart entry, enables the unit, and starts the
+solstone app:
 
 ```bash
 solstone-linux install-service
@@ -246,7 +260,7 @@ If it is not, GNOME asks you to confirm, then installs the AppIndicator extensio
 extensions.gnome.org and turns it on in your current session. There is no logout. The
 solstone app picks up the panel icon within a few seconds.
 
-If you installed the rpm, the extension came with it and is already on disk — GNOME has
+If you installed the rpm, the extension came with it and is already on disk, but GNOME has
 not loaded it yet. Log out and back in once, then run the command again to turn it on.
 
 Either way, `solstone-linux doctor` reports what it found.
