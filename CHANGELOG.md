@@ -6,9 +6,14 @@ and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+## [2.0.24] - 2026-10-19
+
 ### Added
 
-- open solstone from your app menu for status, pause and resume, journal pairing, settings and help, even without a panel icon. compare your journal's mark before confirming a pairing link. settings stay in config.json, including hand-added keys, and the window tells you when a restart is needed. help lets you preview recent logs and save exactly what you read. opening or closing the window does not start or stop intake; your journal opens in your browser.
+- the solstone app now has its own window. open it from your app menu for status, pause and resume, journal pairing, settings and help, even without a panel icon. opening or closing the window does not start or stop intake.
+- in the window, paste a pairing link and compare your journal's mark before you confirm it. once you've paired, "open your journal" opens it in your browser.
+- if you've edited config.json by hand, saving settings from the window keeps your edits, and the window tells you when a restart is needed.
+- help lets you preview recent logs and save exactly what you read.
 
 ## [2.0.23] - 2026-10-18
 
