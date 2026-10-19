@@ -6,8 +6,8 @@
 use crate::{
     activity_prefs::ActivityPrefs,
     activity_source::{
-        ActivityFault, ActivityRuntime, CapabilityStatus, ForegroundProvider, NoForeground,
-        PollInput, route_name,
+        ActivityContinuation, ActivityFault, ActivityRuntime, CapabilityStatus, ForegroundProvider,
+        NoForeground, PollInput, route_name,
     },
     activity_writer::ActivityWriter,
     capture_stats::{CaptureStats, compute_capture_stats},
@@ -354,13 +354,13 @@ where
         desktop: String,
     ) {
         self.foreground = foreground;
+        self.foreground.bind_prefs(std::sync::Arc::clone(&prefs));
         self.activity = Some(ActivityRuntime {
             prefs,
             sampler: crate::activity_source::ActivitySampler::new(),
             writer: None,
             fault,
             capability,
-            anchor_mono: None,
             desktop,
         });
     }
@@ -372,7 +372,8 @@ where
         self.state.mode = target;
         if self.config.activity_only {
             self.note_activity();
-            self.persist_activity();
+            self.ensure_activity_segment()?;
+            let _ = self.persist_activity();
             if !self.session_live() {
                 self.state.mode = Mode::Idle;
             }
@@ -406,9 +407,19 @@ where
         if let Some(activity) = self.activity.as_ref() {
             activity.prefs.bump_generation();
         }
+        // Seal at this instant. The next tick must not extend the interval, and it
+        // must not ask the desktop what is in front.
+        self.foreground.set_reading(false);
+        self.foreground.set_paused(true);
+        let now_ms = wall_millis(self.backends.clock.wall_seconds());
+        if let Some(activity) = self.activity.as_mut() {
+            activity.sampler.seal(now_ms);
+        }
+        let _ = self.persist_activity();
         self.publish();
     }
     /// Ends the owner's pause, by the owner or at its deadline.
+    /// Does not open an activity interval; the next tick starts a new one.
     pub fn resume(&mut self) {
         self.state.paused = false;
         self.state.pause_until = None;
@@ -416,6 +427,7 @@ where
         if let Err(error) = pause_hold::clear(&self.config.state_dir()) {
             tracing::warn!(%error, "Could not remove the recorded pause");
         }
+        self.foreground.set_paused(false);
         self.publish();
     }
 
@@ -469,7 +481,7 @@ where
                 Err(error) => return Err(error),
                 Ok(()) => {}
             }
-            self.persist_activity();
+            let _ = self.persist_activity();
             self.publish();
             return Ok(());
         }
@@ -510,7 +522,7 @@ where
             target = Mode::Idle;
         }
         self.note_activity();
-        self.persist_activity();
+        let _ = self.persist_activity();
         let mode_changed = target != self.state.mode;
         let screen_transition =
             mode_changed && (self.state.mode == Mode::Screencast || target == Mode::Screencast);
@@ -540,16 +552,28 @@ where
     }
 
     pub fn handle_boundary(&mut self, target: Mode) -> Result<(), ObserverError> {
+        let end_ms = wall_millis(self.backends.clock.wall_seconds());
+        let continued: ActivityContinuation = self
+            .activity
+            .as_ref()
+            .map(|activity| activity.sampler.continuation())
+            .unwrap_or_default();
         if self.state.mode == Mode::Screencast && !self.config.activity_only {
             self.stop_video()?;
         }
         self.write_gated_audio()?;
         self.state.frames.clear();
         self.state.hit_gate = HitGate::default();
-        self.finalize_segment()?;
+        self.finalize_segment_at(end_ms)?;
         self.state.segment_is_muted = self.state.cached_is_muted;
         self.state.mode = target;
-        self.start_capture(target)
+        let started = self.start_capture(target);
+        if self.state.segment_dir.is_some()
+            && let Some(activity) = self.activity.as_mut()
+        {
+            activity.sampler.resume_continuation(continued, end_ms);
+        }
+        started
     }
 
     pub fn shutdown(&mut self) -> Result<(), ObserverError> {
@@ -564,16 +588,18 @@ where
         if let Some(activity) = self.activity.as_ref() {
             activity.prefs.bump_generation();
         }
+        self.foreground.set_reading(false);
+        self.foreground.set_paused(true);
         if !self.config.activity_only {
             self.write_gated_audio()?;
         }
-        self.finalize_segment()?;
+        let activity_result = self.finalize_segment();
         self.backends.audio.stop();
         self.publish();
         if let Some(error) = self.backends.audio.fatal_error() {
             return Err(ObserverError::AudioFatal(error));
         }
-        Ok(())
+        activity_result
     }
 
     fn session_live(&self) -> bool {
@@ -594,7 +620,7 @@ where
 
     fn finish_paused_segment(&mut self) -> Result<(), ObserverError> {
         self.note_activity();
-        self.persist_activity();
+        let _ = self.persist_activity();
         if self.state.segment_dir.is_none() {
             return Ok(());
         }
@@ -642,6 +668,11 @@ where
     }
     fn start_segment(&mut self) -> Result<PathBuf, ObserverError> {
         let wall = self.backends.clock.wall_seconds();
+        let mono = self.backends.clock.monotonic_seconds();
+        self.start_segment_at(wall, mono)
+    }
+
+    fn start_segment_at(&mut self, wall: f64, mono: f64) -> Result<PathBuf, ObserverError> {
         if let Some(ref dir) = self.state.segment_dir
             && (wall.floor() as i64) == (self.state.segment_start_wall.floor() as i64)
         {
@@ -671,7 +702,7 @@ where
             },
         );
         self.state.segment_start_wall = wall;
-        self.state.segment_start_mono = self.backends.clock.monotonic_seconds();
+        self.state.segment_start_mono = mono;
         self.state.segment_dir = Some(dir.clone());
         self.state.video_started = false;
         Ok(dir)
@@ -726,11 +757,21 @@ where
         }
     }
     fn finalize_segment(&mut self) -> Result<(), ObserverError> {
-        self.seal_open_activity();
-        self.persist_activity();
+        let end_ms = wall_millis(self.backends.clock.wall_seconds());
+        self.finalize_segment_at(end_ms)
+    }
+
+    fn finalize_segment_at(&mut self, end_ms: u64) -> Result<(), ObserverError> {
+        if let Some(activity) = self.activity.as_mut() {
+            activity.sampler.seal(end_ms);
+        }
+        self.persist_activity()?;
+        self.finish_segment_directory()
+    }
+
+    fn finish_segment_directory(&mut self) -> Result<(), ObserverError> {
         if let Some(activity) = self.activity.as_mut() {
             activity.writer = None;
-            activity.anchor_mono = None;
         }
         let Some(dir) = self.state.segment_dir.take() else {
             return Ok(());
@@ -796,9 +837,10 @@ where
         }
         self.state.mode = target;
         self.state.segment_is_muted = self.state.cached_is_muted;
+        self.split_activity_interval()?;
         self.note_activity();
-        self.persist_activity();
-        self.roll_activity_segment()?;
+        self.ensure_activity_segment()?;
+        let _ = self.persist_activity();
         self.publish();
         Ok(())
     }
@@ -816,8 +858,6 @@ where
         }
         let facts = self.backends.activity.activity_facts();
         let now_ms = wall_millis(self.backends.clock.wall_seconds());
-        let mono = self.backends.clock.monotonic_seconds();
-        let dir_none = self.state.segment_dir.is_none();
         let route = route_name(facts.kind, &desktop);
         let input = PollInput {
             now_ms,
@@ -846,7 +886,6 @@ where
                 && backends.activity.activity_facts().session_epoch == start_epoch
         });
         let status = sampler.status();
-        let has_open = sampler.has_open();
         let Some(activity) = activity.as_mut() else {
             return;
         };
@@ -854,39 +893,30 @@ where
         if let Ok(mut slot) = activity.capability.lock() {
             *slot = status;
         }
-        if has_open && activity.anchor_mono.is_none() && dir_none {
-            activity.anchor_mono = Some(mono);
-        }
     }
 
-    fn seal_open_activity(&mut self) {
-        let now_ms = wall_millis(self.backends.clock.wall_seconds());
+    fn restore_activity_rows(&mut self, rows: Vec<crate::activity_writer::DesktopActivityRow>) {
         if let Some(activity) = self.activity.as_mut() {
-            activity.sampler.seal(now_ms);
+            activity.fault.record_write_error();
+            activity.sampler.restore_pending(rows);
         }
     }
 
-    fn persist_activity(&mut self) {
+    fn persist_activity(&mut self) -> Result<(), ObserverError> {
         let pending = match self.activity.as_mut() {
             Some(activity) => activity.sampler.take_pending(),
-            None => return,
+            None => return Ok(()),
         };
         if pending.is_empty() {
-            return;
+            return Ok(());
         }
         if self.state.segment_dir.is_none() && self.start_segment().is_err() {
-            if let Some(activity) = self.activity.as_mut() {
-                activity.fault.record_write_error();
-                activity.sampler.restore_pending(pending);
-            }
-            return;
+            self.restore_activity_rows(pending);
+            return Err(ObserverError::Io("activity-write-failed".into()));
         }
         let Some(dir) = self.state.segment_dir.clone() else {
-            if let Some(activity) = self.activity.as_mut() {
-                activity.fault.record_write_error();
-                activity.sampler.restore_pending(pending);
-            }
-            return;
+            self.restore_activity_rows(pending);
+            return Err(ObserverError::Io("activity-write-failed".into()));
         };
         let Some(hms) = dir
             .file_name()
@@ -894,14 +924,11 @@ where
             .and_then(|name| name.strip_suffix(".incomplete"))
             .map(str::to_string)
         else {
-            if let Some(activity) = self.activity.as_mut() {
-                activity.fault.record_write_error();
-                activity.sampler.restore_pending(pending);
-            }
-            return;
+            self.restore_activity_rows(pending);
+            return Err(ObserverError::Io("activity-write-failed".into()));
         };
         let Some(activity) = self.activity.as_mut() else {
-            return;
+            return Err(ObserverError::Io("activity-write-failed".into()));
         };
         let reuse = activity
             .writer
@@ -925,30 +952,54 @@ where
         if let Some(index) = failed_at {
             activity.fault.record_write_error();
             activity.sampler.restore_pending(pending[index..].to_vec());
+            return Err(ObserverError::Io("activity-write-failed".into()));
         }
+        Ok(())
     }
 
-    fn roll_activity_segment(&mut self) -> Result<(), ObserverError> {
-        let now = self.backends.clock.monotonic_seconds();
+    /// Activity-only: the open segment begins when the interval begins. At the
+    /// boundary, close rows at that instant and continue them in the next segment.
+    fn split_activity_interval(&mut self) -> Result<(), ObserverError> {
+        if self.state.segment_dir.is_none() {
+            return Ok(());
+        }
         let interval = self.config.segment_interval.max(1) as f64;
-        let anchor = self
+        let now = self.backends.clock.monotonic_seconds();
+        if now - self.state.segment_start_mono < interval {
+            return Ok(());
+        }
+        let boundary_mono = self.state.segment_start_mono + interval;
+        let boundary_wall = self.state.segment_start_wall + interval;
+        let boundary_ms = wall_millis(boundary_wall);
+        let continued: ActivityContinuation = self
             .activity
             .as_ref()
-            .and_then(|activity| activity.anchor_mono);
-        let open_without_dir = self.state.segment_dir.is_none()
-            && self
-                .activity
-                .as_ref()
-                .is_some_and(|activity| activity.sampler.has_open());
-        if open_without_dir && anchor.is_some_and(|start| now - start >= interval) {
-            self.seal_open_activity();
-            self.persist_activity();
-            self.finalize_segment()?;
-        } else if self.state.segment_dir.is_some()
-            && now - self.state.segment_start_mono >= interval
-        {
-            self.finalize_segment()?;
+            .map(|activity| activity.sampler.continuation())
+            .unwrap_or_default();
+        if let Some(activity) = self.activity.as_mut() {
+            activity.sampler.seal(boundary_ms);
         }
+        self.persist_activity()?;
+        self.finish_segment_directory()?;
+        if let Some(activity) = self.activity.as_mut() {
+            activity.sampler.resume_continuation(continued, boundary_ms);
+        }
+        self.start_segment_at(boundary_wall, boundary_mono)?;
+        Ok(())
+    }
+
+    fn ensure_activity_segment(&mut self) -> Result<(), ObserverError> {
+        if !self.config.activity_only || self.state.segment_dir.is_some() {
+            return Ok(());
+        }
+        let open = self
+            .activity
+            .as_ref()
+            .is_some_and(|activity| activity.sampler.has_open());
+        if !open {
+            return Ok(());
+        }
+        self.start_segment()?;
         Ok(())
     }
 
@@ -2807,6 +2858,7 @@ pub(crate) mod tests {
                     app_id: None,
                     title: None,
                     pid: None,
+                    window_id: 0,
                 },
             )
         }
@@ -2906,6 +2958,144 @@ pub(crate) mod tests {
         assert!(!text.contains("pairing_id"));
     }
 
+    fn activity_rows(
+        paths: &[std::path::PathBuf],
+    ) -> Vec<crate::activity_writer::DesktopActivityRow> {
+        let mut rows = Vec::new();
+        for path in paths {
+            let text = fs::read_to_string(path).unwrap();
+            for line in text.lines().filter(|line| !line.is_empty()) {
+                rows.push(serde_json::from_str(line).unwrap());
+            }
+        }
+        rows
+    }
+
+    fn segment_names(root: &std::path::Path) -> Vec<String> {
+        let mut names = Vec::new();
+        let captures = root.join("captures");
+        if !captures.exists() {
+            return names;
+        }
+        for day in fs::read_dir(&captures).unwrap().flatten() {
+            for stream in fs::read_dir(day.path()).unwrap().flatten() {
+                for segment in fs::read_dir(stream.path()).unwrap().flatten() {
+                    if segment.path().is_dir() {
+                        names.push(segment.file_name().to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+        names.sort();
+        names
+    }
+
+    fn rows_in_segment(
+        root: &std::path::Path,
+        segment: &str,
+    ) -> Vec<crate::activity_writer::DesktopActivityRow> {
+        let paths: Vec<_> = activity_jsonl_paths(root)
+            .into_iter()
+            .filter(|path| {
+                path.parent()
+                    .and_then(|parent| parent.file_name())
+                    .and_then(|name| name.to_str())
+                    == Some(segment)
+            })
+            .collect();
+        activity_rows(&paths)
+    }
+
+    #[test]
+    fn pause_seals_activity_at_the_pause_instant() {
+        let mut f = fixture(false);
+        let (_fault, reads) = install_notes(&mut f, true);
+        f.wall.set(1.0);
+        initialize(&mut f);
+        let after_init = reads.get();
+        assert!(after_init >= 1);
+        f.observer.pause(0);
+        assert_eq!(reads.get(), after_init);
+        f.wall.set(5.0);
+        f.mono.set(5.0);
+        f.observer.tick().unwrap();
+        assert_eq!(reads.get(), after_init);
+        let rows = activity_rows(&activity_jsonl_paths(f.observer.config.base_dir.as_path()));
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|row| row.end_ts == 1_000));
+    }
+
+    #[test]
+    fn resume_does_not_continue_a_paused_interval() {
+        let mut f = fixture(false);
+        let (_fault, reads) = install_notes(&mut f, true);
+        f.wall.set(0.0);
+        initialize(&mut f);
+        let after_init = reads.get();
+        f.wall.set(1.0);
+        f.observer.pause(0);
+        assert_eq!(reads.get(), after_init);
+        f.wall.set(2.0);
+        f.observer.resume();
+        assert_eq!(reads.get(), after_init);
+        f.wall.set(5.0);
+        f.mono.set(5.0);
+        f.observer.tick().unwrap();
+        let rows = activity_rows(&activity_jsonl_paths(f.observer.config.base_dir.as_path()));
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter()
+                .all(|row| row.end_ts <= 1_000 || row.ts >= 2_000)
+        );
+        assert!(rows.iter().all(|row| row.ts < 2_000));
+    }
+
+    #[test]
+    fn activity_only_segments_split_on_the_interval_without_a_gap() {
+        let mut f = fixture(false);
+        let (_fault, _reads) = install_notes(&mut f, true);
+        initialize(&mut f);
+        let root = f.observer.config.base_dir.clone();
+        assert!(
+            segment_names(&root)
+                .iter()
+                .any(|name| name == "221320.incomplete")
+        );
+        assert!(activity_jsonl_paths(&root).is_empty());
+        assert_eq!(f.starts.get(), 0);
+
+        f.wall.set(1_700_000_300.0);
+        f.mono.set(300.0);
+        f.observer.tick().unwrap();
+        let names = segment_names(&root);
+        assert!(names.iter().any(|name| name == "221320_300"));
+        assert!(names.iter().any(|name| name == "221820.incomplete"));
+        let boundary = 1_700_000_300_000;
+        let first = rows_in_segment(&root, "221320_300");
+        assert!(!first.is_empty());
+        assert!(first.iter().all(|row| row.end_ts == boundary));
+        let next = root
+            .join("captures")
+            .join("20231114")
+            .join("desk")
+            .join("221820.incomplete");
+        let meta: Value =
+            serde_json::from_str(&fs::read_to_string(next.join(".metadata")).unwrap()).unwrap();
+        assert_eq!(meta["start_timestamp"].as_f64(), Some(1_700_000_300.0));
+
+        f.wall.set(1_700_000_600.0);
+        f.mono.set(600.0);
+        f.observer.tick().unwrap();
+        let second = rows_in_segment(&root, "221820_300");
+        assert!(!second.is_empty());
+        assert!(
+            second
+                .iter()
+                .all(|row| row.ts == boundary && row.end_ts == 1_700_000_600_000)
+        );
+        assert_eq!(f.starts.get(), 0);
+    }
+
     #[test]
     fn activity_write_failure_sets_payload_free_fault() {
         let mut f = fixture(false);
@@ -2923,11 +3113,47 @@ pub(crate) mod tests {
             perms.set_mode(0o755);
             fs::set_permissions(&dir, perms).unwrap();
         }
-        result.unwrap();
+        match result {
+            Err(ObserverError::Io(message)) => {
+                assert_eq!(message, "activity-write-failed");
+                assert!(!message.contains("Notes"));
+            }
+            other => panic!("expected an activity write failure, got {other:?}"),
+        }
         assert_eq!(
             fault.token().as_deref(),
             Some(crate::activity_source::ACTIVITY_FAULT)
         );
-        assert!(activity_jsonl_paths(f.observer.config.base_dir.as_path()).is_empty());
+        assert!(fs::read_dir(&dir).unwrap().flatten().all(|entry| {
+            !entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with("_desktop_activity.jsonl")
+        }));
+        f.observer.shutdown().unwrap();
+        let mut files = Vec::new();
+        for entry in fs::read_dir(f.observer.config.base_dir.as_path())
+            .unwrap()
+            .flatten()
+        {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            for file in fs::read_dir(entry.path()).unwrap().flatten() {
+                let name = file.file_name().to_string_lossy().into_owned();
+                if name.ends_with("_desktop_activity.jsonl") {
+                    files.push(file.path());
+                }
+            }
+        }
+        assert_eq!(files.len(), 1);
+        let text = fs::read_to_string(&files[0]).unwrap();
+        assert_eq!(text.matches("Notes").count(), 1);
+        let lines: Vec<_> = text.lines().filter(|line| !line.is_empty()).collect();
+        let mut unique = lines.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), lines.len());
+        assert!(!text.contains("pairing_id"));
     }
 }

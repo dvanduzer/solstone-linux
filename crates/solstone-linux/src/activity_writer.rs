@@ -3,8 +3,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use url::Url;
 
 pub const MAX_STRING_BYTES: usize = 4096;
@@ -116,94 +117,180 @@ pub fn sanitize_url(raw: &str) -> Option<String> {
     Some(parsed.to_string())
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteFault {
+    ShortWrite,
+    Newline,
+    Sync,
+}
+
 pub struct ActivityWriter {
     segment_dir: PathBuf,
     hms: String,
-    artifact_counter: u64,
     current_file: Option<File>,
     current_path: Option<PathBuf>,
+    /// Bytes known to be a complete, synced prefix of the file.
+    durable_len: u64,
+    #[cfg(test)]
+    fault: Option<WriteFault>,
+}
+
+/// A new id every file. Scanning names still on disk would reuse `1` after the
+/// segment directory is removed.
+fn artifact_id() -> String {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let mixed = nanos
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(u128::from(sequence) << 64)
+        .wrapping_add(u128::from(std::process::id()));
+    let mut bytes = mixed.to_le_bytes();
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
 }
 
 impl ActivityWriter {
     pub fn new(segment_dir: PathBuf, hms: String) -> Self {
-        let mut max_counter = 0;
-        if segment_dir.exists()
-            && let Ok(entries) = fs::read_dir(&segment_dir)
-        {
-            let prefix = format!("{}_", hms);
-            let suffix = "_desktop_activity.jsonl";
-            for entry in entries.flatten() {
-                let file_name = entry.file_name();
-                let name = file_name.to_string_lossy();
-                if name.starts_with(&prefix) && name.ends_with(suffix) {
-                    let middle = &name[prefix.len()..name.len() - suffix.len()];
-                    if let Ok(n) = middle.parse::<u64>()
-                        && n > max_counter
-                    {
-                        max_counter = n;
-                    }
-                }
-            }
-        }
-        let artifact_counter = if max_counter > 0 { max_counter + 1 } else { 1 };
         Self {
             segment_dir,
             hms,
-            artifact_counter,
             current_file: None,
             current_path: None,
+            durable_len: 0,
+            #[cfg(test)]
+            fault: None,
         }
     }
 
+    /// The next closed row starts a new file. This writer does not reopen one.
     pub fn next_artifact(&mut self) {
-        self.artifact_counter += 1;
         self.current_file = None;
         self.current_path = None;
+        self.durable_len = 0;
     }
 
-    pub fn write_row(&mut self, row: &DesktopActivityRow) -> io::Result<()> {
-        let serialized = serde_json::to_string(row)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    #[cfg(test)]
+    fn fail_next(&mut self, fault: WriteFault) {
+        self.fault = Some(fault);
+    }
 
-        if self.current_file.is_none() {
-            fs::create_dir_all(&self.segment_dir)?;
-            let mut attempts = 0;
-            loop {
-                let filename = format!(
-                    "{}_{}_desktop_activity.jsonl",
-                    self.hms, self.artifact_counter
-                );
-                let path = self.segment_dir.join(filename);
-                match OpenOptions::new().write(true).create_new(true).open(&path) {
-                    Ok(file) => {
-                        self.current_path = Some(path);
-                        self.current_file = Some(file);
-                        break;
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                        attempts += 1;
-                        self.artifact_counter += 1;
-                        if attempts >= 8 {
-                            return Err(e);
-                        }
-                    }
-                    Err(e) => return Err(e),
+    pub fn current_path(&self) -> Option<&Path> {
+        self.current_path.as_deref()
+    }
+
+    fn open_fresh(&mut self) -> io::Result<()> {
+        fs::create_dir_all(&self.segment_dir)?;
+        let mut last_error = None;
+        for _ in 0..8 {
+            let filename = format!("{}_{}_desktop_activity.jsonl", self.hms, artifact_id());
+            let path = self.segment_dir.join(filename);
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => {
+                    self.current_path = Some(path);
+                    self.current_file = Some(file);
+                    self.durable_len = 0;
+                    return Ok(());
                 }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
             }
         }
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::AlreadyExists, "activity file id collided")
+        }))
+    }
 
-        if let Some(ref mut file) = self.current_file {
-            file.write_all(serialized.as_bytes())?;
-            file.write_all(b"\n")?;
-            file.flush()?;
-            file.sync_all()?;
+    /// JSON, the newline, and the sync land together. A failed attempt rolls
+    /// back to the last synced row so a retry cannot duplicate a partial line.
+    pub fn write_row(&mut self, row: &DesktopActivityRow) -> io::Result<()> {
+        let serialized = serde_json::to_vec(row)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if self.current_file.is_none() {
+            self.open_fresh()?;
         }
+        let durable = self.durable_len;
+        if let Err(error) = self.append_record(&serialized) {
+            self.rollback(durable)?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn append_record(&mut self, payload: &[u8]) -> io::Result<()> {
+        #[cfg(test)]
+        let fault = self.fault.take();
+        let file = self
+            .current_file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("activity file is not open"))?;
+        #[cfg(test)]
+        if fault == Some(WriteFault::ShortWrite) {
+            let mid = payload.len() / 2;
+            if mid > 0 {
+                file.write_all(&payload[..mid])?;
+            }
+            return Err(io::Error::other("short-write"));
+        }
+        file.write_all(payload)?;
+        #[cfg(test)]
+        if fault == Some(WriteFault::Newline) {
+            return Err(io::Error::other("newline"));
+        }
+        file.write_all(b"\n")?;
+        file.flush()?;
+        #[cfg(test)]
+        if fault == Some(WriteFault::Sync) {
+            return Err(io::Error::other("sync"));
+        }
+        file.sync_all()?;
+        self.durable_len = self
+            .durable_len
+            .saturating_add(payload.len() as u64)
+            .saturating_add(1);
+        Ok(())
+    }
+
+    fn rollback(&mut self, durable: u64) -> io::Result<()> {
+        let Some(file) = self.current_file.as_mut() else {
+            return Ok(());
+        };
+        file.set_len(durable)?;
+        file.seek(SeekFrom::Start(durable))?;
+        file.sync_all()?;
+        self.durable_len = durable;
         Ok(())
     }
 
     pub fn close(&mut self) {
         self.current_file = None;
         self.current_path = None;
+        self.durable_len = 0;
     }
 }
 
@@ -305,20 +392,39 @@ mod tests {
 
         writer.write_row(&row1).unwrap();
         writer.write_row(&row2).unwrap();
+        let first = writer.current_path().unwrap().to_path_buf();
         writer.next_artifact();
         writer.write_row(&row3).unwrap();
+        let second = writer.current_path().unwrap().to_path_buf();
         writer.close();
 
-        let file1 = seg_dir.join("120000_1_desktop_activity.jsonl");
-        let file2 = seg_dir.join("120000_2_desktop_activity.jsonl");
-        assert!(file1.exists());
-        assert!(file2.exists());
+        assert_ne!(first, second);
+        assert!(
+            first.ends_with("_desktop_activity.jsonl")
+                || first
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with("_desktop_activity.jsonl")
+        );
+        assert!(
+            second
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("_desktop_activity.jsonl")
+        );
+        assert!(
+            !first
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("_1_desktop_activity")
+        );
 
-        let read_rows = read_activity_rows_from_dir(&seg_dir).unwrap();
-        assert_eq!(read_rows.len(), 3);
-        assert_eq!(read_rows[0], row1);
-        assert_eq!(read_rows[1], row2);
-        assert_eq!(read_rows[2], row3);
+        let mut read_rows = read_activity_rows_from_dir(&seg_dir).unwrap();
+        read_rows.sort_by_key(|row| row.ts);
+        assert_eq!(read_rows, vec![row1, row2, row3]);
     }
 
     #[test]
@@ -337,13 +443,13 @@ mod tests {
             None,
         );
 
-        {
+        let file1 = {
             let mut writer1 = ActivityWriter::new(seg_dir.clone(), hms.clone());
             writer1.write_row(&row1).unwrap();
+            let path = writer1.current_path().unwrap().to_path_buf();
             writer1.close();
-        }
-
-        let file1 = seg_dir.join("120000_1_desktop_activity.jsonl");
+            path
+        };
         assert!(file1.exists());
         let file1_bytes = fs::read(&file1).unwrap();
 
@@ -357,23 +463,78 @@ mod tests {
             None,
         );
 
-        {
+        let file2 = {
             let mut writer2 = ActivityWriter::new(seg_dir.clone(), hms.clone());
             writer2.write_row(&row2).unwrap();
+            let path = writer2.current_path().unwrap().to_path_buf();
             writer2.close();
-        }
+            path
+        };
 
-        // The first file's bytes and name are unchanged.
         assert_eq!(fs::read(&file1).unwrap(), file1_bytes);
+        assert_ne!(file1, file2);
+        assert!(
+            file2
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("_desktop_activity.jsonl")
+        );
 
-        // The second row is in a different *_desktop_activity.jsonl.
-        let file2 = seg_dir.join("120000_2_desktop_activity.jsonl");
-        assert!(file2.exists());
+        let mut rows = read_activity_rows_from_dir(&seg_dir).unwrap();
+        rows.sort_by_key(|row| row.ts);
+        assert_eq!(rows, vec![row1, row2]);
+    }
 
-        // read_activity_rows_from_dir returns both rows.
-        let rows = read_activity_rows_from_dir(&seg_dir).unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0], row1);
-        assert_eq!(rows[1], row2);
+    #[test]
+    fn removed_directory_does_not_reuse_the_artifact_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let seg_dir = tmp.path().join("120000.incomplete");
+        let row = DesktopActivityRow::activity(1, 2, "unavailable".into(), "active".into());
+        let first = {
+            let mut writer = ActivityWriter::new(seg_dir.clone(), "120000".into());
+            writer.write_row(&row).unwrap();
+            writer.current_path().unwrap().to_path_buf()
+        };
+        let first_name = first.file_name().unwrap().to_os_string();
+        fs::remove_dir_all(&seg_dir).unwrap();
+        let mut writer = ActivityWriter::new(seg_dir, "120000".into());
+        writer.write_row(&row).unwrap();
+        let second_name = writer
+            .current_path()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_os_string();
+        assert_ne!(first_name, second_name);
+    }
+
+    #[test]
+    fn failed_append_keeps_prior_rows_and_retries_once() {
+        for fault in [
+            WriteFault::ShortWrite,
+            WriteFault::Newline,
+            WriteFault::Sync,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let seg_dir = tmp.path().join("120000.incomplete");
+            let mut writer = ActivityWriter::new(seg_dir, "120000".into());
+            let row1 =
+                DesktopActivityRow::activity(1_000, 2_000, "unavailable".into(), "active".into());
+            let row2 =
+                DesktopActivityRow::activity(2_000, 3_000, "unavailable".into(), "idle".into());
+            writer.write_row(&row1).unwrap();
+            let path = writer.current_path().unwrap().to_path_buf();
+            writer.fail_next(fault);
+            assert!(writer.write_row(&row2).is_err());
+            let during = fs::read_to_string(&path).unwrap();
+            assert_eq!(during.lines().count(), 1);
+            assert!(!during.contains("idle"));
+            writer.write_row(&row2).unwrap();
+            let after = fs::read_to_string(&path).unwrap();
+            assert_eq!(after.lines().count(), 2);
+            let rows = read_activity_rows_from_dir(path.parent().unwrap()).unwrap();
+            assert_eq!(rows, vec![row1, row2]);
+        }
     }
 }

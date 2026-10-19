@@ -821,6 +821,64 @@ mod tests {
     }
 
     #[test]
+    fn resolve_publishes_the_idle_signal_that_just_answered() {
+        let mut cache = CacheState::default();
+        let mut wayland = FakeWayland {
+            bound: BackendOutcome::Available(()),
+            edges: vec![IdleEdge::Resumed],
+            bind_calls: 0,
+        };
+        let (state, bound) = run(
+            "GNOME",
+            "wayland",
+            &mut FakeSession::default(),
+            &mut FakeSystem::default(),
+            &mut wayland,
+            &mut FakeX::default(),
+            &mut cache,
+        );
+        assert!(bound.wayland_idle);
+        assert!(state.idle_observed);
+        assert!(!state.user_idle);
+        assert_eq!(bound.idle_signal(), Some("ext-idle-notify-v1"));
+
+        wayland.bound = BackendOutcome::Absent;
+        wayland.edges.clear();
+        let (state, bound) = run(
+            "GNOME",
+            "wayland",
+            &mut FakeSession::default(),
+            &mut FakeSystem::default(),
+            &mut wayland,
+            &mut FakeX::default(),
+            &mut cache,
+        );
+        assert!(!bound.wayland_idle && !bound.mutter_idle && !bound.x11_idle);
+        assert!(bound.idle_signal().is_none());
+        assert!(!state.idle_observed);
+        assert!(!state.user_idle);
+
+        let mut session = FakeSession {
+            idle: BackendOutcome::Available(0),
+            ..FakeSession::default()
+        };
+        let (state, bound) = run(
+            "GNOME",
+            "wayland",
+            &mut session,
+            &mut FakeSystem::default(),
+            &mut wayland,
+            &mut FakeX::default(),
+            &mut cache,
+        );
+        assert!(bound.mutter_idle);
+        assert!(!bound.wayland_idle);
+        assert_eq!(bound.idle_signal(), Some("Mutter IdleMonitor"));
+        assert!(state.idle_observed);
+        assert!(!state.user_idle);
+    }
+
+    #[test]
     fn exact_desktop_tokens_only() {
         assert!(desktop_has_token("ubuntu:GNOME", "gnome"));
         // tests/test_activity.py::TestIsScreenLocked::test_xdg_current_desktop_not_gnome_does_not_match_substring

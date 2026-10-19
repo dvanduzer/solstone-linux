@@ -1020,7 +1020,7 @@ fn create_journal_page(
 }
 
 fn split_exclusion_list(text: &str) -> Vec<String> {
-    text.split(',')
+    text.lines()
         .map(str::trim)
         .filter(|item| !item.is_empty())
         .map(str::to_string)
@@ -1028,7 +1028,29 @@ fn split_exclusion_list(text: &str) -> Vec<String> {
 }
 
 fn join_exclusion_list(items: &[String]) -> String {
-    items.join(", ")
+    items.join("\n")
+}
+
+fn exclusion_text_view() -> gtk::TextView {
+    let view = gtk::TextView::new();
+    view.set_accepts_tab(false);
+    view.set_wrap_mode(gtk::WrapMode::None);
+    view
+}
+
+fn text_view_text(view: &gtk::TextView) -> String {
+    let buffer = view.buffer();
+    buffer
+        .text(&buffer.start_iter(), &buffer.end_iter(), false)
+        .to_string()
+}
+
+fn set_text_view_text(view: &gtk::TextView, text: &str) {
+    let buffer = view.buffer();
+    let current = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
+    if current.as_str() != text {
+        buffer.set_text(text);
+    }
 }
 
 fn activity_route_line(
@@ -1108,12 +1130,12 @@ fn create_settings_page(
     let activity_urls_label = gtk::Label::new(Some(CopyKey::SettingsActivityUrls.as_str()));
     activity_urls_label.set_halign(gtk::Align::Start);
     activity_urls_label.set_mnemonic_widget(Some(&activity_urls_switch));
-    let activity_exclude_apps_entry = gtk::Entry::new();
+    let activity_exclude_apps_entry = exclusion_text_view();
     let activity_exclude_apps_label =
         gtk::Label::new(Some(CopyKey::SettingsActivityExcludeApps.as_str()));
     activity_exclude_apps_label.set_halign(gtk::Align::Start);
     activity_exclude_apps_label.set_mnemonic_widget(Some(&activity_exclude_apps_entry));
-    let activity_exclude_titles_entry = gtk::Entry::new();
+    let activity_exclude_titles_entry = exclusion_text_view();
     let activity_exclude_titles_label =
         gtk::Label::new(Some(CopyKey::SettingsActivityExcludeTitles.as_str()));
     activity_exclude_titles_label.set_halign(gtk::Align::Start);
@@ -1321,28 +1343,34 @@ fn create_settings_page(
     {
         let ctrl = Rc::clone(&controller);
         let rendering = Rc::clone(&rendering);
-        activity_exclude_apps_entry.connect_changed(move |entry| {
-            if !rendering.get() {
-                let mut c = ctrl.borrow_mut();
-                let parsed = split_exclusion_list(&entry.text());
-                c.settings_draft.activity_exclude_apps_dirty = !c.document.saved_available
-                    || parsed != c.document.settings.activity_exclude_apps;
-                c.settings_draft.activity_exclude_apps = Some(parsed);
-            }
-        });
+        let apps_view = activity_exclude_apps_entry.clone();
+        activity_exclude_apps_entry
+            .buffer()
+            .connect_changed(move |_| {
+                if !rendering.get() {
+                    let mut c = ctrl.borrow_mut();
+                    let parsed = split_exclusion_list(&text_view_text(&apps_view));
+                    c.settings_draft.activity_exclude_apps_dirty = !c.document.saved_available
+                        || parsed != c.document.settings.activity_exclude_apps;
+                    c.settings_draft.activity_exclude_apps = Some(parsed);
+                }
+            });
     }
     {
         let ctrl = Rc::clone(&controller);
         let rendering = Rc::clone(&rendering);
-        activity_exclude_titles_entry.connect_changed(move |entry| {
-            if !rendering.get() {
-                let mut c = ctrl.borrow_mut();
-                let parsed = split_exclusion_list(&entry.text());
-                c.settings_draft.activity_exclude_titles_dirty = !c.document.saved_available
-                    || parsed != c.document.settings.activity_exclude_titles;
-                c.settings_draft.activity_exclude_titles = Some(parsed);
-            }
-        });
+        let titles_view = activity_exclude_titles_entry.clone();
+        activity_exclude_titles_entry
+            .buffer()
+            .connect_changed(move |_| {
+                if !rendering.get() {
+                    let mut c = ctrl.borrow_mut();
+                    let parsed = split_exclusion_list(&text_view_text(&titles_view));
+                    c.settings_draft.activity_exclude_titles_dirty = !c.document.saved_available
+                        || parsed != c.document.settings.activity_exclude_titles;
+                    c.settings_draft.activity_exclude_titles = Some(parsed);
+                }
+            });
     }
 
     let update: Rc<dyn Fn()> = {
@@ -1488,15 +1516,20 @@ fn create_settings_page(
                         .state_flags()
                         .contains(gtk::StateFlags::FOCUS_WITHIN)
                 {
-                    activity_exclude_apps_entry.set_text(&join_exclusion_list(&saved_exclude_apps));
+                    set_text_view_text(
+                        &activity_exclude_apps_entry,
+                        &join_exclusion_list(&saved_exclude_apps),
+                    );
                 }
                 if !activity_exclude_titles_dirty
                     && !activity_exclude_titles_entry
                         .state_flags()
                         .contains(gtk::StateFlags::FOCUS_WITHIN)
                 {
-                    activity_exclude_titles_entry
-                        .set_text(&join_exclusion_list(&saved_exclude_titles));
+                    set_text_view_text(
+                        &activity_exclude_titles_entry,
+                        &join_exclusion_list(&saved_exclude_titles),
+                    );
                 }
                 if !activity_only_dirty && !activity_only_switch.has_focus() {
                     activity_only_switch.set_state(saved_activity_only);
@@ -1931,4 +1964,19 @@ fn create_help_page(
     }
 
     scrolled
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{join_exclusion_list, split_exclusion_list};
+
+    #[test]
+    fn exclusion_list_keeps_a_comma_inside_one_title() {
+        let items = split_exclusion_list("Budget, confidential\nOther");
+        assert_eq!(
+            items,
+            vec!["Budget, confidential".to_string(), "Other".to_string()]
+        );
+        assert_eq!(join_exclusion_list(&items), "Budget, confidential\nOther");
+    }
 }

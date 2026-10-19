@@ -4335,6 +4335,7 @@ mod tests {
                         app_id: None,
                         title: Some("SENTINEL_TITLE".into()),
                         pid: None,
+                        window_id: 0,
                     },
                 );
             }
@@ -4344,6 +4345,7 @@ mod tests {
                     app_id: None,
                     title: None,
                     pid: None,
+                    window_id: 0,
                 },
             )
         }

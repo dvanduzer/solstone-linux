@@ -5,7 +5,7 @@
 //! the daemon starts the production foreground reader.
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -192,28 +192,74 @@ impl GnomeEndpoint {
     }
 }
 
-fn read_helper_line(stream: &mut UnixStream, request: &str) -> Result<String, &'static str> {
+fn arm_deadline(stream: &UnixStream, deadline: Instant) -> Result<(), &'static str> {
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return Err("unavailable");
+    };
+    if remaining.is_zero() {
+        return Err("unavailable");
+    }
     stream
-        .write_all(request.as_bytes())
-        .and_then(|_| stream.write_all(b"\n"))
-        .and_then(|_| stream.flush())
+        .set_read_timeout(Some(remaining))
         .map_err(|_| "unavailable")?;
+    stream
+        .set_write_timeout(Some(remaining))
+        .map_err(|_| "unavailable")?;
+    Ok(())
+}
+
+/// One deadline covers the whole line. A peer that drips one byte inside each
+/// per-read timeout still stops when `deadline` passes.
+pub(crate) fn collect_helper_line(
+    mut read_byte: impl FnMut() -> io::Result<Option<u8>>,
+    deadline: Instant,
+    now: impl Fn() -> Instant,
+) -> Result<Vec<u8>, &'static str> {
     let mut line = Vec::new();
     loop {
-        let mut byte = [0u8; 1];
-        match stream.read(&mut byte) {
-            Ok(0) => return Err("unavailable"),
-            Ok(_) if byte[0] == b'\n' => break,
-            Ok(_) => {
+        if now() >= deadline {
+            return Err("unavailable");
+        }
+        match read_byte() {
+            Ok(Some(b'\n')) => break,
+            Ok(Some(byte)) => {
                 if line.len() >= MAX_BODY_BYTES {
                     return Err("payload-too-large");
                 }
-                line.push(byte[0]);
+                line.push(byte);
             }
-            Err(_) => return Err("unavailable"),
+            Ok(None) | Err(_) => return Err("unavailable"),
         }
     }
-    String::from_utf8(line).map_err(|_| "unavailable")
+    Ok(line)
+}
+
+fn read_helper_line(stream: &mut UnixStream, request: &str) -> Result<String, &'static str> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    arm_deadline(stream, deadline)?;
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|_| "unavailable")?;
+    arm_deadline(stream, deadline)?;
+    stream.write_all(b"\n").map_err(|_| "unavailable")?;
+    arm_deadline(stream, deadline)?;
+    stream.flush().map_err(|_| "unavailable")?;
+    let bytes = collect_helper_line(
+        || {
+            if arm_deadline(stream, deadline).is_err() {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "deadline"));
+            }
+            let mut byte = [0u8; 1];
+            match stream.read(&mut byte) {
+                Ok(0) => Ok(None),
+                Ok(_) => Ok(Some(byte[0])),
+                Err(error) => Err(error),
+            }
+        },
+        deadline,
+        Instant::now,
+    )?;
+    String::from_utf8(bytes).map_err(|_| "unavailable")
 }
 
 impl HelperBus for GnomeEndpoint {
@@ -240,34 +286,75 @@ impl Drop for GnomeEndpoint {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct KwinInterest {
-    pub enabled: bool,
+    pub prefs: Option<std::sync::Arc<crate::activity_prefs::ActivityPrefs>>,
+    pub paused: bool,
+    pub session_live: bool,
+    pub seen_generation: u64,
     pub generation: u64,
     pub want_title: bool,
+    pub expected_window: String,
     pub expected_class: String,
     pub expected_pid: u32,
     pub latest: Option<WindowSnapshot>,
 }
 
 impl KwinInterest {
-    /// `(want, generation, wantTitle, expectedClass, expectedPid)`.
-    /// An empty class never asks for a caption.
-    pub fn authorize(&self) -> (bool, u64, bool, String, u32) {
-        if !self.enabled {
-            return (false, self.generation, false, String::new(), 0);
+    /// Source, pause, and session are read on every authorization. A saved
+    /// enabled flag is not admission. Class and pid are not the window.
+    pub fn admitted(&self) -> bool {
+        let source = self
+            .prefs
+            .as_ref()
+            .is_some_and(|prefs| prefs.snapshot().source);
+        source && !self.paused && self.session_live
+    }
+
+    pub fn refresh_admission(&mut self) {
+        let generation = self
+            .prefs
+            .as_ref()
+            .map(|prefs| prefs.snapshot().generation)
+            .unwrap_or(0);
+        if !self.admitted() || generation != self.seen_generation {
+            self.latest = None;
+            self.want_title = false;
+            self.expected_window.clear();
+            self.expected_class.clear();
+            self.expected_pid = 0;
+        }
+        self.seen_generation = generation;
+    }
+
+    /// `(want, generation, wantTitle, expectedClass, expectedPid, expectedWindow)`.
+    /// `expectedWindow` is KWin `internalId`. An empty id never asks for a caption.
+    pub fn authorize(&mut self) -> (bool, u64, bool, String, u32, String) {
+        self.refresh_admission();
+        if !self.admitted() {
+            return (
+                false,
+                self.generation,
+                false,
+                String::new(),
+                0,
+                String::new(),
+            );
         }
         (
             true,
             self.generation,
-            self.want_title && !self.expected_class.is_empty(),
+            self.want_title && !self.expected_window.is_empty(),
             self.expected_class.clone(),
             self.expected_pid,
+            self.expected_window.clone(),
         )
     }
 
     pub fn submit(&mut self, generation: u64, json: &str) -> Result<(), &'static str> {
-        if !self.enabled || generation != self.generation {
+        self.refresh_admission();
+        if !self.admitted() || generation != self.generation {
+            self.latest = None;
             return Err("stale-generation");
         }
         let snapshot = match parse_kwin_snapshot(json, generation, current_unix_ms()) {
@@ -278,13 +365,7 @@ impl KwinInterest {
             }
         };
         if self.want_title {
-            let class_ok =
-                snapshot.wm_class == self.expected_class || snapshot.app == self.expected_class;
-            if self.expected_class.is_empty() || !class_ok {
-                self.latest = None;
-                return Err("focus-changed");
-            }
-            if self.expected_pid != 0 && snapshot.pid != Some(self.expected_pid) {
+            if self.expected_window.is_empty() || snapshot.window_token != self.expected_window {
                 self.latest = None;
                 return Err("focus-changed");
             }
@@ -293,6 +374,7 @@ impl KwinInterest {
             return Err("unexpected-title");
         }
         if !check_age(snapshot.captured_unix_ms, current_unix_ms()) {
+            self.latest = None;
             return Err("snapshot-expired");
         }
         self.latest = Some(snapshot);
@@ -349,17 +431,51 @@ impl LiveDesktop {
         }
     }
 
-    pub fn set_enabled(&self, enabled: bool) {
+    pub fn set_paused(&self, paused: bool) {
         let Ok(mut gate) = self.kwin.lock() else {
             return;
         };
-        gate.enabled = enabled;
-        if !enabled {
-            gate.want_title = false;
-            gate.expected_class.clear();
-            gate.expected_pid = 0;
+        gate.paused = paused;
+        if paused {
             gate.latest = None;
+            gate.want_title = false;
+            gate.expected_window.clear();
         }
+    }
+
+    pub fn bind_prefs(&self, prefs: std::sync::Arc<crate::activity_prefs::ActivityPrefs>) {
+        if let Ok(mut gate) = self.kwin.lock() {
+            gate.seen_generation = prefs.snapshot().generation;
+            gate.prefs = Some(prefs);
+        }
+    }
+
+    pub fn note_route(&self, route: &str, live: bool, epoch: u64) {
+        let Ok(mut gate) = self.kwin.lock() else {
+            return;
+        };
+        let admit = route == "kwin" && live;
+        if !admit || epoch != gate.generation {
+            gate.latest = None;
+            gate.want_title = false;
+            gate.expected_window.clear();
+        }
+        gate.session_live = admit;
+        gate.generation = epoch;
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        if enabled {
+            return;
+        }
+        let Ok(mut gate) = self.kwin.lock() else {
+            return;
+        };
+        gate.want_title = false;
+        gate.expected_window.clear();
+        gate.expected_class.clear();
+        gate.expected_pid = 0;
+        gate.latest = None;
     }
 
     pub fn gnome_snapshot(
@@ -428,7 +544,7 @@ struct KwinService {
 #[zbus::interface(name = "org.solpbc.SolstoneLinux.Activity")]
 impl KwinService {
     #[zbus(name = "AuthorizeRead")]
-    fn authorize_read(&self) -> (bool, u64, bool, String, u32) {
+    fn authorize_read(&mut self) -> (bool, u64, bool, String, u32, String) {
         self.state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -733,30 +849,102 @@ mod tests {
         assert_eq!(reads.get(), 0);
     }
 
-    #[test]
-    fn kwin_title_requires_the_previous_window() {
-        let mut gate = KwinInterest {
-            enabled: true,
+    fn admitted_kwin() -> (
+        KwinInterest,
+        std::sync::Arc<crate::activity_prefs::ActivityPrefs>,
+    ) {
+        let prefs = std::sync::Arc::new(crate::activity_prefs::ActivityPrefs::new(
+            &crate::config::Config {
+                activity_source: true,
+                ..crate::config::Config::default()
+            },
+        ));
+        let gate = KwinInterest {
+            prefs: Some(std::sync::Arc::clone(&prefs)),
+            paused: false,
+            session_live: true,
+            seen_generation: prefs.generation(),
             generation: 4,
             want_title: true,
+            expected_window: "win-a".into(),
             expected_class: "Allowed".into(),
             expected_pid: 9,
             latest: None,
         };
-        let (want, _, want_title, class, pid) = gate.authorize();
+        (gate, prefs)
+    }
+
+    #[test]
+    fn kwin_title_requires_the_previous_window() {
+        let (mut gate, _prefs) = admitted_kwin();
+        let (want, _, want_title, class, pid, window) = gate.authorize();
         assert!(want);
         assert!(want_title);
         assert_eq!(class, "Allowed");
         assert_eq!(pid, 9);
+        assert_eq!(window, "win-a");
         let now = current_unix_ms();
-        let json = format!(
-            r#"{{"resourceClass":"Excluded","pid":9,"caption":"SECRET","captured_unix_ms":{now},"generation":4}}"#
+        let same_app = format!(
+            r#"{{"resourceClass":"Allowed","pid":9,"internalId":"win-b","caption":"SECRET","captured_unix_ms":{now},"generation":4}}"#
         );
-        assert_eq!(gate.submit(4, &json), Err("focus-changed"));
+        assert_eq!(gate.submit(4, &same_app), Err("focus-changed"));
         assert!(gate.latest.is_none());
-        gate.expected_class.clear();
-        let (_, _, want_title, _, _) = gate.authorize();
+        let matched = format!(
+            r#"{{"resourceClass":"Allowed","pid":9,"internalId":"win-a","caption":"Page","captured_unix_ms":{now},"generation":4}}"#
+        );
+        assert!(gate.submit(4, &matched).is_ok());
+        assert_eq!(
+            gate.latest
+                .as_ref()
+                .and_then(|snapshot| snapshot.title.clone()),
+            Some("Page".into())
+        );
+        gate.latest = None;
+        gate.expected_window.clear();
+        let (_, _, want_title, _, _, _) = gate.authorize();
         assert!(!want_title);
+    }
+
+    #[test]
+    fn kwin_authorization_follows_pause_and_source() {
+        let (mut gate, prefs) = admitted_kwin();
+        assert!(gate.authorize().0);
+        gate.paused = true;
+        let (want, _, _, _, _, _) = gate.authorize();
+        assert!(!want);
+        assert!(gate.latest.is_none());
+        gate.paused = false;
+        gate.expected_window = "win-a".into();
+        gate.want_title = true;
+        gate.seen_generation = prefs.generation();
+        prefs.apply_policy(crate::activity_prefs::ActivityPolicy {
+            activity_source: false,
+            activity_titles: false,
+            activity_urls: false,
+            activity_exclude_apps: Vec::new(),
+            activity_exclude_titles: Vec::new(),
+        });
+        let (want, _, _, _, _, _) = gate.authorize();
+        assert!(!want);
+        assert!(gate.expected_window.is_empty());
+    }
+
+    #[test]
+    fn helper_line_stops_on_an_absolute_deadline() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(2);
+        let calls = std::cell::Cell::new(0u32);
+        let result = collect_helper_line(
+            || {
+                calls.set(calls.get() + 1);
+                Ok(Some(b'x'))
+            },
+            deadline,
+            || start + Duration::from_millis(400 * u64::from(calls.get())),
+        );
+        assert_eq!(result, Err("unavailable"));
+        assert!(calls.get() < 8, "drip ran for {}", calls.get());
+        assert!(calls.get() >= 4, "drip stopped too early {}", calls.get());
     }
 
     struct FakeGnome {

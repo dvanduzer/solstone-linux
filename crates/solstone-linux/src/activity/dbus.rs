@@ -298,7 +298,8 @@ pub struct NativeActivitySources {
     wayland: NativeWaylandIdle,
     x11: NativeX11,
     cache: CacheState,
-    inventory: Option<BoundBackends>,
+    /// Startup name probes run once. Row publication uses each `resolve` bound.
+    probed_inventory: bool,
     follower: Option<SessionFollower>,
     last_kind: Option<crate::desktop_session::DesktopKind>,
     last_display: Option<String>,
@@ -359,7 +360,7 @@ impl NativeActivitySources {
             wayland: NativeWaylandIdle::new(),
             x11,
             cache: CacheState::default(),
-            inventory: None,
+            probed_inventory: false,
             follower,
             last_kind: None,
             last_display: None,
@@ -388,8 +389,9 @@ impl ActivityOps for NativeActivitySources {
             self.last_kind = None;
             self.last_display = None;
         }
-        if self.inventory.is_none() {
-            let (inventory, warnings) = probe_backends(
+        if !self.probed_inventory {
+            self.probed_inventory = true;
+            let (_inventory, warnings) = probe_backends(
                 &self.desktop,
                 &self.session_type,
                 &mut self.session,
@@ -400,10 +402,8 @@ impl ActivityOps for NativeActivitySources {
             for warning in warnings {
                 tracing::warn!("{warning}");
             }
-            self.inventory = Some(inventory);
         }
-        let inventory = self.inventory.expect("inventory initialized above");
-        let result = resolve(
+        let (mut state, current) = resolve(
             &self.desktop,
             &self.session_type,
             &mut self.session,
@@ -415,7 +415,6 @@ impl ActivityOps for NativeActivitySources {
         for warning in self.cache.take_warnings() {
             emit_activity_log(warning);
         }
-        let mut state = result.0;
         if let Some(target) = target {
             state.session = target.presence;
             state.session_epoch = target.epoch;
@@ -428,12 +427,18 @@ impl ActivityOps for NativeActivitySources {
                 state.screen_locked = locked;
             }
         }
-        (state, inventory)
+        (state, bound_for_rows(current))
     }
 
     fn desktop_facts(&self) -> (Option<crate::desktop_session::DesktopKind>, Option<String>) {
         (self.last_kind, self.last_display.clone())
     }
+}
+
+/// Rows follow the bound signals from this poll. A startup inventory that
+/// later goes dark must not keep publishing that signal as active.
+fn bound_for_rows(current: super::BoundBackends) -> super::BoundBackends {
+    current
 }
 
 fn emit_activity_log(entry: super::ActivityLog) {
@@ -543,6 +548,26 @@ mod tests {
         assert!(!service_missing(&zbus::Error::FDO(Box::new(
             zbus::fdo::Error::NoReply("broken".into()),
         ))));
+    }
+
+    #[test]
+    fn publication_follows_the_latest_bound_after_a_loss() {
+        let startup = super::super::BoundBackends {
+            wayland_idle: true,
+            ..super::super::BoundBackends::default()
+        };
+        let lost = super::super::BoundBackends::default();
+        let published = super::bound_for_rows(lost);
+        assert!(startup.idle_signal().is_some());
+        assert!(published.idle_signal().is_none());
+        let recovered = super::super::BoundBackends {
+            mutter_idle: true,
+            ..super::super::BoundBackends::default()
+        };
+        assert_eq!(
+            super::bound_for_rows(recovered).idle_signal(),
+            Some("Mutter IdleMonitor")
+        );
     }
 
     #[test]

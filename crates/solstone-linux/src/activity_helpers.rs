@@ -26,6 +26,8 @@ pub struct WindowSnapshot {
     pub pid: Option<u32>,
     pub window_id: u32,
     pub wm_class: String,
+    /// KWin `internalId`. Empty when the route has no separate window token.
+    pub window_token: String,
     pub captured_unix_ms: u64,
     pub generation: u64,
 }
@@ -73,6 +75,9 @@ pub struct KWinSnapshotPayload {
     pub desktop_file_name: Option<String>,
     #[serde(default)]
     pub pid: Option<u32>,
+    /// KWin 6 `Window.internalId`. Class and pid are not a window identity.
+    #[serde(default, rename = "internalId")]
+    pub internal_id: Option<String>,
     pub captured_unix_ms: u64,
     pub generation: u64,
 }
@@ -183,6 +188,7 @@ pub fn parse_kwin_snapshot(
         pid: payload.pid,
         window_id: 0,
         wm_class,
+        window_token: payload.internal_id.unwrap_or_default(),
         captured_unix_ms: payload.captured_unix_ms,
         generation: payload.generation,
     })
@@ -232,6 +238,7 @@ pub fn parse_gnome_reply(
         pid: reply.pid,
         window_id,
         wm_class: reply.wm_class.unwrap_or_default(),
+        window_token: String::new(),
         captured_unix_ms: reply.captured_unix_ms,
         generation: reply.generation,
     })
@@ -321,6 +328,7 @@ pub fn parse_sway_tree_response(
         pid: focused.pid,
         window_id: 0,
         wm_class: String::new(),
+        window_token: String::new(),
         captured_unix_ms: now_unix_ms,
         generation,
     })
@@ -416,6 +424,7 @@ pub fn read_x11_ewmh_snapshot(
         pid,
         window_id: active_window,
         wm_class: class,
+        window_token: String::new(),
         captured_unix_ms: now_unix_ms,
         generation,
     })
@@ -573,6 +582,8 @@ fn connect_ewmh(display: &str) -> Option<LiveEwmh> {
 }
 
 /// Real X11 EWMH read. Callers gate this on an X11 session. A failure is unavailable.
+/// Connect and every property reply share one deadline. A hung reply does not
+/// stay on the caller.
 pub fn read_live_ewmh(
     display: &str,
     generation: u64,
@@ -581,13 +592,41 @@ pub fn read_live_ewmh(
     expected: Option<(u32, String)>,
 ) -> Result<WindowSnapshot, &'static str> {
     let display = display.to_string();
-    let reader = crate::desktop_session::within(HELPER_TIMEOUT, move || connect_ewmh(&display))
-        .flatten()
-        .ok_or("connect-failed")?;
-    let expected = expected
-        .as_ref()
-        .map(|(window, class)| (*window, class.as_str()));
-    read_x11_ewmh_snapshot(&reader, generation, want_title, now_unix_ms, expected)
+    crate::desktop_session::within(HELPER_TIMEOUT, move || {
+        let reader = connect_ewmh(&display).ok_or("connect-failed")?;
+        let expected = expected
+            .as_ref()
+            .map(|(window, class)| (*window, class.as_str()));
+        read_x11_ewmh_snapshot(&reader, generation, want_title, now_unix_ms, expected)
+    })
+    .ok_or("timeout")?
+}
+
+/// The whole property read, not only the connect, runs inside `limit`.
+/// `still_current` false drops a late window after the read returns.
+pub fn read_x11_ewmh_bounded<R>(
+    reader: R,
+    generation: u64,
+    want_title: bool,
+    now_unix_ms: u64,
+    expected: Option<(u32, String)>,
+    limit: Duration,
+    still_current: impl FnOnce() -> bool + Send + 'static,
+) -> Result<WindowSnapshot, &'static str>
+where
+    R: X11PropertyReader + Send + 'static,
+{
+    let snapshot = crate::desktop_session::within(limit, move || {
+        let expected = expected
+            .as_ref()
+            .map(|(window, class)| (*window, class.as_str()));
+        read_x11_ewmh_snapshot(&reader, generation, want_title, now_unix_ms, expected)
+    })
+    .ok_or("timeout")??;
+    if !still_current() {
+        return Err("stale");
+    }
+    Ok(snapshot)
 }
 
 // AT-SPI tree walker. Production does not call this. URL stays unavailable
@@ -895,6 +934,73 @@ mod tests {
         let res = read_x11_ewmh_snapshot(&reader, 1, true, 5000, Some((0x111, "Allowed")));
         assert_eq!(res, Err("focus-changed"));
         assert_eq!(reader.name_call_count.get(), 0);
+    }
+
+    struct StallProperty {
+        entered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        release: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl X11PropertyReader for StallProperty {
+        fn read_active_window(&self) -> io::Result<Option<u32>> {
+            self.entered
+                .store(true, std::sync::atomic::Ordering::Release);
+            while !self.release.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(Some(1))
+        }
+        fn read_net_wm_name(&self, _: u32) -> io::Result<Option<String>> {
+            Ok(Some("SECRET_TITLE".into()))
+        }
+        fn read_wm_name(&self, _: u32) -> io::Result<Option<String>> {
+            Ok(Some("SECRET_TITLE".into()))
+        }
+        fn read_wm_class(&self, _: u32) -> io::Result<Option<(String, String)>> {
+            Ok(Some(("secret".into(), "Secret".into())))
+        }
+    }
+
+    #[test]
+    fn stalled_property_reply_does_not_return_a_window() {
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = StallProperty {
+            entered: std::sync::Arc::clone(&entered),
+            release: std::sync::Arc::clone(&release),
+        };
+        let result = read_x11_ewmh_bounded(
+            reader,
+            1,
+            true,
+            0,
+            Some((1, "Secret".into())),
+            Duration::from_millis(40),
+            || true,
+        );
+        assert_eq!(result, Err("timeout"));
+        assert!(entered.load(std::sync::atomic::Ordering::Acquire));
+        release.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[test]
+    fn late_ewmh_window_is_discarded_when_the_epoch_moved() {
+        let reader = MockX11Reader::single_active(
+            Some(0x123),
+            Some(("gimp".into(), "Gimp".into())),
+            Some("SECRET_TITLE".into()),
+            None,
+        );
+        let result = read_x11_ewmh_bounded(
+            reader,
+            1,
+            true,
+            5_000,
+            Some((0x123, "Gimp".into())),
+            Duration::from_secs(2),
+            || false,
+        );
+        assert_eq!(result, Err("stale"));
     }
 
     struct MockAtSpiNode {
