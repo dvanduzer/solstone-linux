@@ -16,7 +16,7 @@ use crate::activity_helpers::{
     GnomeSnapshotRequest, WindowSnapshot, check_age, current_unix_ms, parse_gnome_reply,
     parse_kwin_snapshot,
 };
-use crate::activity_writer::{MAX_BODY_BYTES, MAX_STRING_BYTES, sanitize_url};
+use crate::activity_writer::{MAX_BODY_BYTES, MAX_STRING_BYTES};
 
 const ROLE_FRAME: u32 = 23;
 const ROLE_DOCUMENT_FRAME: u32 = 82;
@@ -57,6 +57,7 @@ struct DocScan {
 }
 
 /// One showing document under the one active frame. `doc_url` runs only then.
+/// The daemon does not call this. Production does not open an accessibility connection.
 pub fn prove_firefox_document(root: &(dyn A11yNode + '_)) -> Option<String> {
     let mut scan = DocScan {
         nodes: 0,
@@ -385,29 +386,6 @@ impl KwinInterest {
 pub struct LiveDesktop {
     helper: Box<dyn HelperBus>,
     pub kwin: Arc<Mutex<KwinInterest>>,
-    documents: Box<dyn DocumentBus>,
-}
-
-pub trait DocumentBus: Send {
-    fn firefox_doc_url(&mut self, pid: u32) -> Option<String>;
-}
-
-#[cfg(test)]
-struct NoDocument;
-
-#[cfg(test)]
-impl DocumentBus for NoDocument {
-    fn firefox_doc_url(&mut self, _pid: u32) -> Option<String> {
-        None
-    }
-}
-
-struct ZbusDocument;
-
-impl DocumentBus for ZbusDocument {
-    fn firefox_doc_url(&mut self, pid: u32) -> Option<String> {
-        firefox_doc_url_from_bus(pid).and_then(|raw| sanitize_url(&raw))
-    }
 }
 
 impl LiveDesktop {
@@ -418,7 +396,6 @@ impl LiveDesktop {
         Self {
             helper: Box::new(GnomeEndpoint::bind()),
             kwin,
-            documents: Box::new(ZbusDocument),
         }
     }
 
@@ -427,7 +404,6 @@ impl LiveDesktop {
         Self {
             helper,
             kwin: Arc::new(Mutex::new(KwinInterest::default())),
-            documents: Box::new(NoDocument),
         }
     }
 
@@ -512,10 +488,6 @@ impl LiveDesktop {
         }
         Ok(snapshot)
     }
-
-    pub fn firefox_doc_url(&mut self, pid: u32) -> Option<String> {
-        self.documents.firefox_doc_url(pid)
-    }
 }
 
 fn spawn_kwin_bus(state: Arc<Mutex<KwinInterest>>) {
@@ -559,177 +531,13 @@ impl KwinService {
     }
 }
 
-fn firefox_doc_url_from_bus(pid: u32) -> Option<String> {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let session = zbus::blocking::connection::Builder::session()
-        .ok()?
-        .method_timeout(Duration::from_secs(2))
-        .build()
-        .ok()?;
-    let address = session
-        .call_method(
-            Some("org.a11y.Bus"),
-            "/org/a11y/bus",
-            Some("org.a11y.Bus"),
-            "GetAddress",
-            &(),
-        )
-        .ok()?;
-    let address: String = address.body().deserialize().ok()?;
-    let bus = zbus::blocking::connection::Builder::address(address.as_str())
-        .ok()?
-        .method_timeout(Duration::from_secs(2))
-        .build()
-        .ok()?;
-    let root = AtSpiObject {
-        bus: &bus,
-        destination: "org.a11y.atspi.Registry".into(),
-        path: "/org/a11y/atspi/accessible/root".into(),
-        deadline,
-    };
-    let apps = root.children()?;
-    let mut matched = None;
-    for app in apps.into_iter().take(MAX_NODES) {
-        if Instant::now() >= deadline {
-            return None;
-        }
-        let Some(app_pid) = app.unix_pid() else {
-            continue;
-        };
-        if app_pid == pid {
-            if matched.is_some() {
-                return None;
-            }
-            matched = Some(app);
-        }
-    }
-    let app = matched?;
-    let node = BusNode { object: app };
-    prove_firefox_document(&node)
-}
-
-struct AtSpiObject<'a> {
-    bus: &'a zbus::blocking::Connection,
-    destination: String,
-    path: String,
-    deadline: Instant,
-}
-
-impl AtSpiObject<'_> {
-    fn expired(&self) -> bool {
-        Instant::now() >= self.deadline
-    }
-
-    fn call<T: serde::de::DeserializeOwned + zbus::zvariant::Type>(
-        &self,
-        interface: &str,
-        method: &str,
-        body: &(impl serde::Serialize + zbus::zvariant::DynamicType),
-    ) -> Option<T> {
-        if self.expired() {
-            return None;
-        }
-        let reply = self
-            .bus
-            .call_method(
-                Some(self.destination.as_str()),
-                self.path.as_str(),
-                Some(interface),
-                method,
-                body,
-            )
-            .ok()?;
-        reply.body().deserialize().ok()
-    }
-
-    fn children(&self) -> Option<Vec<AtSpiObject<'_>>> {
-        if self.expired() {
-            return None;
-        }
-        let count: i32 = self.call("org.a11y.atspi.Accessible", "GetChildCount", &())?;
-        let count = count.max(0) as usize;
-        let mut out = Vec::new();
-        for index in 0..count.min(MAX_NODES) {
-            if self.expired() {
-                return None;
-            }
-            let (destination, path): (String, zbus::zvariant::OwnedObjectPath) = self.call(
-                "org.a11y.atspi.Accessible",
-                "GetChildAtIndex",
-                &(index as i32),
-            )?;
-            out.push(AtSpiObject {
-                bus: self.bus,
-                destination,
-                path: path.as_str().to_string(),
-                deadline: self.deadline,
-            });
-        }
-        Some(out)
-    }
-
-    fn unix_pid(&self) -> Option<u32> {
-        if self.expired() {
-            return None;
-        }
-        let reply = self
-            .bus
-            .call_method(
-                Some("org.freedesktop.DBus"),
-                "/org/freedesktop/DBus",
-                Some("org.freedesktop.DBus"),
-                "GetConnectionUnixProcessID",
-                &self.destination,
-            )
-            .ok()?;
-        reply.body().deserialize().ok()
-    }
-
-    fn role(&self) -> u32 {
-        self.call("org.a11y.atspi.Accessible", "GetRole", &())
-            .unwrap_or(0)
-    }
-
-    fn states(&self) -> u64 {
-        let words: Vec<u32> = self
-            .call("org.a11y.atspi.Accessible", "GetState", &())
-            .unwrap_or_default();
-        let low = u64::from(words.first().copied().unwrap_or(0));
-        let high = u64::from(words.get(1).copied().unwrap_or(0));
-        low | (high << 32)
-    }
-}
-
-struct BusNode<'a> {
-    object: AtSpiObject<'a>,
-}
-
-impl A11yNode for BusNode<'_> {
-    fn role(&self) -> u32 {
-        self.object.role()
-    }
-    fn states(&self) -> u64 {
-        self.object.states()
-    }
-    fn children(&self) -> Vec<Box<dyn A11yNode + '_>> {
-        self.object
-            .children()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|object| Box::new(BusNode { object }) as Box<dyn A11yNode + '_>)
-            .collect()
-    }
-    fn doc_url(&self) -> Option<String> {
-        self.object
-            .call("org.a11y.atspi.Document", "GetAttributeValue", &"DocURL")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::Cell;
     use std::rc::Rc;
+
+    use crate::activity_writer::sanitize_url;
 
     struct Node {
         role: u32,

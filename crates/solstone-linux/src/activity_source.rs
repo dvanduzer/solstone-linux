@@ -927,8 +927,11 @@ impl ForegroundProvider for ProductionForeground {
         }
     }
 
-    fn read_committed_url(&mut self, pid: u32) -> Option<String> {
-        self.live.firefox_doc_url(pid)
+    fn read_committed_url(&mut self, _pid: u32) -> Option<String> {
+        // No committed document property is qualified. An address value can
+        // remain unsubmitted after blur, so production does not read one and
+        // does not open an accessibility connection.
+        None
     }
 
     fn confirm_window(&mut self, facts: &ActivityFacts) -> ForegroundRead {
@@ -1157,9 +1160,50 @@ mod tests {
         sampler.seal(2_000);
         let rows = sampler.take_pending();
         let blob = serde_json::to_string(&rows).unwrap();
+        assert_eq!(provider.title_reads.get(), 1);
+        assert_eq!(provider.url_reads.get(), 0);
         assert!(!blob.contains("SENTINEL_TITLE"));
         assert!(!foreground_apps(&rows).iter().any(|app| app == "Notes"));
         assert!(sampler.status().route.is_none());
+    }
+
+    #[test]
+    fn overlong_title_with_exclusions_is_not_stored() {
+        let long = "T".repeat(4097);
+        let window = |title: Option<&str>| {
+            ForegroundRead::Window(ForegroundWindow {
+                app: "Notes".into(),
+                app_id: None,
+                title: title.map(str::to_string),
+                pid: Some(4),
+                window_id: 9,
+            })
+        };
+        let mut sampler = ActivitySampler::new();
+        let mut provider = Scripted {
+            identity: VecDeque::from([window(None)]),
+            titled: VecDeque::from([window(Some(&long))]),
+            title_reads: Cell::new(0),
+            confirm: VecDeque::new(),
+            url: Some("https://user:secret@sentinel.example/path?q=1#frag".into()),
+            url_reads: Cell::new(0),
+        };
+        poll_at(
+            &mut sampler,
+            1_000,
+            prefs(true, true, true, &[], &["Other"]),
+            live_state(),
+            BoundBackends::default(),
+            &mut provider,
+        );
+        sampler.seal(2_000);
+        let blob = serde_json::to_string(&sampler.take_pending()).unwrap();
+        assert_eq!(provider.title_reads.get(), 1);
+        assert_eq!(provider.url_reads.get(), 0);
+        assert!(!blob.contains("Notes"));
+        assert!(!blob.contains(&long));
+        assert!(!blob.contains("sentinel.example"));
+        assert!(!blob.contains("secret"));
     }
 
     #[test]

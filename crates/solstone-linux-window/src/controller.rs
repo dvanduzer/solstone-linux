@@ -1123,6 +1123,167 @@ mod tests {
     }
 
     #[test]
+    fn save_applies_exclusions_before_content_reads() {
+        use std::cell::Cell;
+
+        use solstone_linux::activity::{ActivityFacts, BoundBackends};
+        use solstone_linux::activity_prefs::{ActivityPolicy, ActivityPrefs};
+        use solstone_linux::activity_source::{
+            ActivitySampler, ForegroundProvider, ForegroundRead, ForegroundWindow, PollInput,
+        };
+        use solstone_linux::config::Config;
+        use solstone_linux::observer::ActivityState;
+
+        struct Sentinel {
+            app: &'static str,
+            title: &'static str,
+            identity_reads: Cell<usize>,
+            title_reads: Cell<usize>,
+            url_reads: Cell<usize>,
+        }
+
+        impl ForegroundProvider for Sentinel {
+            fn read_foreground(
+                &mut self,
+                want_title: bool,
+                _facts: &ActivityFacts,
+            ) -> ForegroundRead {
+                let title = if want_title {
+                    self.title_reads.set(self.title_reads.get() + 1);
+                    Some(self.title.to_string())
+                } else {
+                    self.identity_reads.set(self.identity_reads.get() + 1);
+                    None
+                };
+                ForegroundRead::Window(ForegroundWindow {
+                    app: self.app.into(),
+                    app_id: None,
+                    title,
+                    pid: Some(4),
+                    window_id: 9,
+                })
+            }
+
+            fn read_committed_url(&mut self, _pid: u32) -> Option<String> {
+                self.url_reads.set(self.url_reads.get() + 1);
+                Some("https://user:secret@sentinel.example/path?q=1#frag".into())
+            }
+        }
+
+        fn poll(sampler: &mut ActivitySampler, prefs: &ActivityPrefs, provider: &mut Sentinel) {
+            sampler.poll(
+                &PollInput {
+                    now_ms: 1_000,
+                    prefs: prefs.snapshot(),
+                    activity: ActivityState::default(),
+                    bound: BoundBackends::default(),
+                    paused: false,
+                    route: "gnome-shell",
+                },
+                provider,
+                &ActivityFacts::default(),
+                &|| true,
+            );
+        }
+
+        fn withheld(blob: &str) {
+            assert!(!blob.contains("SENTINEL_APP"));
+            assert!(!blob.contains("SENTINEL_TITLE"));
+            assert!(!blob.contains("sentinel.example"));
+            assert!(!blob.contains("secret"));
+            assert!(!blob.contains("Notes"));
+        }
+
+        let baseline = sample_baseline();
+        let draft = SettingsDraft {
+            activity_source: Some(true),
+            activity_source_dirty: true,
+            activity_titles: Some(true),
+            activity_titles_dirty: true,
+            activity_urls: Some(true),
+            activity_urls_dirty: true,
+            activity_exclude_apps: Some(vec!["SENTINEL_APP".into()]),
+            activity_exclude_apps_dirty: true,
+            activity_exclude_titles: Some(vec!["SENTINEL_TITLE".into()]),
+            activity_exclude_titles_dirty: true,
+            ..SettingsDraft::default()
+        };
+        let writes = draft.changed_writes(&baseline);
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, "activity_policy");
+
+        let policy: ActivityPolicy = serde_json::from_str(&writes[0].1).unwrap();
+        assert!(policy.activity_source);
+        assert!(policy.activity_titles);
+        assert!(policy.activity_urls);
+        assert_eq!(
+            policy.activity_exclude_apps,
+            vec!["SENTINEL_APP".to_string()]
+        );
+        assert_eq!(
+            policy.activity_exclude_titles,
+            vec!["SENTINEL_TITLE".to_string()]
+        );
+
+        let prefs = ActivityPrefs::new(&Config::default());
+        let mut sampler = ActivitySampler::new();
+        let mut provider = Sentinel {
+            app: "SENTINEL_APP",
+            title: "SENTINEL_TITLE",
+            identity_reads: Cell::new(0),
+            title_reads: Cell::new(0),
+            url_reads: Cell::new(0),
+        };
+        poll(&mut sampler, &prefs, &mut provider);
+        sampler.seal(2_000);
+        assert_eq!(provider.identity_reads.get(), 0);
+        assert_eq!(provider.title_reads.get(), 0);
+        assert_eq!(provider.url_reads.get(), 0);
+        withheld(&serde_json::to_string(&sampler.take_pending()).unwrap());
+
+        prefs.apply_policy(policy);
+        poll(&mut sampler, &prefs, &mut provider);
+        sampler.seal(2_000);
+        assert_eq!(provider.identity_reads.get(), 1);
+        assert_eq!(provider.title_reads.get(), 0);
+        assert_eq!(provider.url_reads.get(), 0);
+        withheld(&serde_json::to_string(&sampler.take_pending()).unwrap());
+
+        let title_draft = SettingsDraft {
+            activity_source: Some(true),
+            activity_source_dirty: true,
+            activity_titles: Some(true),
+            activity_titles_dirty: true,
+            activity_urls: Some(true),
+            activity_urls_dirty: true,
+            activity_exclude_titles: Some(vec!["SENTINEL_TITLE".into()]),
+            activity_exclude_titles_dirty: true,
+            ..SettingsDraft::default()
+        };
+        let title_writes = title_draft.changed_writes(&baseline);
+        assert_eq!(title_writes.len(), 1);
+        assert_eq!(title_writes[0].0, "activity_policy");
+        let title_policy: ActivityPolicy = serde_json::from_str(&title_writes[0].1).unwrap();
+        assert!(title_policy.activity_exclude_apps.is_empty());
+        let title_prefs = ActivityPrefs::new(&Config::default());
+        title_prefs.apply_policy(title_policy);
+        let mut title_sampler = ActivitySampler::new();
+        let mut title_provider = Sentinel {
+            app: "Notes",
+            title: "SENTINEL_TITLE",
+            identity_reads: Cell::new(0),
+            title_reads: Cell::new(0),
+            url_reads: Cell::new(0),
+        };
+        poll(&mut title_sampler, &title_prefs, &mut title_provider);
+        title_sampler.seal(2_000);
+        assert_eq!(title_provider.identity_reads.get(), 1);
+        assert_eq!(title_provider.title_reads.get(), 1);
+        assert_eq!(title_provider.url_reads.get(), 0);
+        withheld(&serde_json::to_string(&title_sampler.take_pending()).unwrap());
+    }
+
+    #[test]
     fn test_superseded_or_mismatched_owner_is_ignored() {
         let mut controller = Controller::new();
         controller.set_bus_owner(Some(":1.100".into()));

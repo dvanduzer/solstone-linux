@@ -4319,6 +4319,7 @@ mod tests {
 
     struct PolicySentinel {
         title_reads: std::cell::Cell<usize>,
+        url_reads: std::cell::Cell<usize>,
     }
 
     impl crate::activity_source::ForegroundProvider for PolicySentinel {
@@ -4334,8 +4335,8 @@ mod tests {
                         app: "SENTINEL_APP".into(),
                         app_id: None,
                         title: Some("SENTINEL_TITLE".into()),
-                        pid: None,
-                        window_id: 0,
+                        pid: Some(9),
+                        window_id: 7,
                     },
                 );
             }
@@ -4344,10 +4345,15 @@ mod tests {
                     app: "SENTINEL_APP".into(),
                     app_id: None,
                     title: None,
-                    pid: None,
-                    window_id: 0,
+                    pid: Some(9),
+                    window_id: 7,
                 },
             )
+        }
+
+        fn read_committed_url(&mut self, _pid: u32) -> Option<String> {
+            self.url_reads.set(self.url_reads.get() + 1);
+            Some("https://user:secret@sentinel.example/path?q=1#frag".into())
         }
     }
 
@@ -4361,21 +4367,60 @@ mod tests {
         let initial_gen = harness.activity_prefs.generation();
         assert!(!harness.activity_prefs.snapshot().source);
 
-        // write_setting("activity_source", "true") leaves prefs.snapshot().source == false and generation() unchanged.
-        let _ = harness
-            .handler
-            .write_setting("activity_source".into(), "true".into())
-            .await;
-        assert!(!harness.activity_prefs.snapshot().source);
+        // Lone enables stay off. A later exclusion must not arrive after the source is already on.
+        for (field, value) in [
+            ("activity_source", "true"),
+            ("activity_titles", "true"),
+            ("activity_urls", "true"),
+        ] {
+            let _ = harness
+                .handler
+                .write_setting(field.into(), value.into())
+                .await;
+        }
+        let rejected = harness.activity_prefs.snapshot();
+        assert!(!rejected.source);
+        assert!(!rejected.titles);
+        assert!(!rejected.urls);
         assert_eq!(harness.activity_prefs.generation(), initial_gen);
 
-        // Then one write_setting("activity_policy", <json>) with activity_source: true and activity_exclude_apps: ["SENTINEL_APP"] (other booleans false, titles exclusion empty). After it returns, snapshot source is true, exclusions contain SENTINEL_APP, and generation increased by 1.
+        let mut sampler = crate::activity_source::ActivitySampler::new();
+        let mut provider = PolicySentinel {
+            title_reads: std::cell::Cell::new(0),
+            url_reads: std::cell::Cell::new(0),
+        };
+        let activity = crate::observer::ActivityState {
+            session: crate::desktop_session::SessionPresence::Live,
+            ..crate::observer::ActivityState::default()
+        };
+        sampler.poll(
+            &crate::activity_source::PollInput {
+                now_ms: 1_000,
+                prefs: rejected,
+                activity,
+                bound: crate::activity::BoundBackends::default(),
+                paused: false,
+                route: "gnome-shell",
+            },
+            &mut provider,
+            &crate::activity::ActivityFacts::default(),
+            &|| true,
+        );
+        sampler.seal(2_000);
+        assert_eq!(provider.title_reads.get(), 0);
+        assert_eq!(provider.url_reads.get(), 0);
+        let early = serde_json::to_string(&sampler.take_pending()).unwrap();
+        assert!(!early.contains("SENTINEL_APP"));
+        assert!(!early.contains("SENTINEL_TITLE"));
+        assert!(!early.contains("sentinel.example"));
+
+        // One policy enables the source and both exclusions together.
         let policy_json = serde_json::json!({
             "activity_source": true,
-            "activity_titles": false,
-            "activity_urls": false,
+            "activity_titles": true,
+            "activity_urls": true,
             "activity_exclude_apps": ["SENTINEL_APP"],
-            "activity_exclude_titles": []
+            "activity_exclude_titles": ["SENTINEL_TITLE"]
         })
         .to_string();
 
@@ -4385,12 +4430,15 @@ mod tests {
             .await;
         let snap1 = harness.activity_prefs.snapshot();
         assert!(snap1.source);
+        assert!(snap1.titles);
+        assert!(snap1.urls);
         assert_eq!(snap1.exclude_apps, vec!["SENTINEL_APP".to_string()]);
+        assert_eq!(snap1.exclude_titles, vec!["SENTINEL_TITLE".to_string()]);
         assert_eq!(harness.activity_prefs.generation(), initial_gen + 1);
 
-        let mut sampler = crate::activity_source::ActivitySampler::new();
         let mut provider = PolicySentinel {
             title_reads: std::cell::Cell::new(0),
+            url_reads: std::cell::Cell::new(0),
         };
         let activity = crate::observer::ActivityState {
             session: crate::desktop_session::SessionPresence::Live,
@@ -4411,9 +4459,21 @@ mod tests {
         );
         sampler.seal(2_000);
         assert_eq!(provider.title_reads.get(), 0);
+        assert_eq!(provider.url_reads.get(), 0);
         let blob = serde_json::to_string(&sampler.take_pending()).unwrap();
         assert!(!blob.contains("SENTINEL_APP"));
         assert!(!blob.contains("SENTINEL_TITLE"));
+        assert!(!blob.contains("sentinel.example"));
+        assert!(!blob.contains("secret"));
+
+        let _ = harness
+            .handler
+            .write_setting("activity_exclude_apps".into(), "[]".into())
+            .await;
+        let kept = harness.activity_prefs.snapshot();
+        assert_eq!(kept.exclude_apps, vec!["SENTINEL_APP".to_string()]);
+        assert_eq!(kept.exclude_titles, vec!["SENTINEL_TITLE".to_string()]);
+        assert_eq!(harness.activity_prefs.generation(), initial_gen + 1);
 
         let _ = harness
             .handler
@@ -4422,6 +4482,7 @@ mod tests {
         let stopped = harness.activity_prefs.snapshot();
         assert!(!stopped.source);
         assert_eq!(stopped.exclude_apps, vec!["SENTINEL_APP".to_string()]);
+        assert_eq!(stopped.exclude_titles, vec!["SENTINEL_TITLE".to_string()]);
         assert_eq!(harness.activity_prefs.generation(), initial_gen + 2);
 
         // write_setting("activity_only", "true") then a second policy write: decoded document restart_required is still true, and effective framerate is still 4.
