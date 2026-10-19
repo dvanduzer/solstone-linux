@@ -117,21 +117,36 @@ export default class ActivityExtension extends Extension {
         if (win) {
             const tracker = Shell.WindowTracker.get_default();
             const app = tracker.get_window_app(win);
-            payload.app = app ? app.get_name() : '';
-            payload.app_id = app ? app.get_id() : '';
             const winId = win.get_id();
             const winWmClass = win.get_wm_class() || '';
             const winPid = win.get_pid() || 0;
+            payload.app = app ? app.get_name() : '';
+            payload.app_id = app ? app.get_id() : '';
             payload.wm_class = winWmClass;
             payload.pid = winPid;
+            payload.window_id = winId;
 
             if (wantTitle) {
-                const secondWin = global.display.focus_window;
-                if (!secondWin || secondWin.get_id() !== winId || (secondWin.get_wm_class() || '') !== winWmClass || (secondWin.get_pid() || 0) !== winPid) {
+                const expectedId = req.expected_window_id;
+                const expectedClass = req.expected_wm_class || '';
+                const expectedPid = req.expected_pid || 0;
+                const current = global.display.focus_window;
+                const same = expectedId !== undefined
+                    && expectedId !== null
+                    && expectedClass.length > 0
+                    && current
+                    && current.get_id() === expectedId
+                    && (current.get_wm_class() || '') === expectedClass
+                    && (current.get_pid() || 0) === expectedPid
+                    && winId === expectedId
+                    && winWmClass === expectedClass
+                    && winPid === expectedPid;
+                if (!same) {
                     payload.app = '';
                     payload.app_id = '';
                     payload.wm_class = '';
                     payload.pid = 0;
+                    payload.window_id = 0;
                 } else {
                     payload.title = win.get_title() || '';
                 }

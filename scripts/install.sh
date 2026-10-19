@@ -135,7 +135,7 @@ for REQUIRED in \
   "$TOP/share/solstone-linux/activity-helpers/solstone-activity@solpbc.org/metadata.json" \
   "$TOP/share/solstone-linux/activity-helpers/solstone-activity@solpbc.org/extension.js" \
   "$TOP/share/solstone-linux/activity-helpers/solstone-activity-kwin/metadata.json" \
-  "$TOP/share/solstone-linux/activity-helpers/solstone-activity-kwin/main.js"; do
+  "$TOP/share/solstone-linux/activity-helpers/solstone-activity-kwin/contents/code/main.js"; do
   if ! grep -Fxq "$REQUIRED" <<< "$CONTENTS"; then
     echo "error: archive is missing $REQUIRED" >&2
     exit 1

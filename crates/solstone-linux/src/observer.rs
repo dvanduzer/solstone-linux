@@ -89,6 +89,8 @@ pub struct ActivityState {
     pub session: SessionPresence,
     /// Changes whenever the followed session changes; a change closes the segment.
     pub session_epoch: u64,
+    /// True only after an idle backend has reported a real sample. A cold bind is not active.
+    pub idle_observed: bool,
 }
 pub trait ActivityProbe {
     fn probe(&mut self) -> Result<ActivityState, String>;
@@ -802,16 +804,13 @@ where
     }
 
     fn note_activity(&mut self) {
-        let (snap, desktop, has_open) = {
-            let Some(activity) = self.activity.as_ref() else {
-                return;
-            };
-            (
-                activity.prefs.snapshot(),
-                activity.desktop.clone(),
-                activity.sampler.has_open(),
-            )
+        let Some(activity) = self.activity.as_ref() else {
+            return;
         };
+        let prefs = std::sync::Arc::clone(&activity.prefs);
+        let snap = prefs.snapshot();
+        let desktop = activity.desktop.clone();
+        let has_open = activity.sampler.has_open();
         if !snap.source && !has_open {
             return;
         }
@@ -822,20 +821,33 @@ where
         let route = route_name(facts.kind, &desktop);
         let input = PollInput {
             now_ms,
-            prefs: snap,
+            prefs: snap.clone(),
             activity: self.state.cached_activity,
             bound: facts.bound,
             paused: self.state.paused,
             route,
         };
-        let mut sampler = match self.activity.as_mut() {
+        let start_generation = snap.generation;
+        let start_epoch = self.state.cached_activity.session_epoch;
+        let Observer {
+            foreground,
+            backends,
+            state,
+            activity,
+            ..
+        } = self;
+        let mut sampler = match activity.as_mut() {
             Some(activity) => std::mem::take(&mut activity.sampler),
             None => return,
         };
-        sampler.poll(&input, self.foreground.as_mut(), &facts);
+        sampler.poll(&input, foreground.as_mut(), &facts, &|| {
+            prefs.generation() == start_generation
+                && !state.paused
+                && backends.activity.activity_facts().session_epoch == start_epoch
+        });
         let status = sampler.status();
         let has_open = sampler.has_open();
-        let Some(activity) = self.activity.as_mut() else {
+        let Some(activity) = activity.as_mut() else {
             return;
         };
         activity.sampler = sampler;
@@ -2794,6 +2806,7 @@ pub(crate) mod tests {
                     app: self.app.clone(),
                     app_id: None,
                     title: None,
+                    pid: None,
                 },
             )
         }

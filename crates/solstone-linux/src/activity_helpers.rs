@@ -24,6 +24,8 @@ pub struct WindowSnapshot {
     pub app_id: Option<String>,
     pub title: Option<String>,
     pub pid: Option<u32>,
+    pub window_id: u32,
+    pub wm_class: String,
     pub captured_unix_ms: u64,
     pub generation: u64,
 }
@@ -34,6 +36,12 @@ pub struct GnomeSnapshotRequest {
     pub op: String,
     pub generation: u64,
     pub want_title: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_window_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_wm_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_pid: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -49,6 +57,8 @@ pub struct GnomeSnapshotReply {
     pub wm_class: Option<String>,
     #[serde(default)]
     pub pid: Option<u32>,
+    #[serde(default)]
+    pub window_id: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -138,6 +148,7 @@ pub fn parse_kwin_snapshot(
     let desktop_file = payload.desktop_file_name.unwrap_or_default();
     let resource_class = payload.resource_class.unwrap_or_default();
 
+    let wm_class = resource_class.clone();
     let (app, app_id) = if !desktop_file.is_empty() {
         let id = if !resource_class.is_empty() {
             Some(resource_class)
@@ -170,6 +181,8 @@ pub fn parse_kwin_snapshot(
         app_id,
         title,
         pid: payload.pid,
+        window_id: 0,
+        wm_class,
         captured_unix_ms: payload.captured_unix_ms,
         generation: payload.generation,
     })
@@ -208,11 +221,17 @@ pub fn parse_gnome_reply(
         None => None,
     };
 
+    let window_id = match reply.window_id {
+        Some(id) => u32::try_from(id).map_err(|_| "invalid-window")?,
+        None => 0,
+    };
     Ok(WindowSnapshot {
         app: reply.app,
         app_id: reply.app_id,
         title,
         pid: reply.pid,
+        window_id,
+        wm_class: reply.wm_class.unwrap_or_default(),
         captured_unix_ms: reply.captured_unix_ms,
         generation: reply.generation,
     })
@@ -300,6 +319,8 @@ pub fn parse_sway_tree_response(
         app_id: Some(app_id.clone()),
         title,
         pid: focused.pid,
+        window_id: 0,
+        wm_class: String::new(),
         captured_unix_ms: now_unix_ms,
         generation,
     })
@@ -311,6 +332,10 @@ pub trait X11PropertyReader {
     fn read_net_wm_name(&self, window: u32) -> io::Result<Option<String>>;
     fn read_wm_name(&self, window: u32) -> io::Result<Option<String>>;
     fn read_wm_class(&self, window: u32) -> io::Result<Option<(String, String)>>; // (instance, class)
+    /// `_NET_WM_PID`. A missing value is not a title and does not fail the window.
+    fn read_net_wm_pid(&self, _window: u32) -> io::Result<Option<u32>> {
+        Ok(None)
+    }
 }
 
 pub fn read_x11_ewmh_snapshot(
@@ -318,6 +343,7 @@ pub fn read_x11_ewmh_snapshot(
     generation: u64,
     want_title: bool,
     now_unix_ms: u64,
+    expected: Option<(u32, &str)>,
 ) -> Result<WindowSnapshot, &'static str> {
     let active_window = reader
         .read_active_window()
@@ -354,6 +380,17 @@ pub fn read_x11_ewmh_snapshot(
         None
     };
 
+    if want_title {
+        let Some((expected_window, expected_class)) = expected else {
+            return Err("focus-changed");
+        };
+        if active_window != expected_window || class != expected_class {
+            return Err("focus-changed");
+        }
+    }
+
+    let pid = reader.read_net_wm_pid(active_window).ok().flatten();
+
     let title = if want_title {
         let name = reader
             .read_net_wm_name(active_window)
@@ -376,7 +413,9 @@ pub fn read_x11_ewmh_snapshot(
         app,
         app_id,
         title,
-        pid: None,
+        pid,
+        window_id: active_window,
+        wm_class: class,
         captured_unix_ms: now_unix_ms,
         generation,
     })
@@ -389,6 +428,7 @@ struct LiveEwmh {
     root: u32,
     net_active_window: u32,
     net_wm_name: u32,
+    net_wm_pid: u32,
     wm_name: u32,
     wm_class: u32,
 }
@@ -417,6 +457,23 @@ impl X11PropertyReader for LiveEwmh {
 
     fn read_wm_name(&self, window: u32) -> io::Result<Option<String>> {
         read_x_text(&self.connection, window, self.wm_name, false)
+    }
+
+    fn read_net_wm_pid(&self, window: u32) -> io::Result<Option<u32>> {
+        let reply = self
+            .connection
+            .get_property(
+                false,
+                window,
+                self.net_wm_pid,
+                x11rb::protocol::xproto::AtomEnum::CARDINAL,
+                0,
+                1,
+            )
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .reply()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(reply.value32().and_then(|values| values.into_iter().next()))
     }
 
     fn read_wm_class(&self, window: u32) -> io::Result<Option<(String, String)>> {
@@ -502,12 +559,14 @@ fn connect_ewmh(display: &str) -> Option<LiveEwmh> {
     let net_active_window = intern_atom(&connection, b"_NET_ACTIVE_WINDOW").ok()?;
     let net_wm_name = intern_atom(&connection, b"_NET_WM_NAME").ok()?;
     let wm_name = intern_atom(&connection, b"WM_NAME").ok()?;
+    let net_wm_pid = intern_atom(&connection, b"_NET_WM_PID").ok()?;
     let wm_class = intern_atom(&connection, b"WM_CLASS").ok()?;
     Some(LiveEwmh {
         connection,
         root,
         net_active_window,
         net_wm_name,
+        net_wm_pid,
         wm_name,
         wm_class,
     })
@@ -519,12 +578,16 @@ pub fn read_live_ewmh(
     generation: u64,
     want_title: bool,
     now_unix_ms: u64,
+    expected: Option<(u32, String)>,
 ) -> Result<WindowSnapshot, &'static str> {
     let display = display.to_string();
     let reader = crate::desktop_session::within(HELPER_TIMEOUT, move || connect_ewmh(&display))
         .flatten()
         .ok_or("connect-failed")?;
-    read_x11_ewmh_snapshot(&reader, generation, want_title, now_unix_ms)
+    let expected = expected
+        .as_ref()
+        .map(|(window, class)| (*window, class.as_str()));
+    read_x11_ewmh_snapshot(&reader, generation, want_title, now_unix_ms, expected)
 }
 
 // AT-SPI tree walker. Production does not call this. URL stays unavailable
@@ -796,7 +859,7 @@ mod tests {
             None,
         );
 
-        let snap = read_x11_ewmh_snapshot(&reader, 1, true, 5000).unwrap();
+        let snap = read_x11_ewmh_snapshot(&reader, 1, true, 5000, Some((0x123, "Gimp"))).unwrap();
         assert_eq!(snap.app, "Gimp");
         assert_eq!(snap.app_id, Some("gimp-2.10".into()));
         assert_eq!(snap.title, Some("GNU Image Manipulation Program".into()));
@@ -814,7 +877,22 @@ mod tests {
             name_call_count: Cell::new(0),
         };
 
-        let res = read_x11_ewmh_snapshot(&reader, 1, true, 5000);
+        let res = read_x11_ewmh_snapshot(&reader, 1, true, 5000, Some((0x123, "Gimp")));
+        assert_eq!(res, Err("focus-changed"));
+        assert_eq!(reader.name_call_count.get(), 0);
+    }
+
+    #[test]
+    fn test_x11_title_read_is_bound_to_the_earlier_window() {
+        let reader = MockX11Reader {
+            active: vec![Some(0x222), Some(0x222)],
+            active_call_idx: Cell::new(0),
+            class: Some(("excluded".into(), "Excluded".into())),
+            net_name: Some("SECRET_TITLE".into()),
+            wm_name: Some("SECRET_TITLE".into()),
+            name_call_count: Cell::new(0),
+        };
+        let res = read_x11_ewmh_snapshot(&reader, 1, true, 5000, Some((0x111, "Allowed")));
         assert_eq!(res, Err("focus-changed"));
         assert_eq!(reader.name_call_count.get(), 0);
     }

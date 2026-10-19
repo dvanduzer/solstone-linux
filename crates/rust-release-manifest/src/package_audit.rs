@@ -209,8 +209,8 @@ pub(crate) const PAYLOAD_AUTHORITY: [PayloadAuthority; 26] = [
         "/usr/share/solstone-linux/activity-helpers/solstone-activity-kwin/metadata.json",
     ),
     activity_helper(
-        "packaging/activity-helpers/solstone-activity-kwin/main.js",
-        "/usr/share/solstone-linux/activity-helpers/solstone-activity-kwin/main.js",
+        "packaging/activity-helpers/solstone-activity-kwin/contents/code/main.js",
+        "/usr/share/solstone-linux/activity-helpers/solstone-activity-kwin/contents/code/main.js",
     ),
 ];
 

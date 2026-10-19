@@ -193,29 +193,6 @@ fn load_int_list(
         .collect()
 }
 
-fn load_string_list(
-    values: &Map<String, Value>,
-    field: &'static str,
-    default: &[String],
-    warnings: &mut Vec<ConfigWarning>,
-) -> Vec<String> {
-    let Some(value) = values.get(field) else {
-        return default.to_vec();
-    };
-    let Some(items) = value.as_array() else {
-        warnings.push(warning(field, value, default));
-        return default.to_vec();
-    };
-    if !items.iter().all(Value::is_string) {
-        warnings.push(warning(field, value, default));
-        return default.to_vec();
-    }
-    items
-        .iter()
-        .filter_map(|item| item.as_str().map(String::from))
-        .collect()
-}
-
 fn load_string(
     values: &Map<String, Value>,
     field: &'static str,
@@ -230,6 +207,70 @@ fn load_string(
             String::new()
         }
     }
+}
+
+fn load_activity_bool(value: Option<&Value>) -> Result<bool, ()> {
+    match value {
+        None => Ok(false),
+        Some(Value::Bool(flag)) => Ok(*flag),
+        Some(_) => Err(()),
+    }
+}
+
+fn load_activity_exclusions(value: Option<&Value>) -> Result<Vec<String>, ()> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = value.as_array() else {
+        return Err(());
+    };
+    if items.len() > 64 {
+        return Err(());
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(text) = item.as_str() else {
+            return Err(());
+        };
+        if text.is_empty() || text.len() > 256 || out.iter().any(|seen| seen == text) {
+            return Err(());
+        }
+        out.push(text.to_string());
+    }
+    Ok(out)
+}
+
+/// A malformed activity boolean or exclusion list disables the source in memory.
+/// The file is left as it was. The warning carries no exclusion text.
+fn apply_loaded_activity_policy(
+    values: &Map<String, Value>,
+    config: &mut Config,
+    warnings: &mut Vec<ConfigWarning>,
+) {
+    let source = load_activity_bool(values.get("activity_source"));
+    let titles = load_activity_bool(values.get("activity_titles"));
+    let urls = load_activity_bool(values.get("activity_urls"));
+    let apps = load_activity_exclusions(values.get("activity_exclude_apps"));
+    let title_list = load_activity_exclusions(values.get("activity_exclude_titles"));
+    if let (Ok(source), Ok(titles), Ok(urls), Ok(apps), Ok(title_list)) =
+        (source, titles, urls, apps, title_list)
+    {
+        config.activity_source = source;
+        config.activity_titles = titles;
+        config.activity_urls = urls;
+        config.activity_exclude_apps = apps;
+        config.activity_exclude_titles = title_list;
+        return;
+    }
+    config.activity_source = false;
+    config.activity_titles = false;
+    config.activity_urls = false;
+    config.activity_exclude_apps.clear();
+    config.activity_exclude_titles.clear();
+    warnings.push(ConfigWarning {
+        field: Some("activity_source"),
+        message: "activity policy is malformed; desktop activity stays off".into(),
+    });
 }
 
 fn json_truthy(value: Option<&Value>, default: bool) -> bool {
@@ -327,13 +368,7 @@ fn load_resolved_config(mut config: Config) -> LoadedConfig {
     config.draw_cursor = json_truthy(values.get("draw_cursor"), true);
     config.start_paused = json_truthy(values.get("start_paused"), false);
     config.panel_icon_offer = json_truthy(values.get("panel_icon_offer"), true);
-    config.activity_source = json_truthy(values.get("activity_source"), false);
-    config.activity_titles = json_truthy(values.get("activity_titles"), false);
-    config.activity_urls = json_truthy(values.get("activity_urls"), false);
-    config.activity_exclude_apps =
-        load_string_list(values, "activity_exclude_apps", &[], &mut warnings);
-    config.activity_exclude_titles =
-        load_string_list(values, "activity_exclude_titles", &[], &mut warnings);
+    apply_loaded_activity_policy(values, &mut config, &mut warnings);
     config.activity_only = json_truthy(values.get("activity_only"), false);
     LoadedConfig { config, warnings }
 }
@@ -499,31 +534,15 @@ fn write_config_merge(
     } else {
         true
     };
-    let mut activity_source = if merge_basis.is_some() {
-        json_truthy(map.get("activity_source"), false)
-    } else {
-        false
-    };
-    let mut activity_titles = if merge_basis.is_some() {
-        json_truthy(map.get("activity_titles"), false)
-    } else {
-        false
-    };
-    let mut activity_urls = if merge_basis.is_some() {
-        json_truthy(map.get("activity_urls"), false)
-    } else {
-        false
-    };
-    let mut activity_exclude_apps = if merge_basis.is_some() {
-        load_string_list(&map, "activity_exclude_apps", &[], &mut warnings)
-    } else {
-        Vec::new()
-    };
-    let mut activity_exclude_titles = if merge_basis.is_some() {
-        load_string_list(&map, "activity_exclude_titles", &[], &mut warnings)
-    } else {
-        Vec::new()
-    };
+    let mut activity_basis = Config::default();
+    if merge_basis.is_some() {
+        apply_loaded_activity_policy(&map, &mut activity_basis, &mut warnings);
+    }
+    let mut activity_source = activity_basis.activity_source;
+    let mut activity_titles = activity_basis.activity_titles;
+    let mut activity_urls = activity_basis.activity_urls;
+    let mut activity_exclude_apps = activity_basis.activity_exclude_apps;
+    let mut activity_exclude_titles = activity_basis.activity_exclude_titles;
     let mut activity_only = if merge_basis.is_some() {
         json_truthy(map.get("activity_only"), false)
     } else {
@@ -1273,6 +1292,34 @@ mod tests {
             }
         );
     }
+    #[test]
+    fn malformed_activity_policy_disables_source_and_keeps_the_file() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("cfg");
+        fs::create_dir_all(&d).unwrap();
+        let raw = br#"{"activity_source":"yes","activity_exclude_apps":"SECRET_TITLE_SENTINEL","capture_framerate":4}"#;
+        let path = d.join("config.json");
+        fs::write(&path, raw).unwrap();
+        let loaded = load(t.path());
+        assert!(!loaded.config.activity_source);
+        assert!(!loaded.config.activity_titles);
+        assert!(!loaded.config.activity_urls);
+        assert!(loaded.config.activity_exclude_apps.is_empty());
+        assert_eq!(loaded.config.capture_framerate, 4);
+        assert_eq!(fs::read(&path).unwrap(), raw);
+        let messages: Vec<&str> = loaded.warnings.iter().map(|w| w.message.as_str()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("activity policy is malformed"))
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|m| !m.contains("SECRET_TITLE_SENTINEL"))
+        );
+    }
+
     // tests/test_config.py::test_load_corrupt
     #[test]
     fn load_corrupt() {

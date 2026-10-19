@@ -2,6 +2,6 @@
   "name": "Solstone Activity Helper",
   "description": "Desktop activity helper for solstone-linux",
   "uuid": "solstone-activity@solpbc.org",
-  "shell-version": ["49", "50", "51"],
+  "shell-version": ["51"],
   "version": 1
 }

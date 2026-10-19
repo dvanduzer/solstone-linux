@@ -131,6 +131,8 @@ pub struct CacheState {
     pub lock_signal: SignalCache<bool>,
     pub subscription_attempted: bool,
     pub wayland_idle: bool,
+    /// Set once `ext-idle-notify-v1` has delivered an edge. Binding alone is not a sample.
+    pub wayland_idle_known: bool,
     pub warnings: Vec<ActivityLog>,
     mutter_warned: bool,
     dpms_warned: bool,
@@ -232,29 +234,36 @@ pub fn resolve(
         }
     };
 
-    let user_idle = match wayland.bind() {
+    let (user_idle, idle_observed) = match wayland.bind() {
         BackendOutcome::Available(()) => {
             bound.wayland_idle = true;
+            let mut saw_edge = false;
             for edge in wayland.drain_edges() {
                 cache.wayland_idle = matches!(edge, IdleEdge::Idled);
+                saw_edge = true;
             }
-            cache.wayland_idle
+            if saw_edge {
+                cache.wayland_idle_known = true;
+            }
+            (cache.wayland_idle, cache.wayland_idle_known)
         }
         BackendOutcome::Absent | BackendOutcome::Broken(_) => match session.mutter_idletime_ms() {
             BackendOutcome::Available(ms) => {
                 bound.mutter_idle = true;
-                ms >= IDLE_THRESHOLD.as_millis() as u64
+                (ms >= IDLE_THRESHOLD.as_millis() as u64, true)
             }
             BackendOutcome::Absent | BackendOutcome::Broken(_) => match x.screensaver_idle_ms() {
                 BackendOutcome::Available(ms) => {
                     bound.x11_idle = true;
-                    ms >= IDLE_THRESHOLD.as_millis() as u64
+                    (ms >= IDLE_THRESHOLD.as_millis() as u64, true)
                 }
-                BackendOutcome::Absent | BackendOutcome::Broken(_) => false,
+                BackendOutcome::Absent | BackendOutcome::Broken(_) => (false, false),
             },
         },
     };
-    (state(locked, power, user_idle), bound)
+    let mut resolved = state(locked, power, user_idle);
+    resolved.idle_observed = idle_observed;
+    (resolved, bound)
 }
 
 impl CacheState {
@@ -504,6 +513,7 @@ pub fn state(lock: bool, power: PowerObservation, user_idle: bool) -> ActivitySt
         power_save: power.power_save,
         user_idle,
         power_unreadable: !power.readable,
+        idle_observed: false,
         ..ActivityState::default()
     }
 }
@@ -513,6 +523,8 @@ pub struct ActivityFacts {
     pub bound: BoundBackends,
     pub kind: Option<DesktopKind>,
     pub display: Option<String>,
+    /// Copied from the same probe as `ActivityState.session_epoch`. A mismatch refuses X11.
+    pub session_epoch: u64,
 }
 
 pub trait ActivityOps: Send + 'static {
@@ -603,12 +615,16 @@ fn run_worker(
     loop {
         let (next, bound) = ops.probe_once();
         let (kind, display) = ops.desktop_facts();
-        *latest.lock().expect("activity state lock") = next;
-        *facts.lock().expect("activity facts lock") = ActivityFacts {
+        let published_facts = ActivityFacts {
             bound,
             kind,
             display,
+            session_epoch: next.session_epoch,
         };
+        // One publication: state and facts share this probe's epoch. Readers that
+        // observe a mismatch are looking at two publications and must not read X11.
+        *latest.lock().expect("activity state lock") = next;
+        *facts.lock().expect("activity facts lock") = published_facts;
         if !reported {
             let (lines, always_capture) = startup_report(&bound);
             for line in lines {

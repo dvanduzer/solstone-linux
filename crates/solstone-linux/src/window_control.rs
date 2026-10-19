@@ -953,6 +953,76 @@ fn validate_exclusion_list(val: &Value) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn is_lone_activity_field(field: &str) -> bool {
+    matches!(
+        field,
+        "activity_source"
+            | "activity_titles"
+            | "activity_urls"
+            | "activity_exclude_apps"
+            | "activity_exclude_titles"
+    )
+}
+
+fn exclusion_superset(value: &Value, current: &[String]) -> bool {
+    let Some(items) = value.as_array() else {
+        return false;
+    };
+    let next: Vec<&str> = items.iter().filter_map(Value::as_str).collect();
+    current.iter().all(|item| next.contains(&item.as_str()))
+}
+
+/// A lone activity key may only keep the running policy or make it stricter.
+/// Enabling the source, titles, or addresses, or dropping an exclusion, has to
+/// arrive in one `activity_policy` so the running source never sees a gap.
+fn lone_activity_write_keeps_or_tightens(
+    field: &str,
+    value: &Value,
+    prefs: Option<&ActivityPrefs>,
+) -> bool {
+    let Some(prefs) = prefs else {
+        return match field {
+            "activity_source" | "activity_titles" | "activity_urls" => {
+                value.as_bool() == Some(false)
+            }
+            "activity_exclude_apps" | "activity_exclude_titles" => exclusion_superset(value, &[]),
+            _ => false,
+        };
+    };
+    let snap = prefs.snapshot();
+    match field {
+        "activity_source" => value.as_bool().is_some_and(|next| !next || snap.source),
+        "activity_titles" => value.as_bool().is_some_and(|next| !next || snap.titles),
+        "activity_urls" => value.as_bool().is_some_and(|next| !next || snap.urls),
+        "activity_exclude_apps" => exclusion_superset(value, &snap.exclude_apps),
+        "activity_exclude_titles" => exclusion_superset(value, &snap.exclude_titles),
+        _ => false,
+    }
+}
+
+fn apply_live_activity_policy(supervisor: &WindowControlSupervisor, policy: ActivityPolicy) {
+    if let Some(ref prefs) = supervisor.activity_prefs {
+        let current = prefs.snapshot();
+        let unchanged = current.source == policy.activity_source
+            && current.titles == policy.activity_titles
+            && current.urls == policy.activity_urls
+            && current.exclude_apps == policy.activity_exclude_apps
+            && current.exclude_titles == policy.activity_exclude_titles;
+        if !unchanged {
+            prefs.apply_policy(policy.clone());
+        }
+    }
+    if let Ok(mut eff_lock) = supervisor.effective_settings.lock()
+        && let Some(ref mut eff) = *eff_lock
+    {
+        eff.activity_source = policy.activity_source;
+        eff.activity_titles = policy.activity_titles;
+        eff.activity_urls = policy.activity_urls;
+        eff.activity_exclude_apps = policy.activity_exclude_apps.clone();
+        eff.activity_exclude_titles = policy.activity_exclude_titles;
+    }
+}
+
 fn validate_setting(field: &str, value: &str) -> Result<Value, &'static str> {
     if value.is_empty() {
         return Err("invalid-setting");
@@ -1842,38 +1912,43 @@ impl WindowControlSupervisor {
             }
         };
 
+        if is_lone_activity_field(&field)
+            && !lone_activity_write_keeps_or_tightens(
+                &field,
+                &normalized,
+                self.activity_prefs.as_deref(),
+            )
+        {
+            let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+            phase.fault = Some("invalid-setting".into());
+            drop(phase);
+            return self.assemble_current(None);
+        }
+
         let result = set_guided_field(&self.config_paths, &field, normalized.clone());
         match result {
-            Ok(_) => {
+            Ok(saved) => {
                 if field == "activity_policy" {
                     if let Ok(policy) = serde_json::from_value::<ActivityPolicy>(normalized.clone())
                     {
-                        if let Some(ref prefs) = self.activity_prefs {
-                            prefs.apply_policy(policy.clone());
-                        }
-                        if let Ok(mut eff_lock) = self.effective_settings.lock()
-                            && let Some(ref mut eff) = *eff_lock
-                        {
-                            eff.activity_source = policy.activity_source;
-                            eff.activity_titles = policy.activity_titles;
-                            eff.activity_urls = policy.activity_urls;
-                            eff.activity_exclude_apps = policy.activity_exclude_apps;
-                            eff.activity_exclude_titles = policy.activity_exclude_titles;
-                        }
+                        apply_live_activity_policy(self, policy);
                     }
                     {
                         let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
                         phase.fault = None;
                     }
                     self.assemble_current(None)
-                } else if matches!(
-                    field.as_str(),
-                    "activity_source"
-                        | "activity_titles"
-                        | "activity_urls"
-                        | "activity_exclude_apps"
-                        | "activity_exclude_titles"
-                ) {
+                } else if is_lone_activity_field(&field) {
+                    apply_live_activity_policy(
+                        self,
+                        ActivityPolicy {
+                            activity_source: saved.activity_source,
+                            activity_titles: saved.activity_titles,
+                            activity_urls: saved.activity_urls,
+                            activity_exclude_apps: saved.activity_exclude_apps,
+                            activity_exclude_titles: saved.activity_exclude_titles,
+                        },
+                    );
                     {
                         let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
                         phase.fault = None;
@@ -4242,6 +4317,38 @@ mod tests {
         assert!(!available);
     }
 
+    struct PolicySentinel {
+        title_reads: std::cell::Cell<usize>,
+    }
+
+    impl crate::activity_source::ForegroundProvider for PolicySentinel {
+        fn read_foreground(
+            &mut self,
+            want_title: bool,
+            _facts: &crate::activity::ActivityFacts,
+        ) -> crate::activity_source::ForegroundRead {
+            if want_title {
+                self.title_reads.set(self.title_reads.get() + 1);
+                return crate::activity_source::ForegroundRead::Window(
+                    crate::activity_source::ForegroundWindow {
+                        app: "SENTINEL_APP".into(),
+                        app_id: None,
+                        title: Some("SENTINEL_TITLE".into()),
+                        pid: None,
+                    },
+                );
+            }
+            crate::activity_source::ForegroundRead::Window(
+                crate::activity_source::ForegroundWindow {
+                    app: "SENTINEL_APP".into(),
+                    app_id: None,
+                    title: None,
+                    pid: None,
+                },
+            )
+        }
+    }
+
     #[tokio::test]
     async fn write_setting_policy_apply() {
         let cred = sample_valid_credential("cert-pem-bytes");
@@ -4278,6 +4385,42 @@ mod tests {
         assert!(snap1.source);
         assert_eq!(snap1.exclude_apps, vec!["SENTINEL_APP".to_string()]);
         assert_eq!(harness.activity_prefs.generation(), initial_gen + 1);
+
+        let mut sampler = crate::activity_source::ActivitySampler::new();
+        let mut provider = PolicySentinel {
+            title_reads: std::cell::Cell::new(0),
+        };
+        let activity = crate::observer::ActivityState {
+            session: crate::desktop_session::SessionPresence::Live,
+            ..crate::observer::ActivityState::default()
+        };
+        sampler.poll(
+            &crate::activity_source::PollInput {
+                now_ms: 1_000,
+                prefs: snap1.clone(),
+                activity,
+                bound: crate::activity::BoundBackends::default(),
+                paused: false,
+                route: "gnome-shell",
+            },
+            &mut provider,
+            &crate::activity::ActivityFacts::default(),
+            &|| true,
+        );
+        sampler.seal(2_000);
+        assert_eq!(provider.title_reads.get(), 0);
+        let blob = serde_json::to_string(&sampler.take_pending()).unwrap();
+        assert!(!blob.contains("SENTINEL_APP"));
+        assert!(!blob.contains("SENTINEL_TITLE"));
+
+        let _ = harness
+            .handler
+            .write_setting("activity_source".into(), "false".into())
+            .await;
+        let stopped = harness.activity_prefs.snapshot();
+        assert!(!stopped.source);
+        assert_eq!(stopped.exclude_apps, vec!["SENTINEL_APP".to_string()]);
+        assert_eq!(harness.activity_prefs.generation(), initial_gen + 2);
 
         // write_setting("activity_only", "true") then a second policy write: decoded document restart_required is still true, and effective framerate is still 4.
         let _ = harness

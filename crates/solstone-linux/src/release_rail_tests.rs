@@ -86,7 +86,7 @@ fn committed_asset_set() -> BTreeSet<PathBuf> {
         root.join("packaging/activity-helpers/solstone-activity-kwin/metadata.json")
             .canonicalize()
             .unwrap(),
-        root.join("packaging/activity-helpers/solstone-activity-kwin/main.js")
+        root.join("packaging/activity-helpers/solstone-activity-kwin/contents/code/main.js")
             .canonicalize()
             .unwrap(),
     ]);

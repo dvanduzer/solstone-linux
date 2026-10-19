@@ -118,7 +118,7 @@ assets = [
     ["../../packaging/activity-helpers/solstone-activity@solpbc.org/metadata.json", "usr/share/solstone-linux/activity-helpers/solstone-activity@solpbc.org/metadata.json", "644"],
     ["../../packaging/activity-helpers/solstone-activity@solpbc.org/extension.js", "usr/share/solstone-linux/activity-helpers/solstone-activity@solpbc.org/extension.js", "644"],
     ["../../packaging/activity-helpers/solstone-activity-kwin/metadata.json", "usr/share/solstone-linux/activity-helpers/solstone-activity-kwin/metadata.json", "644"],
-    ["../../packaging/activity-helpers/solstone-activity-kwin/main.js", "usr/share/solstone-linux/activity-helpers/solstone-activity-kwin/main.js", "644"],
+    ["../../packaging/activity-helpers/solstone-activity-kwin/contents/code/main.js", "usr/share/solstone-linux/activity-helpers/solstone-activity-kwin/contents/code/main.js", "644"],
 ]
 
 # cargo-generate-rpm resolves sources from build-release.sh's workspace-root CWD
@@ -152,7 +152,7 @@ assets = [
     { source = "packaging/activity-helpers/solstone-activity@solpbc.org/metadata.json", dest = "/usr/share/solstone-linux/activity-helpers/solstone-activity@solpbc.org/metadata.json", mode = "644" },
     { source = "packaging/activity-helpers/solstone-activity@solpbc.org/extension.js", dest = "/usr/share/solstone-linux/activity-helpers/solstone-activity@solpbc.org/extension.js", mode = "644" },
     { source = "packaging/activity-helpers/solstone-activity-kwin/metadata.json", dest = "/usr/share/solstone-linux/activity-helpers/solstone-activity-kwin/metadata.json", mode = "644" },
-    { source = "packaging/activity-helpers/solstone-activity-kwin/main.js", dest = "/usr/share/solstone-linux/activity-helpers/solstone-activity-kwin/main.js", mode = "644" },
+    { source = "packaging/activity-helpers/solstone-activity-kwin/contents/code/main.js", dest = "/usr/share/solstone-linux/activity-helpers/solstone-activity-kwin/contents/code/main.js", mode = "644" },
 ]
 
 # On rpm the conditional IS expressible, so it is used: dnf and zypper honour weak

@@ -465,9 +465,9 @@ fn run_capture(
         activity_prefs,
         activity_fault,
         activity_capability,
-        Box::new(crate::activity_source::ProductionForeground {
-            desktop: desktop.clone(),
-        }),
+        Box::new(crate::activity_source::ProductionForeground::start(
+            desktop.clone(),
+        )),
         desktop,
     );
     let initialized = !stopped.load(Ordering::Acquire);
