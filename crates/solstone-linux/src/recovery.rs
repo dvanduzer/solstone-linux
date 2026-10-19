@@ -754,4 +754,46 @@ mod tests {
         assert!(failed_dir.exists());
         assert!(!failed_dir.join(CAPTURE_ZONE_FILENAME).exists());
     }
+
+    #[test]
+    fn activity_files_recover_and_keep_distinct_names() {
+        let t = tempfile::tempdir().unwrap();
+        let now = 1_700_000_060.0;
+        let path = t.path().join("20260403/archon/120000.incomplete");
+        fs::create_dir_all(&path).unwrap();
+        let first = "120000_1_desktop_activity.jsonl";
+        let second = "120000_2_desktop_activity.jsonl";
+        fs::write(path.join(first), b"{\"v\":1}\n").unwrap();
+        fs::write(path.join(second), b"{\"v\":1}\n").unwrap();
+        age(&path, now);
+
+        assert_eq!(recover_incomplete_segments(t.path(), 300, now, &NoMedia), 1);
+        let parent = t.path().join("20260403/archon");
+        let dirs: Vec<_> = fs::read_dir(&parent)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        assert_eq!(dirs.len(), 1);
+        let final_dir = &dirs[0];
+        assert!(
+            final_dir
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("120000_")
+        );
+        assert!(
+            !final_dir
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(".incomplete")
+        );
+        assert!(final_dir.join(first).is_file());
+        assert!(final_dir.join(second).is_file());
+        assert_eq!(fs::read(final_dir.join(first)).unwrap(), b"{\"v\":1}\n");
+        assert_eq!(fs::read(final_dir.join(second)).unwrap(), b"{\"v\":1}\n");
+    }
 }

@@ -13,6 +13,7 @@ use spl_core::pairlink;
 use spl_transport::credential::Credential;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::activity_prefs::{ActivityPolicy, ActivityPrefs};
 use crate::config::{ConfigPaths, set_guided_field};
 use crate::journal_mark::{
     JOURNAL_MARK_RECHECK_INTERVAL, PAIRING_ANSWER_FILENAME, begin_pairing_commit,
@@ -139,6 +140,8 @@ pub struct ControlDocument {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective: Option<SettingsDocument>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_status: Option<RouteStatusDocument>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_mark: Option<MarkRenderDocument>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmed_mark: Option<MarkRenderDocument>,
@@ -167,11 +170,62 @@ pub struct AttemptDocument {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RouteStatusDocument {
+    #[serde(default)]
+    pub route: Option<String>,
+    #[serde(default = "default_capability_status")]
+    pub foreground: String,
+    #[serde(default = "default_capability_status")]
+    pub title: String,
+    #[serde(default = "default_capability_status")]
+    pub url: String,
+    #[serde(default = "default_capability_status")]
+    pub idle: String,
+}
+
+fn default_capability_status() -> String {
+    "unavailable".to_string()
+}
+
+impl Default for RouteStatusDocument {
+    fn default() -> Self {
+        Self {
+            route: None,
+            foreground: "unavailable".into(),
+            title: "unavailable".into(),
+            url: "unavailable".into(),
+            idle: "unavailable".into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteStatusModel {
+    pub route: Option<String>,
+    pub foreground: String,
+    pub title: String,
+    pub url: String,
+    pub idle: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SettingsDocument {
     pub capture_framerate: i64,
     pub draw_cursor: bool,
     pub start_paused: bool,
     pub segment_interval: i64,
+    #[serde(default)]
+    pub activity_source: bool,
+    #[serde(default)]
+    pub activity_titles: bool,
+    #[serde(default)]
+    pub activity_urls: bool,
+    #[serde(default)]
+    pub activity_exclude_apps: Vec<String>,
+    #[serde(default)]
+    pub activity_exclude_titles: Vec<String>,
+    #[serde(default)]
+    pub activity_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,6 +255,7 @@ pub struct ControlModel {
     pub fault: Option<String>,
     pub saved_available: bool,
     pub effective: Option<SettingsModel>,
+    pub route_status: Option<RouteStatusModel>,
     pub pending_mark: Option<MarkRenderDocument>,
     pub confirmed_mark: Option<MarkRenderDocument>,
     pub pause_bounded: Option<bool>,
@@ -226,6 +281,12 @@ pub struct SettingsModel {
     pub draw_cursor: bool,
     pub start_paused: bool,
     pub segment_interval: i64,
+    pub activity_source: bool,
+    pub activity_titles: bool,
+    pub activity_urls: bool,
+    pub activity_exclude_apps: Vec<String>,
+    pub activity_exclude_titles: Vec<String>,
+    pub activity_only: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -260,12 +321,19 @@ impl ControlModel {
                 draw_cursor: DEFAULT_DRAW_CURSOR,
                 start_paused: DEFAULT_START_PAUSED,
                 segment_interval: DEFAULT_SEGMENT_INTERVAL,
+                activity_source: false,
+                activity_titles: false,
+                activity_urls: false,
+                activity_exclude_apps: Vec::new(),
+                activity_exclude_titles: Vec::new(),
+                activity_only: false,
             },
             restart_required: None,
             open_journal: None,
             fault: None,
             saved_available: false,
             effective: None,
+            route_status: None,
             pending_mark: None,
             confirmed_mark: None,
             pause_bounded: None,
@@ -316,6 +384,12 @@ pub fn decode_control<E: std::fmt::Display>(
             draw_cursor: doc.settings.draw_cursor,
             start_paused: doc.settings.start_paused,
             segment_interval: doc.settings.segment_interval,
+            activity_source: doc.settings.activity_source,
+            activity_titles: doc.settings.activity_titles,
+            activity_urls: doc.settings.activity_urls,
+            activity_exclude_apps: doc.settings.activity_exclude_apps,
+            activity_exclude_titles: doc.settings.activity_exclude_titles,
+            activity_only: doc.settings.activity_only,
         },
         restart_required: doc.restart_required,
         open_journal: doc.open_journal,
@@ -326,6 +400,19 @@ pub fn decode_control<E: std::fmt::Display>(
             draw_cursor: s.draw_cursor,
             start_paused: s.start_paused,
             segment_interval: s.segment_interval,
+            activity_source: s.activity_source,
+            activity_titles: s.activity_titles,
+            activity_urls: s.activity_urls,
+            activity_exclude_apps: s.activity_exclude_apps,
+            activity_exclude_titles: s.activity_exclude_titles,
+            activity_only: s.activity_only,
+        }),
+        route_status: doc.route_status.map(|r| RouteStatusModel {
+            route: r.route,
+            foreground: r.foreground,
+            title: r.title,
+            url: r.url,
+            idle: r.idle,
         }),
         pending_mark: doc.pending_mark,
         confirmed_mark: doc.confirmed_mark,
@@ -572,56 +659,39 @@ pub(crate) fn resolve_config_file(paths: &ConfigPaths) -> PathBuf {
     crate::config::resolve_config_paths(paths).config_path()
 }
 
+pub fn default_settings_doc() -> SettingsDocument {
+    SettingsDocument {
+        capture_framerate: DEFAULT_CAPTURE_FRAMERATE,
+        draw_cursor: DEFAULT_DRAW_CURSOR,
+        start_paused: DEFAULT_START_PAUSED,
+        segment_interval: DEFAULT_SEGMENT_INTERVAL,
+        activity_source: false,
+        activity_titles: false,
+        activity_urls: false,
+        activity_exclude_apps: Vec::new(),
+        activity_exclude_titles: Vec::new(),
+        activity_only: false,
+    }
+}
+
 pub fn read_saved_settings(config_paths: &ConfigPaths) -> (SettingsDocument, bool) {
     let config_path = resolve_config_file(config_paths);
     let bytes = match fs::read(&config_path) {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return (
-                SettingsDocument {
-                    capture_framerate: DEFAULT_CAPTURE_FRAMERATE,
-                    draw_cursor: DEFAULT_DRAW_CURSOR,
-                    start_paused: DEFAULT_START_PAUSED,
-                    segment_interval: DEFAULT_SEGMENT_INTERVAL,
-                },
-                true,
-            );
+            return (default_settings_doc(), true);
         }
         Err(_) => {
-            return (
-                SettingsDocument {
-                    capture_framerate: DEFAULT_CAPTURE_FRAMERATE,
-                    draw_cursor: DEFAULT_DRAW_CURSOR,
-                    start_paused: DEFAULT_START_PAUSED,
-                    segment_interval: DEFAULT_SEGMENT_INTERVAL,
-                },
-                false,
-            );
+            return (default_settings_doc(), false);
         }
     };
 
     let Ok(val) = serde_json::from_slice::<Value>(&bytes) else {
-        return (
-            SettingsDocument {
-                capture_framerate: DEFAULT_CAPTURE_FRAMERATE,
-                draw_cursor: DEFAULT_DRAW_CURSOR,
-                start_paused: DEFAULT_START_PAUSED,
-                segment_interval: DEFAULT_SEGMENT_INTERVAL,
-            },
-            false,
-        );
+        return (default_settings_doc(), false);
     };
 
     let Some(obj) = val.as_object() else {
-        return (
-            SettingsDocument {
-                capture_framerate: DEFAULT_CAPTURE_FRAMERATE,
-                draw_cursor: DEFAULT_DRAW_CURSOR,
-                start_paused: DEFAULT_START_PAUSED,
-                segment_interval: DEFAULT_SEGMENT_INTERVAL,
-            },
-            false,
-        );
+        return (default_settings_doc(), false);
     };
 
     let framerate = match obj.get("capture_framerate") {
@@ -644,26 +714,136 @@ pub fn read_saved_settings(config_paths: &ConfigPaths) -> (SettingsDocument, boo
         Some(Value::Number(n)) => n.as_i64().ok_or(()),
         Some(_) => Err(()),
     };
+    let activity_source = match obj.get("activity_source") {
+        None => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(()),
+    };
+    let activity_titles = match obj.get("activity_titles") {
+        None => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(()),
+    };
+    let activity_urls = match obj.get("activity_urls") {
+        None => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(()),
+    };
+    let activity_only = match obj.get("activity_only") {
+        None => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(()),
+    };
+    let activity_exclude_apps = match obj.get("activity_exclude_apps") {
+        None => Ok(Vec::new()),
+        Some(Value::Array(arr)) => {
+            let mut items = Vec::new();
+            let mut ok = true;
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    items.push(s.to_string());
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok { Ok(items) } else { Err(()) }
+        }
+        Some(_) => Err(()),
+    };
+    let activity_exclude_titles = match obj.get("activity_exclude_titles") {
+        None => Ok(Vec::new()),
+        Some(Value::Array(arr)) => {
+            let mut items = Vec::new();
+            let mut ok = true;
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    items.push(s.to_string());
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok { Ok(items) } else { Err(()) }
+        }
+        Some(_) => Err(()),
+    };
 
-    match (framerate, draw_cursor, start_paused, segment_interval) {
-        (Ok(f), Ok(d), Ok(p), Ok(s)) => (
+    match (
+        framerate,
+        draw_cursor,
+        start_paused,
+        segment_interval,
+        activity_source,
+        activity_titles,
+        activity_urls,
+        activity_exclude_apps,
+        activity_exclude_titles,
+        activity_only,
+    ) {
+        (
+            Ok(f),
+            Ok(d),
+            Ok(p),
+            Ok(s),
+            Ok(asrc),
+            Ok(atit),
+            Ok(aurl),
+            Ok(aapps),
+            Ok(atits),
+            Ok(aonly),
+        ) => (
             SettingsDocument {
                 capture_framerate: f,
                 draw_cursor: d,
                 start_paused: p,
                 segment_interval: s,
+                activity_source: asrc,
+                activity_titles: atit,
+                activity_urls: aurl,
+                activity_exclude_apps: aapps,
+                activity_exclude_titles: atits,
+                activity_only: aonly,
             },
             true,
         ),
-        _ => (
-            SettingsDocument {
-                capture_framerate: DEFAULT_CAPTURE_FRAMERATE,
-                draw_cursor: DEFAULT_DRAW_CURSOR,
-                start_paused: DEFAULT_START_PAUSED,
-                segment_interval: DEFAULT_SEGMENT_INTERVAL,
-            },
-            false,
-        ),
+        _ => (default_settings_doc(), false),
+    }
+}
+
+fn apply_activity_status(
+    phase: &mut Phase,
+    fault: &Mutex<Option<Arc<crate::activity_source::ActivityFault>>>,
+    capability: &Mutex<Option<Arc<Mutex<crate::activity_source::CapabilityStatus>>>>,
+    route: &mut Option<RouteStatusDocument>,
+) {
+    if phase.fault.is_none()
+        && let Some(token) = fault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|item| item.token())
+    {
+        phase.fault = Some(token);
+    }
+    if let Some(slot) = capability
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+    {
+        let status = slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if status.published {
+            *route = Some(RouteStatusDocument {
+                route: status.route,
+                foreground: status.foreground,
+                title: status.title,
+                url: status.url,
+                idle: status.idle,
+            });
+        }
     }
 }
 
@@ -676,6 +856,7 @@ pub(crate) fn assemble_document(
     restart_override: Option<bool>,
     sampler: Option<&SyncSampler>,
     effective: Option<&SettingsDocument>,
+    route_status: Option<&RouteStatusDocument>,
     captures_dir: Option<&std::path::Path>,
 ) -> String {
     let (settings, saved_available) = read_saved_settings(config_paths);
@@ -734,6 +915,7 @@ pub(crate) fn assemble_document(
         fault: phase.fault.clone(),
         saved_available,
         effective: effective.cloned(),
+        route_status: route_status.cloned(),
         pending_mark,
         confirmed_mark,
         pause_bounded,
@@ -749,6 +931,28 @@ pub(crate) fn assemble_document(
     })
 }
 
+fn validate_exclusion_list(val: &Value) -> Result<(), &'static str> {
+    let Some(arr) = val.as_array() else {
+        return Err("invalid-setting");
+    };
+    if arr.len() > 64 {
+        return Err("invalid-setting");
+    }
+    let mut seen = std::collections::HashSet::new();
+    for item in arr {
+        let Some(s) = item.as_str() else {
+            return Err("invalid-setting");
+        };
+        if s.is_empty() || s.len() > 256 {
+            return Err("invalid-setting");
+        }
+        if !seen.insert(s) {
+            return Err("invalid-setting");
+        }
+    }
+    Ok(())
+}
+
 fn validate_setting(field: &str, value: &str) -> Result<Value, &'static str> {
     if value.is_empty() {
         return Err("invalid-setting");
@@ -758,7 +962,8 @@ fn validate_setting(field: &str, value: &str) -> Result<Value, &'static str> {
             let n = value.trim().parse::<i64>().map_err(|_| "invalid-setting")?;
             Ok(Value::Number(n.clamp(1, 10).into()))
         }
-        "draw_cursor" | "start_paused" => {
+        "draw_cursor" | "start_paused" | "activity_source" | "activity_titles"
+        | "activity_urls" | "activity_only" => {
             let normalized = value.trim().to_lowercase();
             match normalized.as_str() {
                 "y" | "yes" | "true" => Ok(Value::Bool(true)),
@@ -772,6 +977,32 @@ fn validate_setting(field: &str, value: &str) -> Result<Value, &'static str> {
                 return Err("invalid-setting");
             }
             Ok(Value::Number(n.into()))
+        }
+        "activity_exclude_apps" | "activity_exclude_titles" => {
+            let val: Value = serde_json::from_str(value.trim()).map_err(|_| "invalid-setting")?;
+            validate_exclusion_list(&val)?;
+            Ok(val)
+        }
+        "activity_policy" => {
+            let val: Value = serde_json::from_str(value.trim()).map_err(|_| "invalid-setting")?;
+            let Some(obj) = val.as_object() else {
+                return Err("invalid-setting");
+            };
+            if !obj.get("activity_source").is_some_and(Value::is_boolean)
+                || !obj.get("activity_titles").is_some_and(Value::is_boolean)
+                || !obj.get("activity_urls").is_some_and(Value::is_boolean)
+            {
+                return Err("invalid-setting");
+            }
+            let Some(apps) = obj.get("activity_exclude_apps") else {
+                return Err("invalid-setting");
+            };
+            validate_exclusion_list(apps)?;
+            let Some(titles) = obj.get("activity_exclude_titles") else {
+                return Err("invalid-setting");
+            };
+            validate_exclusion_list(titles)?;
+            Ok(val)
         }
         _ => Err("invalid-setting"),
     }
@@ -796,7 +1027,11 @@ pub struct WindowControlSupervisor {
     health: Arc<Mutex<SyncHealth>>,
     sampler: Option<SyncSampler>,
     snapshot: Arc<Mutex<StateSnapshot>>,
-    effective_settings: Option<SettingsDocument>,
+    effective_settings: Arc<Mutex<Option<SettingsDocument>>>,
+    activity_prefs: Option<Arc<ActivityPrefs>>,
+    route_status: Arc<Mutex<Option<RouteStatusDocument>>>,
+    activity_fault: Arc<Mutex<Option<Arc<crate::activity_source::ActivityFault>>>>,
+    activity_capability: Arc<Mutex<Option<Arc<Mutex<crate::activity_source::CapabilityStatus>>>>>,
     captures_dir: Option<PathBuf>,
     owner: Option<Box<dyn ManagedOwner>>,
     activation_blocked: bool,
@@ -824,8 +1059,10 @@ impl WindowControlSupervisor {
         durable_fault: Arc<dyn DurableWriteFault>,
         health: Arc<Mutex<SyncHealth>>,
         snapshot: Arc<Mutex<StateSnapshot>>,
-        effective_settings: Option<SettingsDocument>,
+        effective_settings: Arc<Mutex<Option<SettingsDocument>>>,
         captures_dir: Option<PathBuf>,
+        activity_prefs: Option<Arc<ActivityPrefs>>,
+        route_status: Arc<Mutex<Option<RouteStatusDocument>>>,
     ) -> (Self, WindowControlHandler) {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let sampler = Some(sync_reset.sampler_handle());
@@ -840,6 +1077,8 @@ impl WindowControlSupervisor {
             current_owner_pairing_id: None,
             pending_instance_id: None,
         }));
+        let activity_fault = Arc::new(Mutex::new(None));
+        let activity_capability = Arc::new(Mutex::new(None));
         let handler = WindowControlHandler {
             inner: Arc::new(WindowControlHandlerInner {
                 phase: Arc::clone(&phase),
@@ -848,7 +1087,10 @@ impl WindowControlSupervisor {
                 health: Arc::clone(&health),
                 sampler: sampler.clone(),
                 snapshot: Arc::clone(&snapshot),
-                effective_settings: effective_settings.clone(),
+                effective_settings: Arc::clone(&effective_settings),
+                route_status: Arc::clone(&route_status),
+                activity_fault: Arc::clone(&activity_fault),
+                activity_capability: Arc::clone(&activity_capability),
                 captures_dir: captures_dir.clone(),
                 custom_opener: None,
             }),
@@ -873,6 +1115,10 @@ impl WindowControlSupervisor {
             sampler,
             snapshot,
             effective_settings,
+            activity_prefs,
+            route_status,
+            activity_fault,
+            activity_capability,
             captures_dir,
             owner: None,
             activation_blocked: false,
@@ -883,8 +1129,34 @@ impl WindowControlSupervisor {
         (supervisor, handler)
     }
 
+    pub(crate) fn attach_activity_runtime(
+        &self,
+        fault: Arc<crate::activity_source::ActivityFault>,
+        capability: Arc<Mutex<crate::activity_source::CapabilityStatus>>,
+    ) {
+        *self
+            .activity_fault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(fault);
+        *self
+            .activity_capability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(capability);
+    }
+
     fn assemble_current(&self, restart_override: Option<bool>) -> String {
-        let phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+        let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+        let mut route = self
+            .route_status
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        apply_activity_status(
+            &mut phase,
+            &self.activity_fault,
+            &self.activity_capability,
+            &mut route,
+        );
         let health = self.sampler.as_ref().map_or_else(
             || {
                 self.health
@@ -895,6 +1167,7 @@ impl WindowControlSupervisor {
             SyncSampler::health,
         );
         let snapshot = self.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+        let eff = self.effective_settings.lock().ok().and_then(|g| g.clone());
         assemble_document(
             &phase,
             &health,
@@ -902,7 +1175,8 @@ impl WindowControlSupervisor {
             &self.config_paths,
             restart_override,
             self.sampler.as_ref(),
-            self.effective_settings.as_ref(),
+            eff.as_ref(),
+            route.as_ref(),
             self.captures_dir.as_deref(),
         )
     }
@@ -1568,15 +1842,51 @@ impl WindowControlSupervisor {
             }
         };
 
-        let result = set_guided_field(&self.config_paths, &field, normalized);
+        let result = set_guided_field(&self.config_paths, &field, normalized.clone());
         match result {
             Ok(_) => {
-                {
-                    let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
-                    phase.restart_required = Some(true);
-                    phase.fault = None;
+                if field == "activity_policy" {
+                    if let Ok(policy) = serde_json::from_value::<ActivityPolicy>(normalized.clone())
+                    {
+                        if let Some(ref prefs) = self.activity_prefs {
+                            prefs.apply_policy(policy.clone());
+                        }
+                        if let Ok(mut eff_lock) = self.effective_settings.lock()
+                            && let Some(ref mut eff) = *eff_lock
+                        {
+                            eff.activity_source = policy.activity_source;
+                            eff.activity_titles = policy.activity_titles;
+                            eff.activity_urls = policy.activity_urls;
+                            eff.activity_exclude_apps = policy.activity_exclude_apps;
+                            eff.activity_exclude_titles = policy.activity_exclude_titles;
+                        }
+                    }
+                    {
+                        let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+                        phase.fault = None;
+                    }
+                    self.assemble_current(None)
+                } else if matches!(
+                    field.as_str(),
+                    "activity_source"
+                        | "activity_titles"
+                        | "activity_urls"
+                        | "activity_exclude_apps"
+                        | "activity_exclude_titles"
+                ) {
+                    {
+                        let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+                        phase.fault = None;
+                    }
+                    self.assemble_current(None)
+                } else {
+                    {
+                        let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+                        phase.restart_required = Some(true);
+                        phase.fault = None;
+                    }
+                    self.assemble_current(Some(true))
                 }
-                self.assemble_current(Some(true))
             }
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                 {
@@ -1632,7 +1942,10 @@ struct WindowControlHandlerInner {
     health: Arc<Mutex<SyncHealth>>,
     sampler: Option<SyncSampler>,
     snapshot: Arc<Mutex<StateSnapshot>>,
-    effective_settings: Option<SettingsDocument>,
+    effective_settings: Arc<Mutex<Option<SettingsDocument>>>,
+    route_status: Arc<Mutex<Option<RouteStatusDocument>>>,
+    activity_fault: Arc<Mutex<Option<Arc<crate::activity_source::ActivityFault>>>>,
+    activity_capability: Arc<Mutex<Option<Arc<Mutex<crate::activity_source::CapabilityStatus>>>>>,
     captures_dir: Option<PathBuf>,
     custom_opener: Option<CustomOpener>,
 }
@@ -1678,7 +1991,10 @@ impl Default for WindowControlHandler {
                     process_start_mono: 0.0,
                     session: Default::default(),
                 })),
-                effective_settings: None,
+                effective_settings: Arc::new(Mutex::new(None)),
+                route_status: Arc::new(Mutex::new(None)),
+                activity_fault: Arc::new(Mutex::new(None)),
+                activity_capability: Arc::new(Mutex::new(None)),
                 captures_dir: None,
                 custom_opener: None,
             }),
@@ -1696,15 +2012,47 @@ impl WindowControlHandler {
                 health: Arc::clone(&self.inner.health),
                 sampler: self.inner.sampler.clone(),
                 snapshot: Arc::clone(&self.inner.snapshot),
-                effective_settings: self.inner.effective_settings.clone(),
+                effective_settings: Arc::clone(&self.inner.effective_settings),
+                route_status: Arc::clone(&self.inner.route_status),
+                activity_fault: Arc::clone(&self.inner.activity_fault),
+                activity_capability: Arc::clone(&self.inner.activity_capability),
                 captures_dir: self.inner.captures_dir.clone(),
                 custom_opener: Some(opener),
             }),
         }
     }
 
+    pub fn attach_activity_runtime(
+        &self,
+        fault: Arc<crate::activity_source::ActivityFault>,
+        capability: Arc<Mutex<crate::activity_source::CapabilityStatus>>,
+    ) {
+        *self
+            .inner
+            .activity_fault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(fault);
+        *self
+            .inner
+            .activity_capability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(capability);
+    }
+
     pub fn get_control_state(&self) -> String {
-        let phase = self.inner.phase.lock().unwrap_or_else(|p| p.into_inner());
+        let mut phase = self.inner.phase.lock().unwrap_or_else(|p| p.into_inner());
+        let mut route = self
+            .inner
+            .route_status
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        apply_activity_status(
+            &mut phase,
+            &self.inner.activity_fault,
+            &self.inner.activity_capability,
+            &mut route,
+        );
         let health = self.inner.sampler.as_ref().map_or_else(
             || {
                 self.inner
@@ -1720,6 +2068,12 @@ impl WindowControlHandler {
             .snapshot
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        let eff = self
+            .inner
+            .effective_settings
+            .lock()
+            .ok()
+            .and_then(|g| g.clone());
         assemble_document(
             &phase,
             &health,
@@ -1727,7 +2081,8 @@ impl WindowControlHandler {
             &self.inner.config_paths,
             None,
             self.inner.sampler.as_ref(),
-            self.inner.effective_settings.as_ref(),
+            eff.as_ref(),
+            route.as_ref(),
             self.inner.captures_dir.as_deref(),
         )
     }
@@ -2223,6 +2578,8 @@ mod tests {
         sync_facts: Arc<Mutex<SyncFacts>>,
         shutdown_notify: Arc<tokio::sync::Notify>,
         open_journal: OpenJournalAccess,
+        activity_prefs: Arc<ActivityPrefs>,
+        effective_settings: Arc<Mutex<Option<SettingsDocument>>>,
         handler: WindowControlHandler,
         supervisor_task: tokio::task::JoinHandle<Result<(), PrivateStateError>>,
     }
@@ -2280,6 +2637,11 @@ mod tests {
             let health = Arc::new(Mutex::new(sync_health));
             let snapshot = Arc::new(Mutex::new(test_snapshot(Mode::Idle, false)));
 
+            let mut initial_settings = default_settings_doc();
+            initial_settings.capture_framerate = 4;
+            let effective_settings = Arc::new(Mutex::new(Some(initial_settings)));
+            let activity_prefs = Arc::new(ActivityPrefs::new(&crate::config::Config::default()));
+
             let config = crate::config::resolve_config_paths(&config_paths);
             let upload = Arc::new(UploadClient::new(
                 &config,
@@ -2312,8 +2674,10 @@ mod tests {
                 fault,
                 Arc::clone(&health),
                 Arc::clone(&snapshot),
+                Arc::clone(&effective_settings),
                 None,
-                None,
+                Some(Arc::clone(&activity_prefs)),
+                Arc::new(Mutex::new(None)),
             );
 
             let supervisor_task = tokio::spawn(supervisor.run());
@@ -2335,6 +2699,8 @@ mod tests {
                 sync_facts,
                 shutdown_notify,
                 open_journal,
+                activity_prefs,
+                effective_settings,
                 handler,
                 supervisor_task,
             }
@@ -2401,8 +2767,10 @@ mod tests {
                 Arc::new(NoWriteFault),
                 self.health.clone(),
                 self.snapshot.clone(),
+                Arc::clone(&self.effective_settings),
                 None,
-                None,
+                Some(Arc::clone(&self.activity_prefs)),
+                Arc::new(Mutex::new(None)),
             );
             self.handler = handler;
             self.supervisor_task = tokio::spawn(supervisor.run());
@@ -3872,5 +4240,59 @@ mod tests {
         std::fs::create_dir(&config_file).unwrap();
         let (_settings, available) = read_saved_settings(&paths);
         assert!(!available);
+    }
+
+    #[tokio::test]
+    async fn write_setting_policy_apply() {
+        let cred = sample_valid_credential("cert-pem-bytes");
+        let pairer = Arc::new(FakePairer::new(cred));
+        let starter = Arc::new(FakeOwnerStarter::default());
+        let harness = TestHarness::new(None, false, pairer, starter, Arc::new(NoWriteFault)).await;
+
+        let initial_gen = harness.activity_prefs.generation();
+        assert!(!harness.activity_prefs.snapshot().source);
+
+        // write_setting("activity_source", "true") leaves prefs.snapshot().source == false and generation() unchanged.
+        let _ = harness
+            .handler
+            .write_setting("activity_source".into(), "true".into())
+            .await;
+        assert!(!harness.activity_prefs.snapshot().source);
+        assert_eq!(harness.activity_prefs.generation(), initial_gen);
+
+        // Then one write_setting("activity_policy", <json>) with activity_source: true and activity_exclude_apps: ["SENTINEL_APP"] (other booleans false, titles exclusion empty). After it returns, snapshot source is true, exclusions contain SENTINEL_APP, and generation increased by 1.
+        let policy_json = serde_json::json!({
+            "activity_source": true,
+            "activity_titles": false,
+            "activity_urls": false,
+            "activity_exclude_apps": ["SENTINEL_APP"],
+            "activity_exclude_titles": []
+        })
+        .to_string();
+
+        let _doc1 = harness
+            .handler
+            .write_setting("activity_policy".into(), policy_json.clone())
+            .await;
+        let snap1 = harness.activity_prefs.snapshot();
+        assert!(snap1.source);
+        assert_eq!(snap1.exclude_apps, vec!["SENTINEL_APP".to_string()]);
+        assert_eq!(harness.activity_prefs.generation(), initial_gen + 1);
+
+        // write_setting("activity_only", "true") then a second policy write: decoded document restart_required is still true, and effective framerate is still 4.
+        let _ = harness
+            .handler
+            .write_setting("activity_only".into(), "true".into())
+            .await;
+
+        let doc2 = harness
+            .handler
+            .write_setting("activity_policy".into(), policy_json)
+            .await;
+        let model2 = decode_control_str(&doc2).unwrap();
+        assert_eq!(model2.restart_required, Some(true));
+        assert_eq!(model2.effective.as_ref().unwrap().capture_framerate, 4);
+
+        harness.shutdown().await;
     }
 }

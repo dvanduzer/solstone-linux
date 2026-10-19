@@ -128,6 +128,18 @@ pub const SETTINGS_FILE: &str = "config file";
 pub const SETTINGS_CONFLICT: &str =
     "your settings changed outside this window. read them again before saving.";
 pub const SETTINGS_RELOAD: &str = "read settings again";
+pub const ACTIVITY_WRITE_FAILED: &str = "couldn't save activity intake. try again.";
+pub const SETTINGS_ACTIVITY_SOURCE: &str = "desktop activity";
+pub const SETTINGS_ACTIVITY_TITLES: &str = "window titles";
+pub const SETTINGS_ACTIVITY_URLS: &str = "web addresses";
+pub const SETTINGS_ACTIVITY_ONLY: &str = "activity only";
+pub const SETTINGS_ACTIVITY_ONLY_HELP: &str =
+    "take in desktop activity without screen or audio intake.";
+pub const SETTINGS_ACTIVITY_PRIVATE_WINDOWS_NOTE: &str = "Linux does not classify private windows.";
+pub const SETTINGS_ACTIVITY_EXCLUDE_APPS: &str = "excluded apps";
+pub const SETTINGS_ACTIVITY_EXCLUDE_TITLES: &str = "excluded window titles";
+pub const SETTINGS_ACTIVITY_ROUTE: &str = "activity route";
+pub const SETTINGS_ACTIVITY_EXPLAIN: &str = "the solstone app takes in the app, window title, page address, and active or idle time you share with it, and all of it goes into your journal.";
 pub const HELP_HEADING: &str = "get help";
 pub const HELP_INTRO: &str = "need a hand? reach a human. we're happy to help.";
 pub const HELP_OPEN: &str = "get help";
@@ -330,6 +342,17 @@ pub enum CopyKey {
     SettingsFile,
     SettingsConflict,
     SettingsReload,
+    ActivityWriteFailed,
+    SettingsActivitySource,
+    SettingsActivityTitles,
+    SettingsActivityUrls,
+    SettingsActivityOnly,
+    SettingsActivityOnlyHelp,
+    SettingsActivityPrivateWindowsNote,
+    SettingsActivityExcludeApps,
+    SettingsActivityExcludeTitles,
+    SettingsActivityRoute,
+    SettingsActivityExplain,
     HelpHeading,
     HelpIntro,
     HelpOpen,
@@ -485,6 +508,17 @@ impl CopyKey {
             Self::SettingsFile => SETTINGS_FILE,
             Self::SettingsConflict => SETTINGS_CONFLICT,
             Self::SettingsReload => SETTINGS_RELOAD,
+            Self::ActivityWriteFailed => ACTIVITY_WRITE_FAILED,
+            Self::SettingsActivitySource => SETTINGS_ACTIVITY_SOURCE,
+            Self::SettingsActivityTitles => SETTINGS_ACTIVITY_TITLES,
+            Self::SettingsActivityUrls => SETTINGS_ACTIVITY_URLS,
+            Self::SettingsActivityOnly => SETTINGS_ACTIVITY_ONLY,
+            Self::SettingsActivityOnlyHelp => SETTINGS_ACTIVITY_ONLY_HELP,
+            Self::SettingsActivityPrivateWindowsNote => SETTINGS_ACTIVITY_PRIVATE_WINDOWS_NOTE,
+            Self::SettingsActivityExcludeApps => SETTINGS_ACTIVITY_EXCLUDE_APPS,
+            Self::SettingsActivityExcludeTitles => SETTINGS_ACTIVITY_EXCLUDE_TITLES,
+            Self::SettingsActivityRoute => SETTINGS_ACTIVITY_ROUTE,
+            Self::SettingsActivityExplain => SETTINGS_ACTIVITY_EXPLAIN,
             Self::HelpHeading => HELP_HEADING,
             Self::HelpIntro => HELP_INTRO,
             Self::HelpOpen => HELP_OPEN,

@@ -6,6 +6,10 @@ and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- the solstone app takes in what you share with it, and all of it goes into your journal: you can now take in the app name, window title, page address, and active, idle, and locked intervals you turn on, and all of it goes into your journal.
+
 ### Fixed
 
 - on a computer with no microphone, the solstone app no longer quits unexpectedly after a few minutes while it keeps checking for one.

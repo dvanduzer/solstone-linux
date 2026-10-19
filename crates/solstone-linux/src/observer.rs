@@ -4,6 +4,12 @@
 //! Capture-loop policy, independent of desktop and network backends.
 
 use crate::{
+    activity_prefs::ActivityPrefs,
+    activity_source::{
+        ActivityFault, ActivityRuntime, CapabilityStatus, ForegroundProvider, NoForeground,
+        PollInput, route_name,
+    },
+    activity_writer::ActivityWriter,
     capture_stats::{CaptureStats, compute_capture_stats},
     chunking::{DrainedChunk, HitGate},
     config::Config,
@@ -26,6 +32,10 @@ use std::{
 };
 
 pub const CAPTURE_STATS_REFRESH_INTERVAL: f64 = 60.0;
+
+fn wall_millis(wall_seconds: f64) -> u64 {
+    (wall_seconds.max(0.0) * 1000.0) as u64
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -82,6 +92,10 @@ pub struct ActivityState {
 }
 pub trait ActivityProbe {
     fn probe(&mut self) -> Result<ActivityState, String>;
+
+    fn activity_facts(&self) -> crate::activity::ActivityFacts {
+        crate::activity::ActivityFacts::default()
+    }
 }
 pub trait MuteProbe {
     fn probe_muted(&mut self) -> Result<bool, String>;
@@ -251,6 +265,8 @@ pub struct Observer<V, A, P, M, W, E, C, Q, N> {
     pub state: ObserverState,
     pub backends: Backends<V, A, P, M, W, E, C, Q, N>,
     zone: Box<dyn ZoneSource>,
+    activity: Option<ActivityRuntime>,
+    foreground: Box<dyn ForegroundProvider>,
 }
 
 impl<V, A, P, M, W, E, C, Q, N> Observer<V, A, P, M, W, E, C, Q, N>
@@ -295,6 +311,8 @@ where
             config,
             backends,
             zone,
+            activity: None,
+            foreground: Box::new(NoForeground),
             state: ObserverState {
                 mode: Mode::Idle,
                 paused: starting.paused,
@@ -325,11 +343,40 @@ where
         }
     }
 
+    pub(crate) fn install_activity(
+        &mut self,
+        prefs: std::sync::Arc<ActivityPrefs>,
+        fault: std::sync::Arc<ActivityFault>,
+        capability: std::sync::Arc<std::sync::Mutex<CapabilityStatus>>,
+        foreground: Box<dyn ForegroundProvider>,
+        desktop: String,
+    ) {
+        self.foreground = foreground;
+        self.activity = Some(ActivityRuntime {
+            prefs,
+            sampler: crate::activity_source::ActivitySampler::new(),
+            writer: None,
+            fault,
+            capability,
+            anchor_mono: None,
+            desktop,
+        });
+    }
+
     pub fn initialize(&mut self) -> Result<(), ObserverError> {
         let target = self.probe_status().unwrap_or(Mode::Screencast);
         self.state.segment_is_muted = self.state.cached_is_muted;
         self.state.cached_is_active = target == Mode::Screencast;
         self.state.mode = target;
+        if self.config.activity_only {
+            self.note_activity();
+            self.persist_activity();
+            if !self.session_live() {
+                self.state.mode = Mode::Idle;
+            }
+            self.publish();
+            return Ok(());
+        }
         if !self.state.paused && self.session_live() {
             self.start_capture(target)?;
         } else if !self.session_live() {
@@ -353,6 +400,9 @@ where
         };
         if let Err(error) = pause_hold::save(&self.config.state_dir(), held) {
             tracing::warn!(%error, "Could not record the pause; it holds until this app stops");
+        }
+        if let Some(activity) = self.activity.as_ref() {
+            activity.prefs.bump_generation();
         }
         self.publish();
     }
@@ -386,6 +436,9 @@ where
         {
             self.resume();
         }
+        if self.config.activity_only {
+            return self.tick_activity_only();
+        }
         if self.state.paused {
             self.finish_paused_segment()?;
             let _ = self.backends.audio.drain();
@@ -405,6 +458,7 @@ where
             }
             self.state.segment_is_muted = self.state.cached_is_muted;
             self.state.mode = target;
+            self.note_activity();
             match self.start_capture(target) {
                 Err(ObserverError::VideoStart(_)) => {
                     // Deliberate reference parity: failed resume start leaves its first .incomplete potentially orphaned for recovery.
@@ -413,6 +467,7 @@ where
                 Err(error) => return Err(error),
                 Ok(()) => {}
             }
+            self.persist_activity();
             self.publish();
             return Ok(());
         }
@@ -452,6 +507,8 @@ where
         {
             target = Mode::Idle;
         }
+        self.note_activity();
+        self.persist_activity();
         let mode_changed = target != self.state.mode;
         let screen_transition =
             mode_changed && (self.state.mode == Mode::Screencast || target == Mode::Screencast);
@@ -481,7 +538,7 @@ where
     }
 
     pub fn handle_boundary(&mut self, target: Mode) -> Result<(), ObserverError> {
-        if self.state.mode == Mode::Screencast {
+        if self.state.mode == Mode::Screencast && !self.config.activity_only {
             self.stop_video()?;
         }
         self.write_gated_audio()?;
@@ -494,7 +551,7 @@ where
     }
 
     pub fn shutdown(&mut self) -> Result<(), ObserverError> {
-        if self.state.mode == Mode::Screencast {
+        if self.state.mode == Mode::Screencast && !self.config.activity_only {
             let _ = self
                 .backends
                 .video
@@ -502,7 +559,12 @@ where
                 .map_err(ObserverError::VideoStop)?;
             self.state.current_streams.clear();
         }
-        self.write_gated_audio()?;
+        if let Some(activity) = self.activity.as_ref() {
+            activity.prefs.bump_generation();
+        }
+        if !self.config.activity_only {
+            self.write_gated_audio()?;
+        }
         self.finalize_segment()?;
         self.backends.audio.stop();
         self.publish();
@@ -529,15 +591,19 @@ where
     }
 
     fn finish_paused_segment(&mut self) -> Result<(), ObserverError> {
+        self.note_activity();
+        self.persist_activity();
         if self.state.segment_dir.is_none() {
             return Ok(());
         }
-        if self.state.mode == Mode::Screencast {
+        if self.state.mode == Mode::Screencast && !self.config.activity_only {
             self.stop_video()?
         }
-        self.write_gated_audio()?;
-        self.state.frames.clear();
-        self.state.hit_gate = HitGate::default();
+        if !self.config.activity_only {
+            self.write_gated_audio()?;
+            self.state.frames.clear();
+            self.state.hit_gate = HitGate::default();
+        }
         self.finalize_segment()
     }
     fn write_gated_audio(&mut self) -> Result<(), ObserverError> {
@@ -658,6 +724,12 @@ where
         }
     }
     fn finalize_segment(&mut self) -> Result<(), ObserverError> {
+        self.seal_open_activity();
+        self.persist_activity();
+        if let Some(activity) = self.activity.as_mut() {
+            activity.writer = None;
+            activity.anchor_mono = None;
+        }
         let Some(dir) = self.state.segment_dir.take() else {
             return Ok(());
         };
@@ -708,12 +780,175 @@ where
             .stats
             .snapshot(&self.config.captures_dir(), &today);
     }
+    fn tick_activity_only(&mut self) -> Result<(), ObserverError> {
+        if self.state.paused {
+            self.finish_paused_segment()?;
+            let _ = self.backends.audio.drain();
+            self.publish();
+            return Ok(());
+        }
+        let target = self.probe_status().unwrap_or(self.state.mode);
+        if !self.session_live() {
+            self.wait_for_session()?;
+            return Ok(());
+        }
+        self.state.mode = target;
+        self.state.segment_is_muted = self.state.cached_is_muted;
+        self.note_activity();
+        self.persist_activity();
+        self.roll_activity_segment()?;
+        self.publish();
+        Ok(())
+    }
+
+    fn note_activity(&mut self) {
+        let (snap, desktop, has_open) = {
+            let Some(activity) = self.activity.as_ref() else {
+                return;
+            };
+            (
+                activity.prefs.snapshot(),
+                activity.desktop.clone(),
+                activity.sampler.has_open(),
+            )
+        };
+        if !snap.source && !has_open {
+            return;
+        }
+        let facts = self.backends.activity.activity_facts();
+        let now_ms = wall_millis(self.backends.clock.wall_seconds());
+        let mono = self.backends.clock.monotonic_seconds();
+        let dir_none = self.state.segment_dir.is_none();
+        let route = route_name(facts.kind, &desktop);
+        let input = PollInput {
+            now_ms,
+            prefs: snap,
+            activity: self.state.cached_activity,
+            bound: facts.bound,
+            paused: self.state.paused,
+            route,
+        };
+        let mut sampler = match self.activity.as_mut() {
+            Some(activity) => std::mem::take(&mut activity.sampler),
+            None => return,
+        };
+        sampler.poll(&input, self.foreground.as_mut(), &facts);
+        let status = sampler.status();
+        let has_open = sampler.has_open();
+        let Some(activity) = self.activity.as_mut() else {
+            return;
+        };
+        activity.sampler = sampler;
+        if let Ok(mut slot) = activity.capability.lock() {
+            *slot = status;
+        }
+        if has_open && activity.anchor_mono.is_none() && dir_none {
+            activity.anchor_mono = Some(mono);
+        }
+    }
+
+    fn seal_open_activity(&mut self) {
+        let now_ms = wall_millis(self.backends.clock.wall_seconds());
+        if let Some(activity) = self.activity.as_mut() {
+            activity.sampler.seal(now_ms);
+        }
+    }
+
+    fn persist_activity(&mut self) {
+        let pending = match self.activity.as_mut() {
+            Some(activity) => activity.sampler.take_pending(),
+            None => return,
+        };
+        if pending.is_empty() {
+            return;
+        }
+        if self.state.segment_dir.is_none() && self.start_segment().is_err() {
+            if let Some(activity) = self.activity.as_mut() {
+                activity.fault.record_write_error();
+                activity.sampler.restore_pending(pending);
+            }
+            return;
+        }
+        let Some(dir) = self.state.segment_dir.clone() else {
+            if let Some(activity) = self.activity.as_mut() {
+                activity.fault.record_write_error();
+                activity.sampler.restore_pending(pending);
+            }
+            return;
+        };
+        let Some(hms) = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".incomplete"))
+            .map(str::to_string)
+        else {
+            if let Some(activity) = self.activity.as_mut() {
+                activity.fault.record_write_error();
+                activity.sampler.restore_pending(pending);
+            }
+            return;
+        };
+        let Some(activity) = self.activity.as_mut() else {
+            return;
+        };
+        let reuse = activity
+            .writer
+            .as_ref()
+            .is_some_and(|(path, _)| path == &dir);
+        if !reuse {
+            activity.writer = Some((dir.clone(), ActivityWriter::new(dir, hms)));
+        }
+        let mut failed_at = None;
+        for (index, row) in pending.iter().enumerate() {
+            let wrote = activity
+                .writer
+                .as_mut()
+                .and_then(|(_, writer)| writer.write_row(row).ok())
+                .is_some();
+            if !wrote {
+                failed_at = Some(index);
+                break;
+            }
+        }
+        if let Some(index) = failed_at {
+            activity.fault.record_write_error();
+            activity.sampler.restore_pending(pending[index..].to_vec());
+        }
+    }
+
+    fn roll_activity_segment(&mut self) -> Result<(), ObserverError> {
+        let now = self.backends.clock.monotonic_seconds();
+        let interval = self.config.segment_interval.max(1) as f64;
+        let anchor = self
+            .activity
+            .as_ref()
+            .and_then(|activity| activity.anchor_mono);
+        let open_without_dir = self.state.segment_dir.is_none()
+            && self
+                .activity
+                .as_ref()
+                .is_some_and(|activity| activity.sampler.has_open());
+        if open_without_dir && anchor.is_some_and(|start| now - start >= interval) {
+            self.seal_open_activity();
+            self.persist_activity();
+            self.finalize_segment()?;
+        } else if self.state.segment_dir.is_some()
+            && now - self.state.segment_start_mono >= interval
+        {
+            self.finalize_segment()?;
+        }
+        Ok(())
+    }
+
     fn probe_status(&mut self) -> Result<Mode, String> {
         let activity = self.backends.activity.probe()?;
         let muted = self.backends.mute.probe_muted()?;
         if activity.session_epoch != self.state.cached_activity.session_epoch {
             self.state.session_settle_until =
                 self.backends.clock.monotonic_seconds() + SESSION_SETTLE_SECONDS;
+            if let Some(runtime) = self.activity.as_ref() {
+                runtime.prefs.bump_generation();
+            }
         }
         self.state.cached_activity = activity;
         self.state.cached_is_muted = muted;
@@ -836,6 +1071,7 @@ pub(crate) mod tests {
     use std::{
         cell::{Cell, RefCell},
         collections::VecDeque,
+        os::unix::fs::PermissionsExt,
         rc::Rc,
         time::Instant,
     };
@@ -2534,5 +2770,151 @@ pub(crate) mod tests {
         assert_eq!(reopened, seg_dir);
         assert_eq!(fs::read(&zone_path).unwrap(), zone_bytes);
         assert_eq!(f.zone_reads.get(), 1);
+    }
+
+    struct CountingForeground {
+        reads: Rc<Cell<usize>>,
+        title_reads: Rc<Cell<usize>>,
+        app: String,
+    }
+
+    impl crate::activity_source::ForegroundProvider for CountingForeground {
+        fn read_foreground(
+            &mut self,
+            want_title: bool,
+            _: &crate::activity::ActivityFacts,
+        ) -> crate::activity_source::ForegroundRead {
+            if want_title {
+                self.title_reads.set(self.title_reads.get() + 1);
+            } else {
+                self.reads.set(self.reads.get() + 1);
+            }
+            crate::activity_source::ForegroundRead::Window(
+                crate::activity_source::ForegroundWindow {
+                    app: self.app.clone(),
+                    app_id: None,
+                    title: None,
+                },
+            )
+        }
+    }
+
+    fn install_notes(
+        f: &mut Fixture,
+        source: bool,
+    ) -> (
+        std::sync::Arc<crate::activity_source::ActivityFault>,
+        Rc<Cell<usize>>,
+    ) {
+        let pref_config = Config {
+            activity_source: source,
+            ..Config::default()
+        };
+        let reads = Rc::new(Cell::new(0));
+        let fault = std::sync::Arc::new(crate::activity_source::ActivityFault::new());
+        f.observer.install_activity(
+            std::sync::Arc::new(crate::activity_prefs::ActivityPrefs::new(&pref_config)),
+            std::sync::Arc::clone(&fault),
+            std::sync::Arc::new(std::sync::Mutex::new(
+                crate::activity_source::CapabilityStatus::default(),
+            )),
+            Box::new(CountingForeground {
+                reads: reads.clone(),
+                title_reads: Rc::new(Cell::new(0)),
+                app: "Notes".into(),
+            }),
+            String::new(),
+        );
+        f.observer.config.activity_only = true;
+        (fault, reads)
+    }
+
+    fn activity_jsonl_paths(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        let captures = root.join("captures");
+        if !captures.exists() {
+            return found;
+        }
+        for day in fs::read_dir(&captures).unwrap().flatten() {
+            for stream in fs::read_dir(day.path()).unwrap().flatten() {
+                for segment in fs::read_dir(stream.path()).unwrap().flatten() {
+                    if segment.path().is_dir() {
+                        for file in fs::read_dir(segment.path()).unwrap().flatten() {
+                            let name = file.file_name().to_string_lossy().into_owned();
+                            if name.ends_with("_desktop_activity.jsonl") {
+                                found.push(file.path());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn activity_only_source_off_skips_video_and_writes_no_file() {
+        let mut f = fixture(false);
+        let (_fault, reads) = install_notes(&mut f, false);
+        initialize(&mut f);
+        f.observer.shutdown().unwrap();
+        assert_eq!(f.starts.get(), 0);
+        assert_eq!(reads.get(), 0);
+        assert!(activity_jsonl_paths(f.observer.config.base_dir.as_path()).is_empty());
+    }
+
+    #[test]
+    fn activity_only_closed_row_is_a_stable_activity_file() {
+        let mut f = fixture(false);
+        let (_fault, reads) = install_notes(&mut f, true);
+        initialize(&mut f);
+        assert_eq!(f.starts.get(), 0);
+        assert!(activity_jsonl_paths(f.observer.config.base_dir.as_path()).is_empty());
+        f.observer.shutdown().unwrap();
+        assert_eq!(f.starts.get(), 0);
+        assert!(reads.get() >= 1);
+        let files = activity_jsonl_paths(f.observer.config.base_dir.as_path());
+        assert_eq!(files.len(), 1);
+        let name = files[0].file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.contains("_desktop_activity.jsonl"));
+        assert!(
+            !files[0]
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(".incomplete")
+        );
+        let text = fs::read_to_string(&files[0]).unwrap();
+        assert!(text.contains("Notes"));
+        assert!(text.contains("\"v\":1"));
+        assert!(text.contains("desktop_activity"));
+        assert!(!text.contains("pairing_id"));
+    }
+
+    #[test]
+    fn activity_write_failure_sets_payload_free_fault() {
+        let mut f = fixture(false);
+        let (fault, _reads) = install_notes(&mut f, true);
+        initialize(&mut f);
+        let dir = f.observer.config.base_dir.join("221320.incomplete");
+        fs::create_dir_all(&dir).unwrap();
+        let mut perms = fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&dir, perms).unwrap();
+        f.observer.state.segment_dir = Some(dir.clone());
+        let result = f.observer.shutdown();
+        if dir.exists() {
+            let mut perms = fs::metadata(&dir).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&dir, perms).unwrap();
+        }
+        result.unwrap();
+        assert_eq!(
+            fault.token().as_deref(),
+            Some(crate::activity_source::ACTIVITY_FAULT)
+        );
+        assert!(activity_jsonl_paths(f.observer.config.base_dir.as_path()).is_empty());
     }
 }

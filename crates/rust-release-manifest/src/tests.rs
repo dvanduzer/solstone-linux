@@ -396,7 +396,7 @@ fn package_payload_authority_matches_both_manifest_dialects() {
         .collect::<Vec<_>>();
     assert_eq!(deb, rpm);
     assert_eq!(deb, expected);
-    assert_eq!(expected.len(), 22);
+    assert_eq!(expected.len(), 26);
 }
 
 fn audit_fixture_bytes(
@@ -422,6 +422,9 @@ fn audit_fixture_bytes(
             include_bytes!("../../../RUST_DEPENDENCY_NOTICES.txt").to_vec()
         }
         crate::package_audit::PayloadRole::Icon => {
+            format!("audit fixture {}\n", authority.source).into_bytes()
+        }
+        crate::package_audit::PayloadRole::ActivityHelper => {
             format!("audit fixture {}\n", authority.source).into_bytes()
         }
     }
@@ -463,6 +466,9 @@ fn audit_tar_with_payload(
                 "share/icons/{}",
                 authority.source.strip_prefix("contrib/icons/").unwrap()
             ),
+            crate::package_audit::PayloadRole::ActivityHelper => {
+                crate::package_audit::activity_helper_archive_path(authority.source)
+            }
         };
         let member = format!("solstone-linux-1.0.0-linux-x86_64/{relative}");
         let (bytes, mode) = options
@@ -852,6 +858,9 @@ fn package_audit_real_artifacts_cover_payload_rejection_matrix() {
                                 .strip_prefix("contrib/icons/")
                                 .map(|path| format!("share/icons/{path}"))
                                 .unwrap(),
+                            PayloadRole::ActivityHelper => {
+                                crate::package_audit::activity_helper_archive_path(authority.source)
+                            }
                         },
                         _ => authority.installed.trim_start_matches('/').to_owned(),
                     };
@@ -877,6 +886,9 @@ fn package_audit_real_artifacts_cover_payload_rejection_matrix() {
                                 "RUST_DEPENDENCY_NOTICES.txt".to_owned()
                             }
                             PayloadRole::Icon => unreachable!(),
+                            PayloadRole::ActivityHelper => {
+                                crate::package_audit::activity_helper_archive_path(authority.source)
+                            }
                         },
                         _ => authority.installed.trim_start_matches('/').to_owned(),
                     };

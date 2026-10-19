@@ -1019,6 +1019,40 @@ fn create_journal_page(
     (scrolled, update)
 }
 
+fn split_exclusion_list(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn join_exclusion_list(items: &[String]) -> String {
+    items.join(", ")
+}
+
+fn activity_route_line(
+    status: Option<&solstone_linux::window_control::RouteStatusModel>,
+) -> String {
+    let route = status
+        .and_then(|item| item.route.clone())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "unavailable".into());
+    let foreground = status
+        .map(|item| item.foreground.as_str())
+        .unwrap_or("unavailable");
+    let title = status
+        .map(|item| item.title.as_str())
+        .unwrap_or("unavailable");
+    let url = status
+        .map(|item| item.url.as_str())
+        .unwrap_or("unavailable");
+    let idle = status
+        .map(|item| item.idle.as_str())
+        .unwrap_or("unavailable");
+    format!("{route}; foreground {foreground}; title {title}; url {url}; idle {idle}")
+}
+
 fn create_settings_page(
     controller: Rc<RefCell<Controller>>,
     changed: Changed,
@@ -1055,6 +1089,50 @@ fn create_settings_page(
     let segment_entry = gtk::Entry::new();
     let segment_help = gtk::Label::new(Some(CopyKey::SettingsSegmentHelp.as_str()));
     segment_help.set_halign(gtk::Align::Start);
+
+    let activity_explain = gtk::Label::new(Some(CopyKey::SettingsActivityExplain.as_str()));
+    activity_explain.set_halign(gtk::Align::Start);
+    activity_explain.set_wrap(true);
+    let activity_source_switch = gtk::Switch::new();
+    activity_source_switch.set_halign(gtk::Align::Start);
+    let activity_source_label = gtk::Label::new(Some(CopyKey::SettingsActivitySource.as_str()));
+    activity_source_label.set_halign(gtk::Align::Start);
+    activity_source_label.set_mnemonic_widget(Some(&activity_source_switch));
+    let activity_titles_switch = gtk::Switch::new();
+    activity_titles_switch.set_halign(gtk::Align::Start);
+    let activity_titles_label = gtk::Label::new(Some(CopyKey::SettingsActivityTitles.as_str()));
+    activity_titles_label.set_halign(gtk::Align::Start);
+    activity_titles_label.set_mnemonic_widget(Some(&activity_titles_switch));
+    let activity_urls_switch = gtk::Switch::new();
+    activity_urls_switch.set_halign(gtk::Align::Start);
+    let activity_urls_label = gtk::Label::new(Some(CopyKey::SettingsActivityUrls.as_str()));
+    activity_urls_label.set_halign(gtk::Align::Start);
+    activity_urls_label.set_mnemonic_widget(Some(&activity_urls_switch));
+    let activity_exclude_apps_entry = gtk::Entry::new();
+    let activity_exclude_apps_label =
+        gtk::Label::new(Some(CopyKey::SettingsActivityExcludeApps.as_str()));
+    activity_exclude_apps_label.set_halign(gtk::Align::Start);
+    activity_exclude_apps_label.set_mnemonic_widget(Some(&activity_exclude_apps_entry));
+    let activity_exclude_titles_entry = gtk::Entry::new();
+    let activity_exclude_titles_label =
+        gtk::Label::new(Some(CopyKey::SettingsActivityExcludeTitles.as_str()));
+    activity_exclude_titles_label.set_halign(gtk::Align::Start);
+    activity_exclude_titles_label.set_mnemonic_widget(Some(&activity_exclude_titles_entry));
+    let activity_only_switch = gtk::Switch::new();
+    activity_only_switch.set_halign(gtk::Align::Start);
+    let activity_only_label = gtk::Label::new(Some(CopyKey::SettingsActivityOnly.as_str()));
+    activity_only_label.set_halign(gtk::Align::Start);
+    activity_only_label.set_mnemonic_widget(Some(&activity_only_switch));
+    let activity_only_help = gtk::Label::new(Some(CopyKey::SettingsActivityOnlyHelp.as_str()));
+    activity_only_help.set_halign(gtk::Align::Start);
+    activity_only_help.set_wrap(true);
+    let activity_private_note =
+        gtk::Label::new(Some(CopyKey::SettingsActivityPrivateWindowsNote.as_str()));
+    activity_private_note.set_halign(gtk::Align::Start);
+    activity_private_note.set_wrap(true);
+    let activity_route_label = gtk::Label::new(Some(CopyKey::SettingsActivityRoute.as_str()));
+    activity_route_label.set_halign(gtk::Align::Start);
+    activity_route_label.set_wrap(true);
 
     let save_button = gtk::Button::with_label(CopyKey::SettingsSave.as_str());
     save_button.set_halign(gtk::Align::Start);
@@ -1103,6 +1181,22 @@ fn create_settings_page(
     form_box.append(&segment_label);
     form_box.append(&segment_entry);
     form_box.append(&segment_help);
+    form_box.append(&activity_explain);
+    form_box.append(&activity_source_label);
+    form_box.append(&activity_source_switch);
+    form_box.append(&activity_titles_label);
+    form_box.append(&activity_titles_switch);
+    form_box.append(&activity_urls_label);
+    form_box.append(&activity_urls_switch);
+    form_box.append(&activity_exclude_apps_label);
+    form_box.append(&activity_exclude_apps_entry);
+    form_box.append(&activity_exclude_titles_label);
+    form_box.append(&activity_exclude_titles_entry);
+    form_box.append(&activity_only_label);
+    form_box.append(&activity_only_switch);
+    form_box.append(&activity_only_help);
+    form_box.append(&activity_private_note);
+    form_box.append(&activity_route_label);
     form_box.append(&save_button);
     form_box.append(&saved_banner);
     form_box.append(&restart_needed_label);
@@ -1172,6 +1266,85 @@ fn create_settings_page(
         });
     }
 
+    {
+        let ctrl = Rc::clone(&controller);
+        let rendering = Rc::clone(&rendering);
+        activity_source_switch.connect_state_set(move |_, state| {
+            if !rendering.get() {
+                let mut c = ctrl.borrow_mut();
+                c.settings_draft.activity_source = Some(state);
+                c.settings_draft.activity_source_dirty =
+                    !c.document.saved_available || state != c.document.settings.activity_source;
+            }
+            glib::Propagation::Proceed
+        });
+    }
+    {
+        let ctrl = Rc::clone(&controller);
+        let rendering = Rc::clone(&rendering);
+        activity_titles_switch.connect_state_set(move |_, state| {
+            if !rendering.get() {
+                let mut c = ctrl.borrow_mut();
+                c.settings_draft.activity_titles = Some(state);
+                c.settings_draft.activity_titles_dirty =
+                    !c.document.saved_available || state != c.document.settings.activity_titles;
+            }
+            glib::Propagation::Proceed
+        });
+    }
+    {
+        let ctrl = Rc::clone(&controller);
+        let rendering = Rc::clone(&rendering);
+        activity_urls_switch.connect_state_set(move |_, state| {
+            if !rendering.get() {
+                let mut c = ctrl.borrow_mut();
+                c.settings_draft.activity_urls = Some(state);
+                c.settings_draft.activity_urls_dirty =
+                    !c.document.saved_available || state != c.document.settings.activity_urls;
+            }
+            glib::Propagation::Proceed
+        });
+    }
+    {
+        let ctrl = Rc::clone(&controller);
+        let rendering = Rc::clone(&rendering);
+        activity_only_switch.connect_state_set(move |_, state| {
+            if !rendering.get() {
+                let mut c = ctrl.borrow_mut();
+                c.settings_draft.activity_only = Some(state);
+                c.settings_draft.activity_only_dirty =
+                    !c.document.saved_available || state != c.document.settings.activity_only;
+            }
+            glib::Propagation::Proceed
+        });
+    }
+    {
+        let ctrl = Rc::clone(&controller);
+        let rendering = Rc::clone(&rendering);
+        activity_exclude_apps_entry.connect_changed(move |entry| {
+            if !rendering.get() {
+                let mut c = ctrl.borrow_mut();
+                let parsed = split_exclusion_list(&entry.text());
+                c.settings_draft.activity_exclude_apps_dirty = !c.document.saved_available
+                    || parsed != c.document.settings.activity_exclude_apps;
+                c.settings_draft.activity_exclude_apps = Some(parsed);
+            }
+        });
+    }
+    {
+        let ctrl = Rc::clone(&controller);
+        let rendering = Rc::clone(&rendering);
+        activity_exclude_titles_entry.connect_changed(move |entry| {
+            if !rendering.get() {
+                let mut c = ctrl.borrow_mut();
+                let parsed = split_exclusion_list(&entry.text());
+                c.settings_draft.activity_exclude_titles_dirty = !c.document.saved_available
+                    || parsed != c.document.settings.activity_exclude_titles;
+                c.settings_draft.activity_exclude_titles = Some(parsed);
+            }
+        });
+    }
+
     let update: Rc<dyn Fn()> = {
         let ctrl = Rc::clone(&controller);
         let rendering = Rc::clone(&rendering);
@@ -1183,6 +1356,16 @@ fn create_settings_page(
         let cursor_switch = cursor_switch.clone();
         let start_paused_switch = start_paused_switch.clone();
         let segment_entry = segment_entry.clone();
+        let activity_source_switch = activity_source_switch.clone();
+        let activity_titles_switch = activity_titles_switch.clone();
+        let activity_urls_switch = activity_urls_switch.clone();
+        let activity_exclude_apps_entry = activity_exclude_apps_entry.clone();
+        let activity_exclude_titles_entry = activity_exclude_titles_entry.clone();
+        let activity_only_switch = activity_only_switch.clone();
+        let activity_route_label = activity_route_label.clone();
+        let framerate_entry_for_mode = framerate_entry.clone();
+        let cursor_switch_for_mode = cursor_switch.clone();
+        let segment_entry_for_mode = segment_entry.clone();
         let saved_banner = saved_banner.clone();
         let restart_needed_label = restart_needed_label.clone();
         let restart_detail_label = restart_detail_label.clone();
@@ -1195,10 +1378,23 @@ fn create_settings_page(
                 cursor_dirty,
                 start_paused_dirty,
                 segment_dirty,
+                activity_source_dirty,
+                activity_titles_dirty,
+                activity_urls_dirty,
+                activity_exclude_apps_dirty,
+                activity_exclude_titles_dirty,
+                activity_only_dirty,
                 saved_framerate,
                 saved_cursor,
                 saved_start_paused,
                 saved_segment,
+                saved_activity_source,
+                saved_activity_titles,
+                saved_activity_urls,
+                saved_exclude_apps,
+                saved_exclude_titles,
+                saved_activity_only,
+                route_line,
                 write_failed,
                 write_uncertain,
                 waiting_read,
@@ -1221,10 +1417,23 @@ fn create_settings_page(
                     c.settings_draft.cursor_dirty,
                     c.settings_draft.start_paused_dirty,
                     c.settings_draft.segment_dirty,
+                    c.settings_draft.activity_source_dirty,
+                    c.settings_draft.activity_titles_dirty,
+                    c.settings_draft.activity_urls_dirty,
+                    c.settings_draft.activity_exclude_apps_dirty,
+                    c.settings_draft.activity_exclude_titles_dirty,
+                    c.settings_draft.activity_only_dirty,
                     c.document.settings.capture_framerate,
                     c.document.settings.draw_cursor,
                     c.document.settings.start_paused,
                     c.document.settings.segment_interval,
+                    c.document.settings.activity_source,
+                    c.document.settings.activity_titles,
+                    c.document.settings.activity_urls,
+                    c.document.settings.activity_exclude_apps.clone(),
+                    c.document.settings.activity_exclude_titles.clone(),
+                    c.document.settings.activity_only,
+                    activity_route_line(c.document.route_status.as_ref()),
                     c.settings_draft.write_failed,
                     c.settings_draft.write_uncertain,
                     c.settings_draft.waiting_confirming_read,
@@ -1265,6 +1474,42 @@ fn create_settings_page(
                 {
                     segment_entry.set_text(&format_integer(saved_segment));
                 }
+                if !activity_source_dirty && !activity_source_switch.has_focus() {
+                    activity_source_switch.set_state(saved_activity_source);
+                }
+                if !activity_titles_dirty && !activity_titles_switch.has_focus() {
+                    activity_titles_switch.set_state(saved_activity_titles);
+                }
+                if !activity_urls_dirty && !activity_urls_switch.has_focus() {
+                    activity_urls_switch.set_state(saved_activity_urls);
+                }
+                if !activity_exclude_apps_dirty
+                    && !activity_exclude_apps_entry
+                        .state_flags()
+                        .contains(gtk::StateFlags::FOCUS_WITHIN)
+                {
+                    activity_exclude_apps_entry.set_text(&join_exclusion_list(&saved_exclude_apps));
+                }
+                if !activity_exclude_titles_dirty
+                    && !activity_exclude_titles_entry
+                        .state_flags()
+                        .contains(gtk::StateFlags::FOCUS_WITHIN)
+                {
+                    activity_exclude_titles_entry
+                        .set_text(&join_exclusion_list(&saved_exclude_titles));
+                }
+                if !activity_only_dirty && !activity_only_switch.has_focus() {
+                    activity_only_switch.set_state(saved_activity_only);
+                }
+                let activity_only_selected = if activity_only_dirty {
+                    activity_only_switch.state()
+                } else {
+                    saved_activity_only
+                };
+                framerate_entry_for_mode.set_sensitive(!activity_only_selected);
+                cursor_switch_for_mode.set_sensitive(!activity_only_selected);
+                segment_entry_for_mode.set_sensitive(!activity_only_selected);
+                activity_route_label.set_text(&route_line);
 
                 saved_banner.set_visible(keys.saved_banner.is_some());
                 restart_needed_label.set_visible(keys.restart_needed.is_some());
@@ -1372,7 +1617,7 @@ fn create_settings_page(
             match res {
                 Ok(mut settings) => {
                     error_label.set_visible(false);
-                    let writes = ctrl.borrow().settings_draft.changed_writes();
+                    let writes = ctrl.borrow().settings_draft.changed_writes(&ctrl.borrow().document.settings);
                     if writes.is_empty() {
                         return;
                     }

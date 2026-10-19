@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use crate::desktop_session::DesktopKind;
 use crate::observer::{ActivityProbe, ActivityState};
 
 pub const DBUS_TIMEOUT: Duration = Duration::from_secs(2);
@@ -386,6 +387,34 @@ pub struct BoundBackends {
 }
 
 impl BoundBackends {
+    pub fn lock_signal(self) -> Option<&'static str> {
+        for (yes, name) in [
+            (self.fdo_lock, "org.freedesktop.ScreenSaver"),
+            (self.gnome_lock, "org.gnome.ScreenSaver"),
+            (self.cinnamon_lock, "org.cinnamon.ScreenSaver"),
+            (self.xfce_lock, "org.xfce.ScreenSaver"),
+            (self.mate_lock, "org.mate.ScreenSaver"),
+            (self.logind_lock, "logind LockedHint"),
+        ] {
+            if yes {
+                return Some(name);
+            }
+        }
+        None
+    }
+
+    pub fn idle_signal(self) -> Option<&'static str> {
+        if self.wayland_idle {
+            Some("ext-idle-notify-v1")
+        } else if self.mutter_idle {
+            Some("Mutter IdleMonitor")
+        } else if self.x11_idle {
+            Some("XScreenSaver")
+        } else {
+            None
+        }
+    }
+
     fn any_lock(self) -> bool {
         self.fdo_lock
             || self.gnome_lock
@@ -479,12 +508,24 @@ pub fn state(lock: bool, power: PowerObservation, user_idle: bool) -> ActivitySt
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ActivityFacts {
+    pub bound: BoundBackends,
+    pub kind: Option<DesktopKind>,
+    pub display: Option<String>,
+}
+
 pub trait ActivityOps: Send + 'static {
     fn probe_once(&mut self) -> (ActivityState, BoundBackends);
+
+    fn desktop_facts(&self) -> (Option<DesktopKind>, Option<String>) {
+        (None, None)
+    }
 }
 
 pub struct CompositeActivityProbe {
     latest: Arc<Mutex<ActivityState>>,
+    facts: Arc<Mutex<ActivityFacts>>,
 }
 
 impl CompositeActivityProbe {
@@ -492,19 +533,22 @@ impl CompositeActivityProbe {
         let desktop = env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
         let session_type = env::var("XDG_SESSION_TYPE").unwrap_or_default();
         let latest = Arc::new(Mutex::new(ActivityState::default()));
+        let facts = Arc::new(Mutex::new(ActivityFacts::default()));
         let worker_latest = Arc::clone(&latest);
+        let worker_facts = Arc::clone(&facts);
         if let Err(error) = thread::Builder::new()
             .name("solstone-activity".into())
             .spawn(move || {
                 run_worker(
                     dbus::NativeActivitySources::new(desktop, session_type),
                     worker_latest,
+                    worker_facts,
                 )
             })
         {
             tracing::warn!(%error, "could not start activity worker; defaulting to active");
         }
-        Self { latest }
+        Self { latest, facts }
     }
 
     /// Activity that follows the session `follower` resolves, starting from `initial`
@@ -516,36 +560,55 @@ impl CompositeActivityProbe {
         let desktop = env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
         let session_type = env::var("XDG_SESSION_TYPE").unwrap_or_default();
         let latest = Arc::new(Mutex::new(initial));
+        let facts = Arc::new(Mutex::new(ActivityFacts::default()));
         let worker_latest = Arc::clone(&latest);
+        let worker_facts = Arc::clone(&facts);
         if let Err(error) = thread::Builder::new()
             .name("solstone-activity".into())
             .spawn(move || {
                 run_worker(
                     dbus::NativeActivitySources::following(desktop, session_type, follower),
                     worker_latest,
+                    worker_facts,
                 )
             })
         {
             tracing::warn!(%error, "could not start activity worker; defaulting to active");
         }
-        Self { latest }
+        Self { latest, facts }
     }
 
     pub fn spawn_with_ops<O: ActivityOps>(ops: O) -> Self {
         let latest = Arc::new(Mutex::new(ActivityState::default()));
+        let facts = Arc::new(Mutex::new(ActivityFacts::default()));
         let worker_latest = Arc::clone(&latest);
+        let worker_facts = Arc::clone(&facts);
         let _ = thread::Builder::new()
             .name("solstone-activity".into())
-            .spawn(move || run_worker(ops, worker_latest));
-        Self { latest }
+            .spawn(move || run_worker(ops, worker_latest, worker_facts));
+        Self { latest, facts }
+    }
+
+    pub fn facts(&self) -> ActivityFacts {
+        self.facts.lock().expect("activity facts lock").clone()
     }
 }
 
-fn run_worker(mut ops: impl ActivityOps, latest: Arc<Mutex<ActivityState>>) {
+fn run_worker(
+    mut ops: impl ActivityOps,
+    latest: Arc<Mutex<ActivityState>>,
+    facts: Arc<Mutex<ActivityFacts>>,
+) {
     let mut reported = false;
     loop {
         let (next, bound) = ops.probe_once();
+        let (kind, display) = ops.desktop_facts();
         *latest.lock().expect("activity state lock") = next;
+        *facts.lock().expect("activity facts lock") = ActivityFacts {
+            bound,
+            kind,
+            display,
+        };
         if !reported {
             let (lines, always_capture) = startup_report(&bound);
             for line in lines {
@@ -565,6 +628,10 @@ impl ActivityProbe for CompositeActivityProbe {
     /// is reserved for a future probe-wide failure and is practically unused.
     fn probe(&mut self) -> Result<ActivityState, String> {
         Ok(*self.latest.lock().expect("activity state lock"))
+    }
+
+    fn activity_facts(&self) -> ActivityFacts {
+        self.facts()
     }
 }
 

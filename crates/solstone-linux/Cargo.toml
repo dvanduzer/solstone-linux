@@ -41,6 +41,7 @@ notify-rust = { version = "=4.18.0", default-features = false, features = ["z-wi
 zbus = { version = "=5.17.0", features = ["tokio"] }
 sd-notify = "0.5.0"
 native-browser-frame = { version = "1.0.0", path = "../../vendor/crates/native-browser-frame" }
+url = "=2.5.8"
 
 [features]
 default = ["browser"]
@@ -114,6 +115,10 @@ assets = [
     ["../../contrib/icons/hicolor/scalable/status/solstone-syncing.svg", "usr/share/icons/hicolor/scalable/status/solstone-syncing.svg", "644"],
     ["../../contrib/icons/hicolor/scalable/status/solstone-attention.svg", "usr/share/icons/hicolor/scalable/status/solstone-attention.svg", "644"],
     ["../../contrib/icons/hicolor/scalable/status/solstone-offline.svg", "usr/share/icons/hicolor/scalable/status/solstone-offline.svg", "644"],
+    ["../../packaging/activity-helpers/solstone-activity@solpbc.org/metadata.json", "usr/share/solstone-linux/activity-helpers/solstone-activity@solpbc.org/metadata.json", "644"],
+    ["../../packaging/activity-helpers/solstone-activity@solpbc.org/extension.js", "usr/share/solstone-linux/activity-helpers/solstone-activity@solpbc.org/extension.js", "644"],
+    ["../../packaging/activity-helpers/solstone-activity-kwin/metadata.json", "usr/share/solstone-linux/activity-helpers/solstone-activity-kwin/metadata.json", "644"],
+    ["../../packaging/activity-helpers/solstone-activity-kwin/main.js", "usr/share/solstone-linux/activity-helpers/solstone-activity-kwin/main.js", "644"],
 ]
 
 # cargo-generate-rpm resolves sources from build-release.sh's workspace-root CWD
@@ -144,6 +149,10 @@ assets = [
     { source = "contrib/icons/hicolor/scalable/status/solstone-syncing.svg", dest = "/usr/share/icons/hicolor/scalable/status/solstone-syncing.svg", mode = "644" },
     { source = "contrib/icons/hicolor/scalable/status/solstone-attention.svg", dest = "/usr/share/icons/hicolor/scalable/status/solstone-attention.svg", mode = "644" },
     { source = "contrib/icons/hicolor/scalable/status/solstone-offline.svg", dest = "/usr/share/icons/hicolor/scalable/status/solstone-offline.svg", mode = "644" },
+    { source = "packaging/activity-helpers/solstone-activity@solpbc.org/metadata.json", dest = "/usr/share/solstone-linux/activity-helpers/solstone-activity@solpbc.org/metadata.json", mode = "644" },
+    { source = "packaging/activity-helpers/solstone-activity@solpbc.org/extension.js", dest = "/usr/share/solstone-linux/activity-helpers/solstone-activity@solpbc.org/extension.js", mode = "644" },
+    { source = "packaging/activity-helpers/solstone-activity-kwin/metadata.json", dest = "/usr/share/solstone-linux/activity-helpers/solstone-activity-kwin/metadata.json", mode = "644" },
+    { source = "packaging/activity-helpers/solstone-activity-kwin/main.js", dest = "/usr/share/solstone-linux/activity-helpers/solstone-activity-kwin/main.js", mode = "644" },
 ]
 
 # On rpm the conditional IS expressible, so it is used: dnf and zypper honour weak

@@ -48,6 +48,18 @@ pub struct SettingsDraft {
     pub start_paused_dirty: bool,
     pub segment: Option<i64>,
     pub segment_dirty: bool,
+    pub activity_source: Option<bool>,
+    pub activity_source_dirty: bool,
+    pub activity_titles: Option<bool>,
+    pub activity_titles_dirty: bool,
+    pub activity_urls: Option<bool>,
+    pub activity_urls_dirty: bool,
+    pub activity_exclude_apps: Option<Vec<String>>,
+    pub activity_exclude_apps_dirty: bool,
+    pub activity_exclude_titles: Option<Vec<String>>,
+    pub activity_exclude_titles_dirty: bool,
+    pub activity_only: Option<bool>,
+    pub activity_only_dirty: bool,
     pub in_flight: Option<InFlight<SettingsModel>>,
     pub saved_verified: bool,
     pub write_failed: bool,
@@ -66,10 +78,19 @@ pub enum SettingsWriteOutcome {
 
 impl SettingsDraft {
     pub fn is_dirty(&self) -> bool {
-        self.framerate_dirty || self.cursor_dirty || self.start_paused_dirty || self.segment_dirty
+        self.framerate_dirty
+            || self.cursor_dirty
+            || self.start_paused_dirty
+            || self.segment_dirty
+            || self.activity_source_dirty
+            || self.activity_titles_dirty
+            || self.activity_urls_dirty
+            || self.activity_exclude_apps_dirty
+            || self.activity_exclude_titles_dirty
+            || self.activity_only_dirty
     }
 
-    pub fn changed_writes(&self) -> Vec<(&'static str, String)> {
+    pub fn changed_writes(&self, baseline: &SettingsModel) -> Vec<(&'static str, String)> {
         let mut writes = Vec::new();
         if self.framerate_dirty
             && let Some(val) = self.framerate
@@ -91,6 +112,55 @@ impl SettingsDraft {
         {
             writes.push(("segment_interval", val.to_string()));
         }
+        let activity_dirty = self.activity_source_dirty
+            || self.activity_titles_dirty
+            || self.activity_urls_dirty
+            || self.activity_exclude_apps_dirty
+            || self.activity_exclude_titles_dirty;
+        if activity_dirty {
+            let source = if self.activity_source_dirty {
+                self.activity_source.unwrap_or(baseline.activity_source)
+            } else {
+                baseline.activity_source
+            };
+            let titles = if self.activity_titles_dirty {
+                self.activity_titles.unwrap_or(baseline.activity_titles)
+            } else {
+                baseline.activity_titles
+            };
+            let urls = if self.activity_urls_dirty {
+                self.activity_urls.unwrap_or(baseline.activity_urls)
+            } else {
+                baseline.activity_urls
+            };
+            let exclude_apps = if self.activity_exclude_apps_dirty {
+                self.activity_exclude_apps
+                    .clone()
+                    .unwrap_or_else(|| baseline.activity_exclude_apps.clone())
+            } else {
+                baseline.activity_exclude_apps.clone()
+            };
+            let exclude_titles = if self.activity_exclude_titles_dirty {
+                self.activity_exclude_titles
+                    .clone()
+                    .unwrap_or_else(|| baseline.activity_exclude_titles.clone())
+            } else {
+                baseline.activity_exclude_titles.clone()
+            };
+            let policy = serde_json::json!({
+                "activity_source": source,
+                "activity_titles": titles,
+                "activity_urls": urls,
+                "activity_exclude_apps": exclude_apps,
+                "activity_exclude_titles": exclude_titles,
+            });
+            writes.push(("activity_policy", policy.to_string()));
+        }
+        if self.activity_only_dirty
+            && let Some(val) = self.activity_only
+        {
+            writes.push(("activity_only", val.to_string()));
+        }
         writes
     }
 
@@ -100,6 +170,32 @@ impl SettingsDraft {
             "draw_cursor" => settings.draw_cursor.to_string() == *expected,
             "start_paused" => settings.start_paused.to_string() == *expected,
             "segment_interval" => settings.segment_interval.to_string() == *expected,
+            "activity_only" => settings.activity_only.to_string() == *expected,
+            "activity_policy" => {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(expected) {
+                    val.get("activity_source")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(settings.activity_source)
+                        && val
+                            .get("activity_titles")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(settings.activity_titles)
+                        && val
+                            .get("activity_urls")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(settings.activity_urls)
+                        && val
+                            .get("activity_exclude_apps")
+                            .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+                            == Some(settings.activity_exclude_apps.clone())
+                        && val
+                            .get("activity_exclude_titles")
+                            .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+                            == Some(settings.activity_exclude_titles.clone())
+                } else {
+                    false
+                }
+            }
             _ => false,
         })
     }
@@ -331,7 +427,7 @@ impl Controller {
     pub fn start_settings_save(&mut self, bus_owner: &str, settings: SettingsModel) -> u64 {
         self.restart_verified = false;
         let id = self.alloc_id();
-        self.settings_draft.requested_writes = self.settings_draft.changed_writes();
+        self.settings_draft.requested_writes = self.settings_draft.changed_writes(&settings);
         self.settings_draft.in_flight = Some(InFlight {
             id,
             bus_owner: bus_owner.to_string(),
@@ -492,6 +588,42 @@ impl Controller {
                 && val == self.document.settings.segment_interval
             {
                 self.settings_draft.segment_dirty = false;
+            }
+            if self.settings_draft.activity_source_dirty
+                && let Some(val) = self.settings_draft.activity_source
+                && val == self.document.settings.activity_source
+            {
+                self.settings_draft.activity_source_dirty = false;
+            }
+            if self.settings_draft.activity_titles_dirty
+                && let Some(val) = self.settings_draft.activity_titles
+                && val == self.document.settings.activity_titles
+            {
+                self.settings_draft.activity_titles_dirty = false;
+            }
+            if self.settings_draft.activity_urls_dirty
+                && let Some(val) = self.settings_draft.activity_urls
+                && val == self.document.settings.activity_urls
+            {
+                self.settings_draft.activity_urls_dirty = false;
+            }
+            if self.settings_draft.activity_exclude_apps_dirty
+                && let Some(ref val) = self.settings_draft.activity_exclude_apps
+                && val == &self.document.settings.activity_exclude_apps
+            {
+                self.settings_draft.activity_exclude_apps_dirty = false;
+            }
+            if self.settings_draft.activity_exclude_titles_dirty
+                && let Some(ref val) = self.settings_draft.activity_exclude_titles
+                && val == &self.document.settings.activity_exclude_titles
+            {
+                self.settings_draft.activity_exclude_titles_dirty = false;
+            }
+            if self.settings_draft.activity_only_dirty
+                && let Some(val) = self.settings_draft.activity_only
+                && val == self.document.settings.activity_only
+            {
+                self.settings_draft.activity_only_dirty = false;
             }
         }
 
@@ -789,6 +921,12 @@ mod tests {
                 draw_cursor: true,
                 start_paused: false,
                 segment_interval: 300,
+                activity_source: false,
+                activity_titles: false,
+                activity_urls: false,
+                activity_exclude_apps: Vec::new(),
+                activity_exclude_titles: Vec::new(),
+                activity_only: false,
             },
         )
     }
@@ -887,17 +1025,33 @@ mod tests {
         assert!(!controller.settings_draft.waiting_confirming_read);
     }
 
+    fn sample_baseline() -> SettingsModel {
+        SettingsModel {
+            capture_framerate: 1,
+            draw_cursor: true,
+            start_paused: false,
+            segment_interval: 300,
+            activity_source: false,
+            activity_titles: false,
+            activity_urls: false,
+            activity_exclude_apps: Vec::new(),
+            activity_exclude_titles: Vec::new(),
+            activity_only: false,
+        }
+    }
+
     #[test]
     fn test_changed_writes_contains_only_dirty_fields() {
+        let baseline = sample_baseline();
         let mut draft = SettingsDraft::default();
-        assert!(draft.changed_writes().is_empty());
+        assert!(draft.changed_writes(&baseline).is_empty());
 
         draft.framerate = Some(8);
-        assert!(draft.changed_writes().is_empty()); // not dirty yet
+        assert!(draft.changed_writes(&baseline).is_empty()); // not dirty yet
 
         draft.framerate_dirty = true;
         assert_eq!(
-            draft.changed_writes(),
+            draft.changed_writes(&baseline),
             vec![("capture_framerate", "8".to_string())]
         );
 
@@ -909,13 +1063,62 @@ mod tests {
         draft.segment_dirty = true;
 
         assert_eq!(
-            draft.changed_writes(),
+            draft.changed_writes(&baseline),
             vec![
                 ("capture_framerate", "8".to_string()),
                 ("draw_cursor", "false".to_string()),
                 ("start_paused", "true".to_string()),
                 ("segment_interval", "15".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn test_changed_writes_activity_policy_merges_with_baseline() {
+        let baseline = SettingsModel {
+            capture_framerate: 1,
+            draw_cursor: true,
+            start_paused: false,
+            segment_interval: 300,
+            activity_source: false,
+            activity_titles: true,
+            activity_urls: false,
+            activity_exclude_apps: vec!["KeepMe".to_string()],
+            activity_exclude_titles: vec![],
+            activity_only: false,
+        };
+        let draft = SettingsDraft {
+            activity_source: Some(true),
+            activity_source_dirty: true,
+            ..SettingsDraft::default()
+        };
+
+        let writes = draft.changed_writes(&baseline);
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, "activity_policy");
+
+        let val: serde_json::Value = serde_json::from_str(&writes[0].1).unwrap();
+        assert_eq!(
+            val.get("activity_source").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            val.get("activity_titles").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            val.get("activity_urls").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            val.get("activity_exclude_apps")
+                .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok()),
+            Some(vec!["KeepMe".to_string()])
+        );
+        assert_eq!(
+            val.get("activity_exclude_titles")
+                .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok()),
+            Some(vec![])
         );
     }
 

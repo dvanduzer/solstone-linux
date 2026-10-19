@@ -70,6 +70,13 @@ pub struct DrainedChunk {
 }
 
 impl DrainedChunk {
+    pub fn silent() -> Self {
+        Self {
+            interleaved: Vec::new(),
+            report: PairingReport::default(),
+        }
+    }
+
     pub fn interleaved(&self) -> &[f32] {
         &self.interleaved
     }

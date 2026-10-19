@@ -43,6 +43,18 @@ pub struct Config {
     /// Whether the running app may offer to set up the GNOME panel icon. The owner
     /// turns this off from the offer itself, or by hand like every other key.
     pub panel_icon_offer: bool,
+    #[serde(default)]
+    pub activity_source: bool,
+    #[serde(default)]
+    pub activity_titles: bool,
+    #[serde(default)]
+    pub activity_urls: bool,
+    #[serde(default)]
+    pub activity_exclude_apps: Vec<String>,
+    #[serde(default)]
+    pub activity_exclude_titles: Vec<String>,
+    #[serde(default)]
+    pub activity_only: bool,
     #[serde(skip)]
     pub base_dir: PathBuf,
     #[serde(skip)]
@@ -72,6 +84,12 @@ impl Default for Config {
             draw_cursor: true,
             start_paused: false,
             panel_icon_offer: true,
+            activity_source: false,
+            activity_titles: false,
+            activity_urls: false,
+            activity_exclude_apps: Vec::new(),
+            activity_exclude_titles: Vec::new(),
+            activity_only: false,
             base_dir: home.join(".local/share/solstone-linux"),
             config_dir: config_dir_for(home, env::var_os("XDG_CONFIG_HOME").map(PathBuf::from)),
         }
@@ -172,6 +190,29 @@ fn load_int_list(
                 .or_else(|| item.as_f64().map(|value| value as i64))
                 .unwrap()
         })
+        .collect()
+}
+
+fn load_string_list(
+    values: &Map<String, Value>,
+    field: &'static str,
+    default: &[String],
+    warnings: &mut Vec<ConfigWarning>,
+) -> Vec<String> {
+    let Some(value) = values.get(field) else {
+        return default.to_vec();
+    };
+    let Some(items) = value.as_array() else {
+        warnings.push(warning(field, value, default));
+        return default.to_vec();
+    };
+    if !items.iter().all(Value::is_string) {
+        warnings.push(warning(field, value, default));
+        return default.to_vec();
+    }
+    items
+        .iter()
+        .filter_map(|item| item.as_str().map(String::from))
         .collect()
 }
 
@@ -286,6 +327,14 @@ fn load_resolved_config(mut config: Config) -> LoadedConfig {
     config.draw_cursor = json_truthy(values.get("draw_cursor"), true);
     config.start_paused = json_truthy(values.get("start_paused"), false);
     config.panel_icon_offer = json_truthy(values.get("panel_icon_offer"), true);
+    config.activity_source = json_truthy(values.get("activity_source"), false);
+    config.activity_titles = json_truthy(values.get("activity_titles"), false);
+    config.activity_urls = json_truthy(values.get("activity_urls"), false);
+    config.activity_exclude_apps =
+        load_string_list(values, "activity_exclude_apps", &[], &mut warnings);
+    config.activity_exclude_titles =
+        load_string_list(values, "activity_exclude_titles", &[], &mut warnings);
+    config.activity_only = json_truthy(values.get("activity_only"), false);
     LoadedConfig { config, warnings }
 }
 
@@ -450,6 +499,36 @@ fn write_config_merge(
     } else {
         true
     };
+    let mut activity_source = if merge_basis.is_some() {
+        json_truthy(map.get("activity_source"), false)
+    } else {
+        false
+    };
+    let mut activity_titles = if merge_basis.is_some() {
+        json_truthy(map.get("activity_titles"), false)
+    } else {
+        false
+    };
+    let mut activity_urls = if merge_basis.is_some() {
+        json_truthy(map.get("activity_urls"), false)
+    } else {
+        false
+    };
+    let mut activity_exclude_apps = if merge_basis.is_some() {
+        load_string_list(&map, "activity_exclude_apps", &[], &mut warnings)
+    } else {
+        Vec::new()
+    };
+    let mut activity_exclude_titles = if merge_basis.is_some() {
+        load_string_list(&map, "activity_exclude_titles", &[], &mut warnings)
+    } else {
+        Vec::new()
+    };
+    let mut activity_only = if merge_basis.is_some() {
+        json_truthy(map.get("activity_only"), false)
+    } else {
+        false
+    };
 
     let is_guided_field = matches!(overlay, ConfigOverlay::GuidedField(..));
 
@@ -460,6 +539,12 @@ fn write_config_merge(
             start_paused = snapshot.start_paused;
             panel_icon_offer = snapshot.panel_icon_offer;
             segment_interval = snapshot.segment_interval;
+            activity_source = snapshot.activity_source;
+            activity_titles = snapshot.activity_titles;
+            activity_urls = snapshot.activity_urls;
+            activity_exclude_apps = snapshot.activity_exclude_apps.clone();
+            activity_exclude_titles = snapshot.activity_exclude_titles.clone();
+            activity_only = snapshot.activity_only;
             if merge_basis.is_none() {
                 stream = snapshot.stream.clone();
                 sync_max_retries = snapshot.sync_max_retries;
@@ -510,6 +595,160 @@ fn write_config_merge(
                     segment_interval = n;
                     Value::Number(n.into())
                 }
+                "activity_source" => {
+                    let b = value.as_bool().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "invalid activity_source")
+                    })?;
+                    activity_source = b;
+                    Value::Bool(b)
+                }
+                "activity_titles" => {
+                    let b = value.as_bool().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "invalid activity_titles")
+                    })?;
+                    activity_titles = b;
+                    Value::Bool(b)
+                }
+                "activity_urls" => {
+                    let b = value.as_bool().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "invalid activity_urls")
+                    })?;
+                    activity_urls = b;
+                    Value::Bool(b)
+                }
+                "activity_only" => {
+                    let b = value.as_bool().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "invalid activity_only")
+                    })?;
+                    activity_only = b;
+                    Value::Bool(b)
+                }
+                "activity_exclude_apps" => {
+                    let arr = value.as_array().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "invalid activity_exclude_apps")
+                    })?;
+                    let mut items = Vec::new();
+                    for item in arr {
+                        let s = item.as_str().ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "invalid activity_exclude_apps entry",
+                            )
+                        })?;
+                        items.push(s.to_string());
+                    }
+                    activity_exclude_apps = items;
+                    Value::Array(arr.clone())
+                }
+                "activity_exclude_titles" => {
+                    let arr = value.as_array().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "invalid activity_exclude_titles",
+                        )
+                    })?;
+                    let mut items = Vec::new();
+                    for item in arr {
+                        let s = item.as_str().ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "invalid activity_exclude_titles entry",
+                            )
+                        })?;
+                        items.push(s.to_string());
+                    }
+                    activity_exclude_titles = items;
+                    Value::Array(arr.clone())
+                }
+                "activity_policy" => {
+                    let obj = value.as_object().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "invalid activity_policy")
+                    })?;
+                    let src = obj
+                        .get("activity_source")
+                        .and_then(Value::as_bool)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "missing activity_source in policy",
+                            )
+                        })?;
+                    let tit = obj
+                        .get("activity_titles")
+                        .and_then(Value::as_bool)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "missing activity_titles in policy",
+                            )
+                        })?;
+                    let url = obj
+                        .get("activity_urls")
+                        .and_then(Value::as_bool)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "missing activity_urls in policy",
+                            )
+                        })?;
+                    let apps_arr = obj
+                        .get("activity_exclude_apps")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "missing activity_exclude_apps in policy",
+                            )
+                        })?;
+                    let mut apps = Vec::new();
+                    for item in apps_arr {
+                        let s = item.as_str().ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "invalid activity_exclude_apps entry",
+                            )
+                        })?;
+                        apps.push(s.to_string());
+                    }
+                    let titles_arr = obj
+                        .get("activity_exclude_titles")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "missing activity_exclude_titles in policy",
+                            )
+                        })?;
+                    let mut titles = Vec::new();
+                    for item in titles_arr {
+                        let s = item.as_str().ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "invalid activity_exclude_titles entry",
+                            )
+                        })?;
+                        titles.push(s.to_string());
+                    }
+
+                    activity_source = src;
+                    activity_titles = tit;
+                    activity_urls = url;
+                    activity_exclude_apps = apps;
+                    activity_exclude_titles = titles;
+
+                    map.insert("activity_source".to_owned(), Value::Bool(src));
+                    map.insert("activity_titles".to_owned(), Value::Bool(tit));
+                    map.insert("activity_urls".to_owned(), Value::Bool(url));
+                    map.insert(
+                        "activity_exclude_apps".to_owned(),
+                        Value::Array(apps_arr.clone()),
+                    );
+                    map.insert(
+                        "activity_exclude_titles".to_owned(),
+                        Value::Array(titles_arr.clone()),
+                    );
+                    Value::Null
+                }
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -517,7 +756,9 @@ fn write_config_merge(
                     ));
                 }
             };
-            map.insert(key.to_owned(), normalized);
+            if key != "activity_policy" {
+                map.insert(key.to_owned(), normalized);
+            }
         }
         ConfigOverlay::Sanitize => {}
     }
@@ -532,6 +773,12 @@ fn write_config_merge(
         draw_cursor,
         start_paused,
         panel_icon_offer,
+        activity_source,
+        activity_titles,
+        activity_urls,
+        activity_exclude_apps: activity_exclude_apps.clone(),
+        activity_exclude_titles: activity_exclude_titles.clone(),
+        activity_only,
         base_dir: resolved.base_dir.clone(),
         config_dir: resolved.config_dir.clone(),
     };
@@ -565,6 +812,28 @@ fn write_config_merge(
         map.insert("draw_cursor".into(), Value::Bool(draw_cursor));
         map.insert("start_paused".into(), Value::Bool(start_paused));
         map.insert("panel_icon_offer".into(), Value::Bool(panel_icon_offer));
+        map.insert("activity_source".into(), Value::Bool(activity_source));
+        map.insert("activity_titles".into(), Value::Bool(activity_titles));
+        map.insert("activity_urls".into(), Value::Bool(activity_urls));
+        map.insert(
+            "activity_exclude_apps".into(),
+            Value::Array(
+                activity_exclude_apps
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+        map.insert(
+            "activity_exclude_titles".into(),
+            Value::Array(
+                activity_exclude_titles
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+        map.insert("activity_only".into(), Value::Bool(activity_only));
         serde_json::to_vec_pretty(&map).map_err(io::Error::other)?
     };
     bytes.push(b'\n');
@@ -1288,7 +1557,23 @@ mod tests {
         let c = Config::default();
         assert_eq!(
             serde_json::to_value(c).unwrap(),
-            json!({"stream":"","segment_interval":300,"sync_retry_delays":[5,30,120,300],"sync_max_retries":10,"sync_stale_threshold":600,"capture_framerate":1,"draw_cursor":true,"start_paused":false,"panel_icon_offer":true})
+            json!({
+                "stream": "",
+                "segment_interval": 300,
+                "sync_retry_delays": [5, 30, 120, 300],
+                "sync_max_retries": 10,
+                "sync_stale_threshold": 600,
+                "capture_framerate": 1,
+                "draw_cursor": true,
+                "start_paused": false,
+                "panel_icon_offer": true,
+                "activity_source": false,
+                "activity_titles": false,
+                "activity_urls": false,
+                "activity_exclude_apps": [],
+                "activity_exclude_titles": [],
+                "activity_only": false
+            })
         );
     }
     // numeric coercion rejects bool and truncates floats, including list elements.
@@ -1994,7 +2279,13 @@ mod tests {
                 "  \"capture_framerate\": 1,\n",
                 "  \"draw_cursor\": true,\n",
                 "  \"start_paused\": false,\n",
-                "  \"panel_icon_offer\": true\n",
+                "  \"panel_icon_offer\": true,\n",
+                "  \"activity_source\": false,\n",
+                "  \"activity_titles\": false,\n",
+                "  \"activity_urls\": false,\n",
+                "  \"activity_exclude_apps\": [],\n",
+                "  \"activity_exclude_titles\": [],\n",
+                "  \"activity_only\": false\n",
                 "}\n"
             )
         );

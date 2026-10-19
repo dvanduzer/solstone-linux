@@ -26,6 +26,7 @@ pub fn map_fault(model: &ControlModel) -> Option<CopyKey> {
         "owner-start-failed" | "owner-stop-failed" => CopyKey::PairingConfirmedUnavailable,
         "invalid-config" => CopyKey::SettingsLoadFailed,
         "invalid-setting" => CopyKey::SettingsSaveFailed,
+        "activity-write-failed" => CopyKey::ActivityWriteFailed,
         _ => CopyKey::StatusAttention,
     })
 }
@@ -622,6 +623,12 @@ mod tests {
             draw_cursor: false,
             start_paused: true,
             segment_interval: 1500,
+            activity_source: false,
+            activity_titles: false,
+            activity_urls: false,
+            activity_exclude_apps: Vec::new(),
+            activity_exclude_titles: Vec::new(),
+            activity_only: false,
         };
         assert_eq!(
             validate_settings_changes(&saved, None, None),
@@ -770,6 +777,12 @@ mod tests {
             draw_cursor: true,
             start_paused: false,
             segment_interval: 10,
+            activity_source: false,
+            activity_titles: false,
+            activity_urls: false,
+            activity_exclude_apps: Vec::new(),
+            activity_exclude_titles: Vec::new(),
+            activity_only: false,
         };
         let keys_unavailable = map_settings_state(false, &saved, None, false, true, false, false);
         assert_eq!(

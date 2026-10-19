@@ -21,9 +21,9 @@ use crate::{
     config::Config,
     desktop_session::{CaptureTarget, DesktopKind, SessionFollower, SharedTarget, native_resolver},
     observer::{
-        ActivityState, Backends, BackgroundCaptureStats, Clock, EventSink, Mode, Observer,
-        ObserverError, SegmentCompletedEvent, StateSnapshot, StoppedStream, VideoCapture,
-        VideoStream, WatchStateSink, lifecycle,
+        ActivityState, AudioCapture, Backends, BackgroundCaptureStats, Clock, EventSink, Mode,
+        MuteProbe, Observer, ObserverError, SegmentCompletedEvent, StateSnapshot, StoppedStream,
+        VideoCapture, VideoStream, WatchStateSink, lifecycle,
     },
     private_link::{
         PrivateLinkCapability, PrivateStateLock, load_credential,
@@ -273,9 +273,27 @@ fn run_capture(
         native_resolver().map_err(|error| ObserverError::Io(error.to_string()))?,
     );
     let first_target = follower.resolve();
-    let video = VideoBackend::new(&config, portal_startup_cancellation, follower.shared())
-        .map_err(ObserverError::VideoStart)?;
-    let (audio, mute) = PulseAudioCapture::spawn().map_err(ObserverError::Io)?;
+    let media = open_media_stack(
+        config.activity_only,
+        || {
+            VideoBackend::new(&config, portal_startup_cancellation, follower.shared())
+                .map_err(ObserverError::VideoStart)
+        },
+        || PulseAudioCapture::spawn().map_err(ObserverError::Io),
+    )?;
+    let (video, audio, mute) = match media {
+        Some((video, (audio, mute))) => (
+            CaptureVideo::Live(video),
+            CaptureAudio::Live(audio),
+            CaptureMute::Live(mute),
+        ),
+        None => (CaptureVideo::Idle, CaptureAudio::Idle, CaptureMute::Idle),
+    };
+    let activity_prefs = Arc::new(crate::activity_prefs::ActivityPrefs::new(&config));
+    let activity_fault = Arc::new(crate::activity_source::ActivityFault::new());
+    let activity_capability = Arc::new(Mutex::new(
+        crate::activity_source::CapabilityStatus::default(),
+    ));
     let clock = SystemClock::new();
     let upload = Arc::new(UploadClient::new(
         &config,
@@ -343,12 +361,19 @@ fn run_capture(
     let (linked_start, window_control) = if process_epoch.is_some() {
         let shutdown_notify = Arc::clone(&linked_shutdown_notify);
         let on_confirmed = Some(sync_trigger.clone());
-        let effective_settings = Some(crate::window_control::SettingsDocument {
-            capture_framerate: config.capture_framerate,
-            draw_cursor: config.draw_cursor,
-            start_paused: config.start_paused,
-            segment_interval: config.segment_interval,
-        });
+        let effective_settings =
+            Arc::new(Mutex::new(Some(crate::window_control::SettingsDocument {
+                capture_framerate: config.capture_framerate,
+                draw_cursor: config.draw_cursor,
+                start_paused: config.start_paused,
+                segment_interval: config.segment_interval,
+                activity_source: config.activity_source,
+                activity_titles: config.activity_titles,
+                activity_urls: config.activity_urls,
+                activity_exclude_apps: config.activity_exclude_apps.clone(),
+                activity_exclude_titles: config.activity_exclude_titles.clone(),
+                activity_only: config.activity_only,
+            })));
         let captures_dir = Some(config.captures_dir());
         let (supervisor, handler) = crate::window_control::WindowControlSupervisor::new(
             linked_state_lock,
@@ -372,6 +397,16 @@ fn run_capture(
             Arc::clone(&snapshot),
             effective_settings,
             captures_dir,
+            Some(Arc::clone(&activity_prefs)),
+            Arc::new(Mutex::new(None)),
+        );
+        supervisor.attach_activity_runtime(
+            Arc::clone(&activity_fault),
+            Arc::clone(&activity_capability),
+        );
+        handler.attach_activity_runtime(
+            Arc::clone(&activity_fault),
+            Arc::clone(&activity_capability),
         );
         (runtime.spawn(supervisor.run()), handler)
     } else {
@@ -425,6 +460,16 @@ fn run_capture(
             .collect(),
     ));
     let mut observer = Observer::with_starting_pause(config, backends, zone, starting_pause);
+    let desktop = env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    observer.install_activity(
+        activity_prefs,
+        activity_fault,
+        activity_capability,
+        Box::new(crate::activity_source::ProductionForeground {
+            desktop: desktop.clone(),
+        }),
+        desktop,
+    );
     let initialized = !stopped.load(Ordering::Acquire);
     let mut run_result = if initialized {
         observer.initialize()
@@ -828,6 +873,105 @@ fn spawn_signal_task(
     Ok(())
 }
 
+fn open_media_stack<V, A>(
+    activity_only: bool,
+    open_video: impl FnOnce() -> Result<V, ObserverError>,
+    open_audio: impl FnOnce() -> Result<A, ObserverError>,
+) -> Result<Option<(V, A)>, ObserverError> {
+    if activity_only {
+        return Ok(None);
+    }
+    Ok(Some((open_video()?, open_audio()?)))
+}
+
+enum CaptureVideo {
+    Live(VideoBackend),
+    Idle,
+}
+
+enum CaptureAudio {
+    Live(PulseAudioCapture),
+    Idle,
+}
+
+enum CaptureMute {
+    Live(crate::audio::backend::PulseMuteProbe),
+    Idle,
+}
+
+impl VideoCapture for CaptureVideo {
+    fn start(
+        &mut self,
+        directory: &std::path::Path,
+        framerate: i64,
+        draw_cursor: bool,
+    ) -> Result<Vec<VideoStream>, String> {
+        match self {
+            Self::Live(video) => video.start(directory, framerate, draw_cursor),
+            Self::Idle => Err("activity-only".into()),
+        }
+    }
+
+    fn stop(&mut self) -> Result<Vec<StoppedStream>, String> {
+        match self {
+            Self::Live(video) => video.stop(),
+            Self::Idle => Ok(Vec::new()),
+        }
+    }
+
+    fn stop_for_shutdown(&mut self) -> Result<Vec<StoppedStream>, String> {
+        match self {
+            Self::Live(video) => video.stop_for_shutdown(),
+            Self::Idle => Ok(Vec::new()),
+        }
+    }
+
+    fn is_healthy(&self) -> bool {
+        match self {
+            Self::Live(video) => video.is_healthy(),
+            Self::Idle => true,
+        }
+    }
+}
+
+impl AudioCapture for CaptureAudio {
+    fn drain(&mut self) -> crate::chunking::DrainedChunk {
+        match self {
+            Self::Live(audio) => audio.drain(),
+            Self::Idle => crate::chunking::DrainedChunk::silent(),
+        }
+    }
+
+    fn audio_available(&self) -> bool {
+        match self {
+            Self::Live(audio) => audio.audio_available(),
+            Self::Idle => false,
+        }
+    }
+
+    fn fatal_error(&self) -> Option<String> {
+        match self {
+            Self::Live(audio) => audio.fatal_error(),
+            Self::Idle => None,
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Self::Live(audio) = self {
+            audio.stop();
+        }
+    }
+}
+
+impl MuteProbe for CaptureMute {
+    fn probe_muted(&mut self) -> Result<bool, String> {
+        match self {
+            Self::Live(probe) => probe.probe_muted(),
+            Self::Idle => Ok(false),
+        }
+    }
+}
+
 enum ActiveVideo {
     Portal(PortalVideoCapture),
     X11(X11VideoCapture),
@@ -1009,6 +1153,34 @@ impl Clock for SystemClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activity_only_skips_media_constructors() {
+        let video_calls = std::cell::Cell::new(0);
+        let audio_calls = std::cell::Cell::new(0);
+        let opened = open_media_stack(
+            true,
+            || {
+                video_calls.set(video_calls.get() + 1);
+                Ok(())
+            },
+            || {
+                audio_calls.set(audio_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(opened.is_none());
+        assert_eq!(video_calls.get(), 0);
+        assert_eq!(audio_calls.get(), 0);
+    }
+
+    #[test]
+    fn media_intake_calls_both_constructors() {
+        let opened = open_media_stack(false, || Ok("video"), || Ok("audio")).unwrap();
+        assert_eq!(opened, Some(("video", "audio")));
+    }
+
     use crate::{
         dbus_service::{ObserverCommands, clamp_pause},
         observer::StateSink,

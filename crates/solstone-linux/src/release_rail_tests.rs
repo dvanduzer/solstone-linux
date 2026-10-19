@@ -77,6 +77,18 @@ fn committed_asset_set() -> BTreeSet<PathBuf> {
         root.join("RUST_DEPENDENCY_NOTICES.txt")
             .canonicalize()
             .unwrap(),
+        root.join("packaging/activity-helpers/solstone-activity@solpbc.org/metadata.json")
+            .canonicalize()
+            .unwrap(),
+        root.join("packaging/activity-helpers/solstone-activity@solpbc.org/extension.js")
+            .canonicalize()
+            .unwrap(),
+        root.join("packaging/activity-helpers/solstone-activity-kwin/metadata.json")
+            .canonicalize()
+            .unwrap(),
+        root.join("packaging/activity-helpers/solstone-activity-kwin/main.js")
+            .canonicalize()
+            .unwrap(),
     ]);
     collect_files(&root.join("contrib/icons/hicolor"), &mut paths);
     paths
@@ -190,14 +202,14 @@ fn package_assets_exist_and_match() {
     let expected = committed_asset_set();
     assert_eq!(
         expected.len(),
-        20,
-        "LICENSE + Comfortaa-OFL.txt + INSTALL-NOTES + RUST_DEPENDENCY_NOTICES.txt + launcher + 15 icons"
+        24,
+        "LICENSE + Comfortaa-OFL.txt + INSTALL-NOTES + RUST_DEPENDENCY_NOTICES.txt + launcher + 15 icons + 4 activity helpers"
     );
 
     let deb = deb_assets(&member);
     let rpm = rpm_assets(&member);
-    assert_eq!(deb.len(), 22);
-    assert_eq!(rpm.len(), 22);
+    assert_eq!(deb.len(), 26);
+    assert_eq!(rpm.len(), 26);
     assert_eq!(deb[0].0, "target/release/solstone-linux");
     assert_eq!(rpm[0].0, "target/release/solstone-linux");
     assert_eq!(deb[0].2, "755");
@@ -235,8 +247,8 @@ fn debian_sealing_enumerates_every_installed_payload() {
     let (_, member) = metadata();
     let payload_count = deb_assets(&member).len() + 1;
     assert_eq!(
-        payload_count, 23,
-        "22 declared assets + generated copyright"
+        payload_count, 27,
+        "26 declared assets + generated copyright"
     );
 
     let containerfile =
@@ -303,6 +315,10 @@ fn release_fixture(temp: &Path) -> PathBuf {
     copy_tree(
         &workspace_root().join("contrib/icons/hicolor"),
         &root.join("share/icons/hicolor"),
+    );
+    copy_tree(
+        &workspace_root().join("packaging/activity-helpers"),
+        &root.join("share/solstone-linux/activity-helpers"),
     );
 
     let archive = temp.join(format!("{root_name}.tar.gz"));

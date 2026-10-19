@@ -82,6 +82,7 @@ pub(crate) enum PayloadRole {
     InstallNotes,
     DependencyNotices,
     Icon,
+    ActivityHelper,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,7 +93,7 @@ pub(crate) struct PayloadAuthority {
     pub(crate) role: PayloadRole,
 }
 
-pub(crate) const PAYLOAD_AUTHORITY: [PayloadAuthority; 22] = [
+pub(crate) const PAYLOAD_AUTHORITY: [PayloadAuthority; 26] = [
     PayloadAuthority {
         source: "target/release/solstone-linux",
         installed: "/usr/bin/solstone-linux",
@@ -195,7 +196,39 @@ pub(crate) const PAYLOAD_AUTHORITY: [PayloadAuthority; 22] = [
         "contrib/icons/hicolor/scalable/status/solstone-offline.svg",
         "/usr/share/icons/hicolor/scalable/status/solstone-offline.svg",
     ),
+    activity_helper(
+        "packaging/activity-helpers/solstone-activity@solpbc.org/metadata.json",
+        "/usr/share/solstone-linux/activity-helpers/solstone-activity@solpbc.org/metadata.json",
+    ),
+    activity_helper(
+        "packaging/activity-helpers/solstone-activity@solpbc.org/extension.js",
+        "/usr/share/solstone-linux/activity-helpers/solstone-activity@solpbc.org/extension.js",
+    ),
+    activity_helper(
+        "packaging/activity-helpers/solstone-activity-kwin/metadata.json",
+        "/usr/share/solstone-linux/activity-helpers/solstone-activity-kwin/metadata.json",
+    ),
+    activity_helper(
+        "packaging/activity-helpers/solstone-activity-kwin/main.js",
+        "/usr/share/solstone-linux/activity-helpers/solstone-activity-kwin/main.js",
+    ),
 ];
+
+const fn activity_helper(source: &'static str, installed: &'static str) -> PayloadAuthority {
+    PayloadAuthority {
+        source,
+        installed,
+        mode: 0o644,
+        role: PayloadRole::ActivityHelper,
+    }
+}
+
+pub(crate) fn activity_helper_archive_path(source: &str) -> String {
+    let rest = source
+        .strip_prefix("packaging/activity-helpers/")
+        .unwrap_or(source);
+    format!("share/solstone-linux/activity-helpers/{rest}")
+}
 
 const fn icon(source: &'static str, installed: &'static str) -> PayloadAuthority {
     PayloadAuthority {
@@ -840,6 +873,7 @@ fn expected_path(format: Format, authority: PayloadAuthority) -> String {
                 .strip_prefix("contrib/icons/")
                 .map(|value| format!("share/icons/{value}"))
                 .unwrap_or_default(),
+            PayloadRole::ActivityHelper => activity_helper_archive_path(authority.source),
         },
     }
 }
@@ -1179,6 +1213,7 @@ mod tests {
                     PayloadRole::MarkFontLicense => MARK_FONT_LICENSE.to_vec(),
                     PayloadRole::DependencyNotices => RUST_DEPENDENCY_NOTICES.to_vec(),
                     PayloadRole::Icon => authority.source.as_bytes().to_vec(),
+                    PayloadRole::ActivityHelper => authority.source.as_bytes().to_vec(),
                 };
                 Member {
                     path: expected_path(format, authority),

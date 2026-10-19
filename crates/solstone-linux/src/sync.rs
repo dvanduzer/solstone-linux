@@ -2185,7 +2185,7 @@ fn count_unacked_segments(
     count
 }
 
-fn eligible_files(segment_dir: &Path) -> io::Result<Vec<PathBuf>> {
+pub(crate) fn eligible_files(segment_dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for entry in fs::read_dir(segment_dir)? {
         let entry = entry?;
@@ -2196,6 +2196,41 @@ fn eligible_files(segment_dir: &Path) -> io::Result<Vec<PathBuf>> {
     }
     files.sort();
     Ok(files)
+}
+
+#[cfg(test)]
+mod activity_file_eligibility {
+    use super::eligible_files;
+    use std::fs;
+
+    #[test]
+    fn both_activity_files_stay_eligible_under_their_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("120000_1_desktop_activity.jsonl");
+        let second = dir.path().join("120000_2_desktop_activity.jsonl");
+        fs::write(&first, b"{\"app\":\"A\"}\n").unwrap();
+        fs::write(&second, b"{\"app\":\"B\"}\n").unwrap();
+        fs::write(
+            dir.path().join(".ingest_ack.json"),
+            b"{\"pairing_id\":\"nope\"}",
+        )
+        .unwrap();
+        let files = eligible_files(dir.path()).unwrap();
+        let names: Vec<_> = files
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "120000_1_desktop_activity.jsonl".to_string(),
+                "120000_2_desktop_activity.jsonl".to_string()
+            ]
+        );
+        let blob = fs::read_to_string(&first).unwrap() + &fs::read_to_string(&second).unwrap();
+        assert!(!blob.contains("pairing_id"));
+        assert!(!blob.contains("identity_key"));
+    }
 }
 
 fn sha256_file(path: &Path) -> io::Result<String> {

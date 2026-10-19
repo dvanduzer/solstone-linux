@@ -483,6 +483,10 @@ fn type_identity(value: &Type) -> Option<String> {
 }
 
 fn permitted_capability(fact: &FunctionFact) -> bool {
+    if fact.item_path == "activity_writer::sanitize_url" {
+        // Reduces a page address to origin and path. It does not open a connection.
+        return true;
+    }
     fact.path
         .ends_with("crates/solstone-linux/src/private_link.rs")
         && (fact

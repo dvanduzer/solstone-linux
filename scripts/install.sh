@@ -131,7 +131,11 @@ for REQUIRED in \
   "$TOP/Comfortaa-OFL.txt" \
   "$TOP/RUST_DEPENDENCY_NOTICES.txt" \
   "$TOP/share/icons/hicolor/scalable/apps/solstone-observer.svg" \
-  "$TOP/share/applications/org.solpbc.solstone.Window.desktop"; do
+  "$TOP/share/applications/org.solpbc.solstone.Window.desktop" \
+  "$TOP/share/solstone-linux/activity-helpers/solstone-activity@solpbc.org/metadata.json" \
+  "$TOP/share/solstone-linux/activity-helpers/solstone-activity@solpbc.org/extension.js" \
+  "$TOP/share/solstone-linux/activity-helpers/solstone-activity-kwin/metadata.json" \
+  "$TOP/share/solstone-linux/activity-helpers/solstone-activity-kwin/main.js"; do
   if ! grep -Fxq "$REQUIRED" <<< "$CONTENTS"; then
     echo "error: archive is missing $REQUIRED" >&2
     exit 1
@@ -170,7 +174,8 @@ mkdir -p \
   "$PREFIX/bin" \
   "$PREFIX/share/doc/solstone-linux" \
   "$PREFIX/share/applications" \
-  "$PREFIX/share/icons"
+  "$PREFIX/share/icons" \
+  "$PREFIX/share/solstone-linux/activity-helpers"
 install -m 0755 "$SOURCE/bin/solstone-linux" "$PREFIX/bin/solstone-linux"
 install -m 0755 "$SOURCE/bin/solstone-linux-window" "$PREFIX/bin/solstone-linux-window"
 install -m 0644 "$SOURCE/LICENSE" "$PREFIX/share/doc/solstone-linux/LICENSE"
@@ -181,6 +186,10 @@ while IFS= read -r -d '' ICON; do
   RELATIVE_ICON=${ICON#"$SOURCE/share/icons/hicolor/"}
   install -D -m 0644 "$ICON" "$PREFIX/share/icons/hicolor/$RELATIVE_ICON"
 done < <(find "$SOURCE/share/icons/hicolor" -type f -print0)
+while IFS= read -r -d '' HELPER; do
+  RELATIVE_HELPER=${HELPER#"$SOURCE/share/solstone-linux/activity-helpers/"}
+  install -D -m 0644 "$HELPER" "$PREFIX/share/solstone-linux/activity-helpers/$RELATIVE_HELPER"
+done < <(find "$SOURCE/share/solstone-linux/activity-helpers" -type f -print0)
 
 # Exec is parsed twice: first the desktop-entry string escaping, then the
 # quoted argument. Use an absolute path so app-menu launch does not depend on

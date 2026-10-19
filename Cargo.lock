@@ -3590,6 +3590,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "url",
  "wayland-client",
  "wayland-protocols",
  "x11rb",
@@ -3603,6 +3604,7 @@ dependencies = [
  "gtk4",
  "num-format",
  "resvg",
+ "serde_json",
  "solstone-linux",
  "tokio",
 ]

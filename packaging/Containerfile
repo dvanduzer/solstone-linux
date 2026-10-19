@@ -46,8 +46,9 @@ RUN cargo build --locked --release -p solstone-linux -p solstone-linux-window -p
     && install -D -m 0644 crates/solstone-linux-window/assets/Comfortaa-OFL.txt "/release-tree/${ROOT}/Comfortaa-OFL.txt" \
     && install -D -m 0644 packaging/INSTALL-NOTES "/release-tree/${ROOT}/INSTALL-NOTES" \
     && install -D -m 0644 RUST_DEPENDENCY_NOTICES.txt "/release-tree/${ROOT}/RUST_DEPENDENCY_NOTICES.txt" \
-    && mkdir -p "/release-tree/${ROOT}/share/icons" /release \
+    && mkdir -p "/release-tree/${ROOT}/share/icons" "/release-tree/${ROOT}/share/solstone-linux/activity-helpers" /release \
     && cp -R contrib/icons/hicolor "/release-tree/${ROOT}/share/icons/hicolor" \
+    && cp -R packaging/activity-helpers/* "/release-tree/${ROOT}/share/solstone-linux/activity-helpers/" \
     && tar -C /release-tree -czf "/release/${ROOT}.tar.gz" "$ROOT" \
     && printf '%s\n' "$VERSION" > /release/VERSION
 
@@ -81,8 +82,8 @@ RUN actual="$(cargo deb --version)" \
         | LC_ALL=C sort -z \
         | xargs -0 -r md5sum -- > DEBIAN/md5sums \
     && md5_count="$(wc -l < DEBIAN/md5sums)" \
-    && { test "${md5_count}" -eq 23 \
-        || { echo "error: Debian md5 inventory mismatch: expected 23 payloads, actual ${md5_count:-unavailable}" >&2; \
+    && { test "${md5_count}" -eq 27 \
+        || { echo "error: Debian md5 inventory mismatch: expected 27 payloads, actual ${md5_count:-unavailable}" >&2; \
              echo "repair: align the sealing bound with package assets and generated copyright" >&2; exit 1; }; } \
     && chmod 0644 DEBIAN/md5sums \
     && dpkg-deb --root-owner-group -Zxz -z9 --build "$DEB_ROOT" "${DEB}.sealed" >/dev/null \

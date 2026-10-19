@@ -1,0 +1,12 @@
+{
+  "KPlugin": {
+    "Name": "Solstone Activity Helper",
+    "Description": "KWin activity helper for solstone-linux",
+    "Icon": "preferences-system-windows",
+    "Id": "solstone-activity-kwin",
+    "Version": "1",
+    "KPackageStructure": "KWin/Script"
+  },
+  "X-Plasma-API": "javascript",
+  "X-Plasma-MainScript": "main.js"
+}

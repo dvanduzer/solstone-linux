@@ -81,6 +81,11 @@ enum Commands {
         about = "set up the GNOME panel icon, where pause and resume live"
     )]
     PanelIcon,
+    #[command(
+        name = "activity-helpers",
+        about = "install GNOME and KWin activity helper assets"
+    )]
+    ActivityHelpers,
     #[command(about = "pause intake")]
     Pause {
         #[arg(
@@ -422,6 +427,10 @@ pub fn run() -> i32 {
         }
         Commands::Status => cmd_status(ConfigPaths::default(), &SystemRunner, &mut io::stdout()),
         Commands::PanelIcon => cmd_panel_icon(&mut io::stdout(), &mut io::stderr()),
+        Commands::ActivityHelpers => crate::activity_helper_install::run_install_activity_helpers(
+            &mut io::stdout(),
+            &mut io::stderr(),
+        ),
         Commands::Pause { minutes } => cmd_control(
             Control::Pause(minutes),
             &mut io::stdout(),
@@ -1448,6 +1457,7 @@ mod tests {
             "status",
             "about",
             "panel-icon",
+            "activity-helpers",
             "pause",
             "resume",
         ];

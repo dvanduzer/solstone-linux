@@ -300,6 +300,8 @@ pub struct NativeActivitySources {
     cache: CacheState,
     inventory: Option<BoundBackends>,
     follower: Option<SessionFollower>,
+    last_kind: Option<crate::desktop_session::DesktopKind>,
+    last_display: Option<String>,
 }
 
 impl NativeActivitySources {
@@ -359,6 +361,8 @@ impl NativeActivitySources {
             cache: CacheState::default(),
             inventory: None,
             follower,
+            last_kind: None,
+            last_display: None,
         }
     }
 }
@@ -367,16 +371,22 @@ impl ActivityOps for NativeActivitySources {
     fn probe_once(&mut self) -> (ActivityState, BoundBackends) {
         let target = self.follower.as_mut().map(SessionFollower::resolve);
         if let Some(target) = &target {
+            self.last_kind = target.kind;
+            self.last_display = target.display.clone();
             match target.kind {
                 Some(DesktopKind::X11) => self.session_type = "x11".into(),
                 Some(DesktopKind::Wayland) => self.session_type = "wayland".into(),
                 None => {}
             }
+            // Idle and power may use this display on Wayland. Foreground does not.
             self.x11.retarget(target.epoch, target.display.as_deref());
             if self.system.retarget(target.session_path.as_deref()) {
                 self.cache.subscription_attempted = false;
                 self.cache.lock_signal = Default::default();
             }
+        } else {
+            self.last_kind = None;
+            self.last_display = None;
         }
         if self.inventory.is_none() {
             let (inventory, warnings) = probe_backends(
@@ -419,6 +429,10 @@ impl ActivityOps for NativeActivitySources {
             }
         }
         (state, inventory)
+    }
+
+    fn desktop_facts(&self) -> (Option<crate::desktop_session::DesktopKind>, Option<String>) {
+        (self.last_kind, self.last_display.clone())
     }
 }
 
