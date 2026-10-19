@@ -30,6 +30,7 @@ use pulse::{
         subscribe::{Facility, InterestMaskSet, Operation},
     },
     mainloop::threaded::Mainloop,
+    operation::Operation as PulseOperation,
     sample::{Format, Spec},
     stream::{FlagSet as StreamFlagSet, PeekResult, State as StreamState, Stream},
 };
@@ -245,15 +246,12 @@ pub(crate) fn run_pulse(
     failures: Arc<FailureCounter>,
     reset_on_detection: bool,
 ) -> Result<bool, PulseRunError> {
-    let mut mainloop = Mainloop::new().ok_or_else(|| {
-        PulseRunError::Degraded("failed to create PulseAudio threaded mainloop".into())
-    })?;
-    let mut context = connect_context(&mut mainloop)
-        .map_err(|error| PulseRunError::Degraded(error.to_string()))?;
+    let mut session =
+        PulseSession::connect().map_err(|error| PulseRunError::Degraded(error.to_string()))?;
 
     let outcome = drive_subscription(
-        &mut mainloop,
-        &context,
+        &mut session.mainloop,
+        &session.context,
         SubscriptionState::default(),
         SubscriptionEvent::Started,
     )
@@ -291,40 +289,39 @@ pub(crate) fn run_pulse(
         .as_deref()
         .ok_or_else(|| PulseRunError::Degraded("monitor has no name".into()))?;
     let (muted, mute_failure) = mute_result(&state.mute_status);
-    let (microphone, system) = initialize_streams(&sender, muted, mute_failure, || {
-        let microphone = start_stream(
-            &mut mainloop,
-            &mut context,
+    initialize_streams(&sender, muted, mute_failure, || {
+        start_stream(
+            &mut session,
             microphone_name,
             AudioLeg::Microphone,
             sender.clone(),
             Arc::clone(&threshold_reached),
             Arc::clone(&failures),
         )?;
-        let system = start_stream(
-            &mut mainloop,
-            &mut context,
+        start_stream(
+            &mut session,
             system_name,
             AudioLeg::System,
             sender.clone(),
             Arc::clone(&threshold_reached),
             Arc::clone(&failures),
-        )?;
-        Ok((microphone, system))
+        )
     })
     .map_err(|error| PulseRunError::Setup(error.to_string()))?;
     info!(default_sink = ?state.default_sink, "PulseAudio capture ready");
 
     let (event_tx, event_rx) = mpsc::channel();
-    context.set_subscribe_callback(Some(Box::new(move |facility, operation, index| {
-        let _ = event_tx.send((facility, operation, index));
-    })));
-    mainloop.lock();
-    let subscription = context.subscribe(
+    session.mainloop.lock();
+    session
+        .context
+        .set_subscribe_callback(Some(Box::new(move |facility, operation, index| {
+            let _ = event_tx.send((facility, operation, index));
+        })));
+    session.subscription = Some(session.context.subscribe(
         InterestMaskSet::SOURCE | InterestMaskSet::SINK | InterestMaskSet::SERVER,
         |_| {},
-    );
-    mainloop.unlock();
+    ));
+    session.mainloop.unlock();
     let mut state = state;
     let schedule_started = Instant::now();
     struct RealDriverClock(Instant);
@@ -359,8 +356,9 @@ pub(crate) fn run_pulse(
                 let Some(event) = driver_subscription_event(&driver_event) else {
                     continue;
                 };
-                let outcome = drive_subscription(&mut mainloop, &context, state, event)
-                    .map_err(|error| PulseRunError::Degraded(error.to_string()))?;
+                let outcome =
+                    drive_subscription(&mut session.mainloop, &session.context, state, event)
+                        .map_err(|error| PulseRunError::Degraded(error.to_string()))?;
                 let source_changed = outcome.source_changed;
                 state = outcome.state;
                 if let Some(reason) = state.degraded_reason.clone() {
@@ -389,37 +387,81 @@ pub(crate) fn run_pulse(
             DriverEvent::Disconnected => break,
         }
     }
-    drop(subscription);
-    mainloop.lock();
-    let _ = microphone
-        .lock()
-        .expect("microphone stream lock")
-        .disconnect();
-    let _ = system.lock().expect("system stream lock").disconnect();
-    context.disconnect();
-    mainloop.unlock();
-    mainloop.stop();
     Ok(threshold_reached.load(Ordering::Acquire))
 }
 
-fn connect_context(mainloop: &mut Mainloop) -> Result<Context, AnyError> {
-    let mut context =
-        Context::new(mainloop, "solstone-linux").ok_or("failed to create PulseAudio context")?;
-    context
-        .connect(None, ContextFlagSet::NOFLAGS, None)
-        .map_err(|error| format!("{error:?}"))?;
-    mainloop.start().map_err(|error| format!("{error:?}"))?;
-    wait_for_context(mainloop, &context)?;
-    Ok(context)
+/// One PulseAudio connection and every PulseAudio object made on it.
+///
+/// libpulse objects may be used, and released, only while the threaded-mainloop
+/// lock is held or after the loop thread has stopped. Releasing a connected
+/// context from another thread frees mainloop I/O events mid-iteration and
+/// aborts the process inside libpulse. `Drop` therefore disconnects under the
+/// lock and stops the loop thread before any field is released, on every exit
+/// path. Fields then drop in declaration order: the subscription and streams,
+/// then the context they reference, then the mainloop.
+struct PulseSession {
+    subscription: Option<PulseOperation<dyn FnMut(bool)>>,
+    streams: Vec<Arc<Mutex<Stream>>>,
+    context: Context,
+    mainloop: Mainloop,
+}
+
+impl PulseSession {
+    fn connect() -> Result<Self, AnyError> {
+        let mut session = Self::start(None, ContextFlagSet::NOFLAGS)?;
+        wait_for_context(&mut session.mainloop, &session.context)?;
+        Ok(session)
+    }
+
+    fn start(server: Option<&str>, flags: ContextFlagSet) -> Result<Self, AnyError> {
+        let mainloop = Mainloop::new().ok_or("failed to create PulseAudio threaded mainloop")?;
+        let context = Context::new(&mainloop, "solstone-linux")
+            .ok_or("failed to create PulseAudio context")?;
+        let mut session = Self {
+            subscription: None,
+            streams: Vec::new(),
+            context,
+            mainloop,
+        };
+        session
+            .context
+            .connect(server, flags, None)
+            .map_err(|error| format!("{error:?}"))?;
+        session
+            .mainloop
+            .start()
+            .map_err(|error| format!("{error:?}"))?;
+        Ok(session)
+    }
+}
+
+impl Drop for PulseSession {
+    fn drop(&mut self) {
+        self.mainloop.lock();
+        for stream in &self.streams {
+            let _ = stream
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .disconnect();
+        }
+        self.context.disconnect();
+        self.mainloop.unlock();
+        self.mainloop.stop();
+    }
+}
+
+/// Releases a PulseAudio object, such as an introspection `Operation`, under the
+/// mainloop lock so its final unref never runs beside the loop thread.
+fn release_locked<T>(mainloop: &mut Mainloop, value: T) {
+    mainloop.lock();
+    drop(value);
+    mainloop.unlock();
 }
 
 pub(crate) fn probe_server() -> Result<(), String> {
-    let mut mainloop = Mainloop::new()
-        .ok_or_else(|| "failed to create PulseAudio threaded mainloop".to_owned())?;
-    let mut context = connect_context(&mut mainloop).map_err(|error| error.to_string())?;
-    context.disconnect();
-    mainloop.stop();
-    Ok(())
+    PulseSession::connect()
+        .map(drop)
+        .map_err(|error| error.to_string())
 }
 
 fn initialize_streams<T>(
@@ -497,9 +539,9 @@ fn query_sources(
     }
     let mut events = ChannelEvents(rx);
     let clock = RealClock(Instant::now());
-    let sources = collect_source_metadata(&mut events, &clock)?;
-    drop(operation);
-    Ok(sources)
+    let sources = collect_source_metadata(&mut events, &clock);
+    release_locked(mainloop, operation);
+    sources
 }
 
 enum SourceEvent {
@@ -553,12 +595,13 @@ fn query_default_sink(
         ));
     });
     mainloop.unlock();
-    let (name, default_source_name) = match rx.recv_timeout(PULSE_TIMEOUT) {
+    let server = rx.recv_timeout(PULSE_TIMEOUT);
+    release_locked(mainloop, operation);
+    let (name, default_source_name) = match server {
         Ok((Some(name), default_source_name)) => (name, default_source_name),
         Ok((None, _)) => return Err("server has no default sink".into()),
         Err(error) => return Err(format!("default sink query failed: {error}")),
     };
-    drop(operation);
     let (tx, rx) = mpsc::channel();
     mainloop.lock();
     let operation = context
@@ -572,7 +615,7 @@ fn query_default_sink(
         });
     mainloop.unlock();
     let result = rx.recv_timeout(PULSE_TIMEOUT);
-    drop(operation);
+    release_locked(mainloop, operation);
     match result {
         Ok(Some(index)) => Ok(crate::subscription::DefaultSink {
             index,
@@ -602,7 +645,7 @@ fn query_sink_mute(
         });
     mainloop.unlock();
     let result = rx.recv_timeout(PULSE_TIMEOUT);
-    drop(operation);
+    release_locked(mainloop, operation);
     match result {
         Ok(Some(muted)) => Ok(muted),
         Ok(None) => Err("default sink mute lookup failed".into()),
@@ -611,30 +654,37 @@ fn query_sink_mute(
 }
 
 fn start_stream(
-    mainloop: &mut Mainloop,
-    context: &mut Context,
+    session: &mut PulseSession,
     source_name: &str,
     leg: AudioLeg,
     sender: mpsc::Sender<PulseMessage>,
     restart: Arc<AtomicBool>,
     failures: Arc<FailureCounter>,
-) -> Result<Arc<Mutex<Stream>>, AnyError> {
+) -> Result<(), AnyError> {
     let spec = Spec {
         format: Format::F32le,
         channels: 1,
         rate: SAMPLE_RATE,
     };
-    let stream = Arc::new(Mutex::new(
-        Stream::new(context, "solstone audio leg", &spec, None)
-            .ok_or("failed to create PulseAudio record stream")?,
-    ));
-    let weak: Weak<Mutex<Stream>> = Arc::downgrade(&stream);
-    stream
-        .lock()
-        .expect("stream lock")
-        .set_read_callback(Some(Box::new(move |_| {
-            read_stream(&weak, leg, &sender, &restart, &failures)
-        })));
+    // The session keeps a reference, so a stream that fails below is released
+    // only by the session's teardown, never beside the running loop thread.
+    session.mainloop.lock();
+    let stream =
+        Stream::new(&mut session.context, "solstone audio leg", &spec, None).map(|stream| {
+            let stream = Arc::new(Mutex::new(stream));
+            let weak: Weak<Mutex<Stream>> = Arc::downgrade(&stream);
+            stream
+                .lock()
+                .expect("stream lock")
+                .set_read_callback(Some(Box::new(move |_| {
+                    read_stream(&weak, leg, &sender, &restart, &failures)
+                })));
+            session.streams.push(Arc::clone(&stream));
+            stream
+        });
+    session.mainloop.unlock();
+    let stream = stream.ok_or("failed to create PulseAudio record stream")?;
+    let mainloop = &mut session.mainloop;
     mainloop.lock();
     let connect_result = stream.lock().expect("stream lock").connect_record(
         Some(source_name),
@@ -667,7 +717,7 @@ fn start_stream(
         .copied();
     mainloop.unlock();
     info!(?leg, ?attributes, "negotiated PulseAudio buffer attributes");
-    Ok(stream)
+    Ok(())
 }
 
 fn read_stream(
@@ -904,5 +954,43 @@ mod tests {
         let event = driver_subscription_event(&driver_event).expect("source event");
         let outcome = transition(SubscriptionState::default(), event);
         assert_eq!(outcome.actions, vec![SubscriptionAction::QuerySources]);
+    }
+
+    #[test]
+    fn session_teardown_never_races_the_loop_thread() {
+        // A context connected to a socket holds live mainloop I/O events. Releasing
+        // it beside the running loop thread crashed libpulse within a few hundred
+        // teardowns (SIGSEGV, hangs, or mainloop assertion aborts). The fake
+        // server accepts and never answers, so no PulseAudio daemon is needed.
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pulse.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        thread::spawn(move || {
+            let mut held = Vec::new();
+            for connection in listener.incoming() {
+                held.push(connection);
+            }
+        });
+        let server = format!("unix:{}", path.display());
+        for _ in 0..500 {
+            let mut session =
+                PulseSession::start(Some(&server), ContextFlagSet::NOAUTOSPAWN).unwrap();
+            let deadline = Instant::now() + PULSE_TIMEOUT;
+            loop {
+                session.mainloop.lock();
+                let state = session.context.get_state();
+                session.mainloop.unlock();
+                if !matches!(state, ContextState::Unconnected | ContextState::Connecting) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "fake server connection timed out"
+                );
+                thread::yield_now();
+            }
+            drop(session);
+        }
     }
 }

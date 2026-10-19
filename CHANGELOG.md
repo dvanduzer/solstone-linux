@@ -6,6 +6,10 @@ and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- on a computer with no microphone, the solstone app no longer quits unexpectedly after a few minutes while it keeps checking for one.
+
 ## [2.0.24] - 2026-10-19
 
 ### Added
