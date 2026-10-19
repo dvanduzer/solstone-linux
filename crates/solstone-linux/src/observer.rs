@@ -98,6 +98,10 @@ pub trait ActivityProbe {
     fn activity_facts(&self) -> crate::activity::ActivityFacts {
         crate::activity::ActivityFacts::default()
     }
+
+    fn current_session_epoch(&self) -> u64 {
+        self.activity_facts().session_epoch
+    }
 }
 pub trait MuteProbe {
     fn probe_muted(&mut self) -> Result<bool, String>;
@@ -392,6 +396,7 @@ where
     /// The owner's pause. `seconds == 0` is "until I resume". It is recorded so a
     /// restart keeps it.
     pub fn pause(&mut self, seconds: u64) {
+        let now_ms = wall_millis(self.backends.clock.wall_seconds());
         self.state.paused = true;
         self.state.pause_until =
             (seconds > 0).then(|| self.backends.clock.monotonic_seconds() + seconds as f64);
@@ -401,9 +406,6 @@ where
             Some(deadline) => HeldPause::Until(deadline),
             None => HeldPause::UntilResumed,
         };
-        if let Err(error) = pause_hold::save(&self.config.state_dir(), held) {
-            tracing::warn!(%error, "Could not record the pause; it holds until this app stops");
-        }
         if let Some(activity) = self.activity.as_ref() {
             activity.prefs.bump_generation();
         }
@@ -411,9 +413,15 @@ where
         // must not ask the desktop what is in front.
         self.foreground.set_reading(false);
         self.foreground.set_paused(true);
-        let now_ms = wall_millis(self.backends.clock.wall_seconds());
         if let Some(activity) = self.activity.as_mut() {
-            activity.sampler.seal(now_ms);
+            let cutoff = activity
+                .prefs
+                .take_policy_boundary_before(now_ms)
+                .unwrap_or(now_ms);
+            activity.sampler.seal(cutoff);
+        }
+        if let Err(error) = pause_hold::save(&self.config.state_dir(), held) {
+            tracing::warn!(%error, "Could not record the pause; it holds until this app stops");
         }
         let _ = self.persist_activity();
         self.publish();
@@ -553,10 +561,18 @@ where
 
     pub fn handle_boundary(&mut self, target: Mode) -> Result<(), ObserverError> {
         let end_ms = wall_millis(self.backends.clock.wall_seconds());
+        let generation = self
+            .activity
+            .as_ref()
+            .map(|activity| activity.prefs.generation());
         let continued: ActivityContinuation = self
             .activity
             .as_ref()
-            .map(|activity| activity.sampler.continuation())
+            .map(|activity| {
+                activity
+                    .sampler
+                    .continuation_for_generation(activity.prefs.generation())
+            })
             .unwrap_or_default();
         if self.state.mode == Mode::Screencast && !self.config.activity_only {
             self.stop_video()?;
@@ -570,6 +586,7 @@ where
         let started = self.start_capture(target);
         if self.state.segment_dir.is_some()
             && let Some(activity) = self.activity.as_mut()
+            && generation == Some(activity.prefs.generation())
         {
             activity.sampler.resume_continuation(continued, end_ms);
         }
@@ -577,6 +594,7 @@ where
     }
 
     pub fn shutdown(&mut self) -> Result<(), ObserverError> {
+        self.stop_activity_intake();
         if self.state.mode == Mode::Screencast && !self.config.activity_only {
             let _ = self
                 .backends
@@ -585,11 +603,6 @@ where
                 .map_err(ObserverError::VideoStop)?;
             self.state.current_streams.clear();
         }
-        if let Some(activity) = self.activity.as_ref() {
-            activity.prefs.bump_generation();
-        }
-        self.foreground.set_reading(false);
-        self.foreground.set_paused(true);
         if !self.config.activity_only {
             self.write_gated_audio()?;
         }
@@ -600,6 +613,20 @@ where
             return Err(ObserverError::AudioFatal(error));
         }
         activity_result
+    }
+
+    pub fn stop_activity_intake(&mut self) {
+        let now_ms = wall_millis(self.backends.clock.wall_seconds());
+        if let Some(activity) = self.activity.as_mut() {
+            activity.prefs.stop_intake_at(now_ms);
+            let cutoff = activity
+                .prefs
+                .take_policy_boundary_before(now_ms)
+                .unwrap_or(now_ms);
+            activity.sampler.seal(cutoff);
+        }
+        self.foreground.set_reading(false);
+        self.foreground.set_paused(true);
     }
 
     fn session_live(&self) -> bool {
@@ -763,7 +790,11 @@ where
 
     fn finalize_segment_at(&mut self, end_ms: u64) -> Result<(), ObserverError> {
         if let Some(activity) = self.activity.as_mut() {
-            activity.sampler.seal(end_ms);
+            let cutoff = activity
+                .prefs
+                .take_policy_boundary_before(end_ms)
+                .unwrap_or(end_ms);
+            activity.sampler.seal(cutoff);
         }
         self.persist_activity()?;
         self.finish_segment_directory()
@@ -850,14 +881,16 @@ where
             return;
         };
         let prefs = std::sync::Arc::clone(&activity.prefs);
-        let snap = prefs.snapshot();
+        // The policy and timestamp share its lock, so enabling cannot create a
+        // span before the enable and disabling cannot extend the old span.
+        let (snap, now_ms) =
+            prefs.take_policy_snapshot(|| wall_millis(self.backends.clock.wall_seconds()));
         let desktop = activity.desktop.clone();
         let has_open = activity.sampler.has_open();
         if !snap.source && !has_open {
             return;
         }
         let facts = self.backends.activity.activity_facts();
-        let now_ms = wall_millis(self.backends.clock.wall_seconds());
         let route = route_name(facts.kind, &desktop);
         let input = PollInput {
             now_ms,
@@ -883,7 +916,7 @@ where
         sampler.poll(&input, foreground.as_mut(), &facts, &|| {
             prefs.generation() == start_generation
                 && !state.paused
-                && backends.activity.activity_facts().session_epoch == start_epoch
+                && backends.activity.current_session_epoch() == start_epoch
         });
         let status = sampler.status();
         let Some(activity) = activity.as_mut() else {
@@ -971,13 +1004,22 @@ where
         let boundary_mono = self.state.segment_start_mono + interval;
         let boundary_wall = self.state.segment_start_wall + interval;
         let boundary_ms = wall_millis(boundary_wall);
+        let policy_cutoff = self
+            .activity
+            .as_ref()
+            .and_then(|activity| activity.prefs.take_policy_boundary_before(boundary_ms));
         let continued: ActivityContinuation = self
             .activity
             .as_ref()
-            .map(|activity| activity.sampler.continuation())
+            .filter(|_| policy_cutoff.is_none())
+            .map(|activity| {
+                activity
+                    .sampler
+                    .continuation_for_generation(activity.prefs.generation())
+            })
             .unwrap_or_default();
         if let Some(activity) = self.activity.as_mut() {
-            activity.sampler.seal(boundary_ms);
+            activity.sampler.seal(policy_cutoff.unwrap_or(boundary_ms));
         }
         self.persist_activity()?;
         self.finish_segment_directory()?;
@@ -3004,6 +3046,60 @@ pub(crate) mod tests {
             })
             .collect();
         activity_rows(&paths)
+    }
+
+    #[test]
+    fn policy_off_and_on_between_ticks_preserves_the_disabled_gap() {
+        let mut f = fixture(false);
+        install_notes(&mut f, true);
+        f.wall.set(0.0);
+        initialize(&mut f);
+        let prefs = f.observer.activity.as_ref().unwrap().prefs.clone();
+        let policy = |source| crate::activity_prefs::ActivityPolicy {
+            activity_source: source,
+            activity_titles: false,
+            activity_urls: false,
+            activity_exclude_apps: Vec::new(),
+            activity_exclude_titles: Vec::new(),
+        };
+        prefs.apply_policy_at(policy(false), 1_000);
+        prefs.apply_policy_at(policy(true), 2_000);
+        f.wall.set(5.0);
+        f.mono.set(5.0);
+        f.observer.tick().unwrap();
+        f.wall.set(6.0);
+        f.observer.shutdown().unwrap();
+        let rows = activity_rows(&activity_jsonl_paths(f.observer.config.base_dir.as_path()));
+        assert!(!rows.is_empty());
+        assert!(rows.iter().any(|row| row.ts == 0 && row.end_ts == 1_000));
+        assert!(
+            rows.iter()
+                .all(|row| row.end_ts <= 1_000 || row.ts >= 2_000)
+        );
+    }
+
+    #[test]
+    fn policy_change_before_shutdown_closes_at_the_saved_instant() {
+        let mut f = fixture(false);
+        install_notes(&mut f, true);
+        f.wall.set(0.0);
+        initialize(&mut f);
+        let prefs = f.observer.activity.as_ref().unwrap().prefs.clone();
+        prefs.apply_policy_at(
+            crate::activity_prefs::ActivityPolicy {
+                activity_source: false,
+                activity_titles: false,
+                activity_urls: false,
+                activity_exclude_apps: Vec::new(),
+                activity_exclude_titles: Vec::new(),
+            },
+            1_000,
+        );
+        f.wall.set(2.0);
+        f.observer.shutdown().unwrap();
+        let rows = activity_rows(&activity_jsonl_paths(f.observer.config.base_dir.as_path()));
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|row| row.end_ts <= 1_000));
     }
 
     #[test]

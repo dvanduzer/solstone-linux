@@ -233,7 +233,13 @@ impl ActivitySampler {
             || input.prefs.generation != self.generation
             || input.activity.session_epoch != self.epoch
         {
-            self.seal(input.now_ms);
+            self.seal(
+                input
+                    .prefs
+                    .policy_boundary_ms
+                    .unwrap_or(input.now_ms)
+                    .min(input.now_ms),
+            );
             self.generation = input.prefs.generation;
             self.epoch = input.activity.session_epoch;
         }
@@ -265,6 +271,14 @@ impl ActivitySampler {
         }
         if let Some(span) = self.url.take() {
             self.push_span(span, now_ms);
+        }
+    }
+
+    pub fn continuation_for_generation(&self, generation: u64) -> ActivityContinuation {
+        if self.generation == generation {
+            self.continuation()
+        } else {
+            ActivityContinuation::default()
         }
     }
 
@@ -994,6 +1008,7 @@ mod tests {
             exclude_apps: apps.iter().map(|s| (*s).to_string()).collect(),
             exclude_titles: title_exclusions.iter().map(|s| (*s).to_string()).collect(),
             generation: 1,
+            policy_boundary_ms: None,
         }
     }
 

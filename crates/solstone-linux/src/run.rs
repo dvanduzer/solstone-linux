@@ -263,9 +263,14 @@ fn run_capture(
 ) -> Result<(), ObserverError> {
     let notifier: Arc<dyn ServiceNotifier> = Arc::new(SdNotifier);
     let stopped = Arc::new(AtomicBool::new(false));
+    let activity_prefs = Arc::new(crate::activity_prefs::ActivityPrefs::new(&config));
     let portal_startup_cancellation = CancellationToken::new();
-    spawn_signal_task(Arc::clone(&stopped), portal_startup_cancellation.clone())
-        .map_err(ObserverError::Io)?;
+    spawn_signal_task(
+        Arc::clone(&stopped),
+        portal_startup_cancellation.clone(),
+        Arc::clone(&activity_prefs),
+    )
+    .map_err(ObserverError::Io)?;
     let startup_heartbeat = begin_startup(Arc::clone(&notifier));
     // Resolve the session once before anything starts, so the video backend matches it
     // and the first tick already knows whether there is a live session to capture.
@@ -289,7 +294,6 @@ fn run_capture(
         ),
         None => (CaptureVideo::Idle, CaptureAudio::Idle, CaptureMute::Idle),
     };
-    let activity_prefs = Arc::new(crate::activity_prefs::ActivityPrefs::new(&config));
     let activity_fault = Arc::new(crate::activity_source::ActivityFault::new());
     let activity_capability = Arc::new(Mutex::new(
         crate::activity_source::CapabilityStatus::default(),
@@ -516,6 +520,9 @@ fn run_capture(
         } else {
             command_receiver.recv_timeout(next_tick.saturating_duration_since(now))
         };
+        if stopped.load(Ordering::Acquire) {
+            break;
+        }
         match wake {
             Ok(command) => {
                 run_result = dispatch_wake(
@@ -540,6 +547,7 @@ fn run_capture(
             }
         }
     }
+    observer.stop_activity_intake();
     if let Err(error) = notifier.stopping() {
         tracing::warn!(%error, "Failed to notify systemd stopping state");
     }
@@ -857,6 +865,7 @@ fn dispatch_wake<T, E>(
 fn spawn_signal_task(
     stopped: Arc<AtomicBool>,
     portal_startup_cancellation: CancellationToken,
+    activity_prefs: Arc<crate::activity_prefs::ActivityPrefs>,
 ) -> Result<(), String> {
     use tokio::signal::unix::{SignalKind, signal};
     let mut interrupt = signal(SignalKind::interrupt()).map_err(|error| error.to_string())?;
@@ -867,6 +876,7 @@ fn spawn_signal_task(
             _ = terminate.recv() => {}
         }
         tracing::info!("Received shutdown signal");
+        activity_prefs.stop_intake_at(crate::activity_helpers::current_unix_ms());
         stopped.store(true, Ordering::Release);
         portal_startup_cancellation.cancel();
     });

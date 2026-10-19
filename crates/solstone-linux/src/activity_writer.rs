@@ -123,6 +123,7 @@ enum WriteFault {
     ShortWrite,
     Newline,
     Sync,
+    ShortWriteAndRollback,
 }
 
 pub struct ActivityWriter {
@@ -132,6 +133,9 @@ pub struct ActivityWriter {
     current_path: Option<PathBuf>,
     /// Bytes known to be a complete, synced prefix of the file.
     durable_len: u64,
+    rollback_required: bool,
+    #[cfg(test)]
+    rollback_failures: usize,
     #[cfg(test)]
     fault: Option<WriteFault>,
 }
@@ -181,6 +185,9 @@ impl ActivityWriter {
             current_file: None,
             current_path: None,
             durable_len: 0,
+            rollback_required: false,
+            #[cfg(test)]
+            rollback_failures: 0,
             #[cfg(test)]
             fault: None,
         }
@@ -191,6 +198,7 @@ impl ActivityWriter {
         self.current_file = None;
         self.current_path = None;
         self.durable_len = 0;
+        self.rollback_required = false;
     }
 
     #[cfg(test)]
@@ -229,6 +237,10 @@ impl ActivityWriter {
     /// JSON, the newline, and the sync land together. A failed attempt rolls
     /// back to the last synced row so a retry cannot duplicate a partial line.
     pub fn write_row(&mut self, row: &DesktopActivityRow) -> io::Result<()> {
+        if self.rollback_required {
+            self.rollback(self.durable_len)?;
+            self.rollback_required = false;
+        }
         let serialized = serde_json::to_vec(row)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         if self.current_file.is_none() {
@@ -236,7 +248,9 @@ impl ActivityWriter {
         }
         let durable = self.durable_len;
         if let Err(error) = self.append_record(&serialized) {
+            self.rollback_required = true;
             self.rollback(durable)?;
+            self.rollback_required = false;
             return Err(error);
         }
         Ok(())
@@ -250,10 +264,16 @@ impl ActivityWriter {
             .as_mut()
             .ok_or_else(|| io::Error::other("activity file is not open"))?;
         #[cfg(test)]
-        if fault == Some(WriteFault::ShortWrite) {
+        if matches!(
+            fault,
+            Some(WriteFault::ShortWrite | WriteFault::ShortWriteAndRollback)
+        ) {
             let mid = payload.len() / 2;
             if mid > 0 {
                 file.write_all(&payload[..mid])?;
+            }
+            if fault == Some(WriteFault::ShortWriteAndRollback) {
+                self.rollback_failures = 2;
             }
             return Err(io::Error::other("short-write"));
         }
@@ -277,6 +297,11 @@ impl ActivityWriter {
     }
 
     fn rollback(&mut self, durable: u64) -> io::Result<()> {
+        #[cfg(test)]
+        if self.rollback_failures > 0 {
+            self.rollback_failures -= 1;
+            return Err(io::Error::other("rollback-unavailable"));
+        }
         let Some(file) = self.current_file.as_mut() else {
             return Ok(());
         };
@@ -344,6 +369,26 @@ pub fn read_activity_rows_from_dir(dir: &Path) -> io::Result<Vec<DesktopActivity
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_rollback_blocks_append_until_durable_prefix_is_restored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut writer = ActivityWriter::new(tmp.path().to_owned(), "120000".into());
+        let first = DesktopActivityRow::activity(0, 1000, "native".into(), "active".into());
+        let next = DesktopActivityRow::activity(1000, 2000, "native".into(), "idle".into());
+        writer.write_row(&first).unwrap();
+        let path = writer.current_path().unwrap().to_owned();
+        writer.fail_next(WriteFault::ShortWriteAndRollback);
+        assert!(writer.write_row(&next).is_err());
+        let dirty = fs::read(&path).unwrap();
+        assert!(writer.write_row(&next).is_err());
+        assert_eq!(fs::read(&path).unwrap(), dirty);
+        writer.write_row(&next).unwrap();
+        assert_eq!(
+            read_activity_rows_from_dir(tmp.path()).unwrap(),
+            vec![first, next]
+        );
+    }
 
     #[test]
     fn test_sanitize_url() {

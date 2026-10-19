@@ -94,11 +94,11 @@ pub fn run_install_activity_helpers(output: &mut dyn Write, errors: &mut dyn Wri
 
     let _ = writeln!(
         output,
-        "Installed activity helper assets to user data directories."
+        "installed activity helper assets to user data directories."
     );
     let _ = writeln!(
         output,
-        "Note: you must explicitly enable the extension or script in your desktop session."
+        "note: you must explicitly enable the extension or script in your desktop session."
     );
     0
 }

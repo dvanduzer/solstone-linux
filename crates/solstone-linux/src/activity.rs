@@ -536,31 +536,34 @@ pub trait ActivityOps: Send + 'static {
 }
 
 pub struct CompositeActivityProbe {
-    latest: Arc<Mutex<ActivityState>>,
-    facts: Arc<Mutex<ActivityFacts>>,
+    latest: Arc<Mutex<(ActivityState, ActivityFacts)>>,
+    observed_facts: ActivityFacts,
 }
 
 impl CompositeActivityProbe {
     pub fn spawn() -> Self {
         let desktop = env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
         let session_type = env::var("XDG_SESSION_TYPE").unwrap_or_default();
-        let latest = Arc::new(Mutex::new(ActivityState::default()));
-        let facts = Arc::new(Mutex::new(ActivityFacts::default()));
+        let latest = Arc::new(Mutex::new((
+            ActivityState::default(),
+            ActivityFacts::default(),
+        )));
         let worker_latest = Arc::clone(&latest);
-        let worker_facts = Arc::clone(&facts);
         if let Err(error) = thread::Builder::new()
             .name("solstone-activity".into())
             .spawn(move || {
                 run_worker(
                     dbus::NativeActivitySources::new(desktop, session_type),
                     worker_latest,
-                    worker_facts,
                 )
             })
         {
             tracing::warn!(%error, "could not start activity worker; defaulting to active");
         }
-        Self { latest, facts }
+        Self {
+            latest,
+            observed_facts: ActivityFacts::default(),
+        }
     }
 
     /// Activity that follows the session `follower` resolves, starting from `initial`
@@ -571,46 +574,49 @@ impl CompositeActivityProbe {
     ) -> Self {
         let desktop = env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
         let session_type = env::var("XDG_SESSION_TYPE").unwrap_or_default();
-        let latest = Arc::new(Mutex::new(initial));
-        let facts = Arc::new(Mutex::new(ActivityFacts::default()));
+        let latest = Arc::new(Mutex::new((initial, ActivityFacts::default())));
         let worker_latest = Arc::clone(&latest);
-        let worker_facts = Arc::clone(&facts);
         if let Err(error) = thread::Builder::new()
             .name("solstone-activity".into())
             .spawn(move || {
                 run_worker(
                     dbus::NativeActivitySources::following(desktop, session_type, follower),
                     worker_latest,
-                    worker_facts,
                 )
             })
         {
             tracing::warn!(%error, "could not start activity worker; defaulting to active");
         }
-        Self { latest, facts }
+        Self {
+            latest,
+            observed_facts: ActivityFacts::default(),
+        }
     }
 
     pub fn spawn_with_ops<O: ActivityOps>(ops: O) -> Self {
-        let latest = Arc::new(Mutex::new(ActivityState::default()));
-        let facts = Arc::new(Mutex::new(ActivityFacts::default()));
+        let latest = Arc::new(Mutex::new((
+            ActivityState::default(),
+            ActivityFacts::default(),
+        )));
         let worker_latest = Arc::clone(&latest);
-        let worker_facts = Arc::clone(&facts);
         let _ = thread::Builder::new()
             .name("solstone-activity".into())
-            .spawn(move || run_worker(ops, worker_latest, worker_facts));
-        Self { latest, facts }
+            .spawn(move || run_worker(ops, worker_latest));
+        Self {
+            latest,
+            observed_facts: ActivityFacts::default(),
+        }
     }
 
     pub fn facts(&self) -> ActivityFacts {
-        self.facts.lock().expect("activity facts lock").clone()
+        // The worker may already have another measurement. These facts belong
+        // to the state returned by this consumer's last probe(), including when
+        // both measurements have the same session epoch.
+        self.observed_facts.clone()
     }
 }
 
-fn run_worker(
-    mut ops: impl ActivityOps,
-    latest: Arc<Mutex<ActivityState>>,
-    facts: Arc<Mutex<ActivityFacts>>,
-) {
+fn run_worker(mut ops: impl ActivityOps, latest: Arc<Mutex<(ActivityState, ActivityFacts)>>) {
     let mut reported = false;
     loop {
         let (next, bound) = ops.probe_once();
@@ -621,10 +627,7 @@ fn run_worker(
             display,
             session_epoch: next.session_epoch,
         };
-        // One publication: state and facts share this probe's epoch. Readers that
-        // observe a mismatch are looking at two publications and must not read X11.
-        *latest.lock().expect("activity state lock") = next;
-        *facts.lock().expect("activity facts lock") = published_facts;
+        *latest.lock().expect("activity snapshot lock") = (next, published_facts);
         if !reported {
             let (lines, always_capture) = startup_report(&bound);
             for line in lines {
@@ -643,11 +646,21 @@ impl ActivityProbe for CompositeActivityProbe {
     /// Transport absence and exhaustion are normal results. The trait error arm
     /// is reserved for a future probe-wide failure and is practically unused.
     fn probe(&mut self) -> Result<ActivityState, String> {
-        Ok(*self.latest.lock().expect("activity state lock"))
+        let (state, facts) = self.latest.lock().expect("activity snapshot lock").clone();
+        self.observed_facts = facts;
+        Ok(state)
     }
 
     fn activity_facts(&self) -> ActivityFacts {
         self.facts()
+    }
+
+    fn current_session_epoch(&self) -> u64 {
+        self.latest
+            .lock()
+            .expect("activity snapshot lock")
+            .0
+            .session_epoch
     }
 }
 
@@ -655,6 +668,53 @@ impl ActivityProbe for CompositeActivityProbe {
 mod tests {
     use super::*;
     use std::collections::{HashMap, VecDeque};
+
+    #[test]
+    fn measurement_facts_stay_with_the_probed_state() {
+        let active = ActivityState {
+            session_epoch: 7,
+            ..ActivityState::default()
+        };
+        let idle = ActivityState {
+            user_idle: true,
+            session_epoch: 8,
+            ..active
+        };
+        let wayland = ActivityFacts {
+            bound: BoundBackends {
+                wayland_idle: true,
+                ..BoundBackends::default()
+            },
+            session_epoch: 7,
+            ..ActivityFacts::default()
+        };
+        let mutter = ActivityFacts {
+            bound: BoundBackends {
+                mutter_idle: true,
+                ..BoundBackends::default()
+            },
+            session_epoch: 8,
+            ..ActivityFacts::default()
+        };
+        let latest = Arc::new(Mutex::new((active, wayland)));
+        let mut probe = CompositeActivityProbe {
+            latest: Arc::clone(&latest),
+            observed_facts: ActivityFacts::default(),
+        };
+        assert!(!probe.probe().unwrap().user_idle);
+        *latest.lock().unwrap() = (idle, mutter);
+        assert_eq!(probe.current_session_epoch(), 8);
+        assert_eq!(probe.activity_facts().session_epoch, 7);
+        assert_eq!(
+            probe.activity_facts().bound.idle_signal(),
+            Some("ext-idle-notify-v1")
+        );
+        assert!(probe.probe().unwrap().user_idle);
+        assert_eq!(
+            probe.activity_facts().bound.idle_signal(),
+            Some("Mutter IdleMonitor")
+        );
+    }
 
     struct FakeSession {
         lock: HashMap<&'static str, VecDeque<BackendOutcome<bool>>>,

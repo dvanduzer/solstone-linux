@@ -1,7 +1,7 @@
 {
   "KPackageStructure": "KWin/Script",
   "KPlugin": {
-    "Name": "Solstone Activity Helper",
+    "Name": "solstone activity helper",
     "Description": "KWin activity helper for solstone-linux",
     "Icon": "preferences-system-windows",
     "Id": "solstone-activity-kwin",

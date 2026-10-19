@@ -134,12 +134,12 @@ pub const SETTINGS_ACTIVITY_TITLES: &str = "window titles";
 pub const SETTINGS_ACTIVITY_URLS: &str = "web addresses";
 pub const SETTINGS_ACTIVITY_ONLY: &str = "activity only";
 pub const SETTINGS_ACTIVITY_ONLY_HELP: &str =
-    "take in desktop activity without screen or audio intake.";
-pub const SETTINGS_ACTIVITY_PRIVATE_WINDOWS_NOTE: &str = "Linux does not classify private windows.";
+    "desktop activity only, with screen and audio intake off.";
+pub const SETTINGS_ACTIVITY_PRIVATE_WINDOWS_NOTE: &str = "linux does not classify private windows.";
 pub const SETTINGS_ACTIVITY_EXCLUDE_APPS: &str = "excluded apps";
 pub const SETTINGS_ACTIVITY_EXCLUDE_TITLES: &str = "excluded window titles";
 pub const SETTINGS_ACTIVITY_ROUTE: &str = "activity route";
-pub const SETTINGS_ACTIVITY_EXPLAIN: &str = "the solstone app takes in the app, window title, page address, and active or idle time you share with it, and all of it goes into your journal.";
+pub const SETTINGS_ACTIVITY_EXPLAIN: &str = "the solstone app takes in the app, window title, and active or idle time you share with it, and all of it goes into your journal.";
 pub const HELP_HEADING: &str = "get help";
 pub const HELP_INTRO: &str = "need a hand? reach a human. we're happy to help.";
 pub const HELP_OPEN: &str = "get help";

@@ -289,6 +289,9 @@ impl Drop for GnomeEndpoint {
 
 #[derive(Clone, Default)]
 pub struct KwinInterest {
+    // Only the in-module parser tests opt in. Production construction uses
+    // Default=false; no setting or installation can qualify this route.
+    qualified: bool,
     pub prefs: Option<std::sync::Arc<crate::activity_prefs::ActivityPrefs>>,
     pub paused: bool,
     pub session_live: bool,
@@ -309,7 +312,9 @@ impl KwinInterest {
             .prefs
             .as_ref()
             .is_some_and(|prefs| prefs.snapshot().source);
-        source && !self.paused && self.session_live
+        // No producer/helper qualification has been completed for KWin. Neither
+        // installing its assets nor saving source=true grants it authorization.
+        self.qualified && source && !self.paused && self.session_live
     }
 
     pub fn refresh_admission(&mut self) {
@@ -668,6 +673,7 @@ mod tests {
             },
         ));
         let gate = KwinInterest {
+            qualified: true,
             prefs: Some(std::sync::Arc::clone(&prefs)),
             paused: false,
             session_live: true,
@@ -680,6 +686,16 @@ mod tests {
             latest: None,
         };
         (gate, prefs)
+    }
+
+    #[test]
+    fn unqualified_kwin_never_authorizes_or_accepts_content() {
+        let (mut gate, _prefs) = admitted_kwin();
+        gate.qualified = false;
+        assert!(!gate.authorize().0);
+        assert!(!gate.want_title);
+        assert!(gate.submit(4, r#"{"caption":"SECRET"}"#).is_err());
+        assert!(gate.latest.is_none());
     }
 
     #[test]

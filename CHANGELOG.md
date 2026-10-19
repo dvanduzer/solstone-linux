@@ -8,7 +8,7 @@ and this project adheres to Semantic Versioning.
 
 ### Added
 
-- the solstone app takes in what you share with it, and all of it goes into your journal: you can now take in the app name, window title, page address, and active, idle, and locked intervals you turn on, and all of it goes into your journal.
+- you can now share app names, window titles, and active, idle, and locked intervals with the solstone app, and all of it goes into your journal.
 
 ### Fixed
 

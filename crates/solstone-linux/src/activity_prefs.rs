@@ -25,6 +25,7 @@ pub struct ActivityPrefsSnapshot {
     pub exclude_apps: Vec<String>,
     pub exclude_titles: Vec<String>,
     pub generation: u64,
+    pub policy_boundary_ms: Option<u64>,
 }
 
 pub struct ActivityPrefs {
@@ -42,6 +43,7 @@ impl ActivityPrefs {
             exclude_apps: config.activity_exclude_apps.clone(),
             exclude_titles: config.activity_exclude_titles.clone(),
             generation: initial_gen,
+            policy_boundary_ms: None,
         };
         Self {
             state: RwLock::new(snapshot),
@@ -59,7 +61,16 @@ impl ActivityPrefs {
     }
 
     pub fn apply_policy(&self, policy: ActivityPolicy) -> u64 {
+        self.apply_policy_with_clock(policy, crate::activity_helpers::current_unix_ms)
+    }
+
+    pub fn apply_policy_at(&self, policy: ActivityPolicy, now_ms: u64) -> u64 {
+        self.apply_policy_with_clock(policy, || now_ms)
+    }
+
+    fn apply_policy_with_clock(&self, policy: ActivityPolicy, clock: impl FnOnce() -> u64) -> u64 {
         let mut lock = self.state.write().unwrap_or_else(|p| p.into_inner());
+        let now_ms = clock();
         let next = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         lock.source = policy.activity_source;
         lock.titles = policy.activity_titles;
@@ -67,7 +78,44 @@ impl ActivityPrefs {
         lock.exclude_apps = policy.activity_exclude_apps;
         lock.exclude_titles = policy.activity_exclude_titles;
         lock.generation = next;
+        lock.policy_boundary_ms = Some(
+            lock.policy_boundary_ms
+                .map_or(now_ms, |old| old.min(now_ms)),
+        );
         next
+    }
+
+    pub fn take_policy_snapshot(
+        &self,
+        clock: impl FnOnce() -> u64,
+    ) -> (ActivityPrefsSnapshot, u64) {
+        let mut lock = self.state.write().unwrap_or_else(|p| p.into_inner());
+        let now_ms = clock();
+        let snapshot = lock.clone();
+        lock.policy_boundary_ms = None;
+        (snapshot, now_ms)
+    }
+
+    /// Runtime stop only: the owner's saved enable choice remains unchanged.
+    pub fn stop_intake_at(&self, now_ms: u64) {
+        let mut lock = self.state.write().unwrap_or_else(|p| p.into_inner());
+        lock.source = false;
+        lock.policy_boundary_ms = Some(
+            lock.policy_boundary_ms
+                .map_or(now_ms, |old| old.min(now_ms)),
+        );
+        let next = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        lock.generation = next;
+    }
+
+    /// A segment boundary earlier than the policy change must leave it pending.
+    pub fn take_policy_boundary_before(&self, now_ms: u64) -> Option<u64> {
+        let mut lock = self.state.write().unwrap_or_else(|p| p.into_inner());
+        if lock.policy_boundary_ms.is_some_and(|at| at <= now_ms) {
+            lock.policy_boundary_ms.take()
+        } else {
+            None
+        }
     }
 
     pub fn is_app_excluded(&self, app: &str, app_id: Option<&str>) -> bool {
