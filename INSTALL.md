@@ -171,7 +171,7 @@ continue taking in what you share while unpaired or offline. Setup asks you to c
 
 ## Build from source
 
-Install rustup, a C toolchain, CMake, pkg-config, GTK4/GLib/GStreamer development headers, and PulseAudio development headers. Then:
+Install rustup, a C toolchain, CMake, pkg-config, GTK4/GLib/GStreamer development headers, PulseAudio development headers, and the `minisign` and `shellcheck` commands, which `make ci` runs. Then:
 
 ```bash
 git clone https://github.com/solpbc/solstone-linux.git
@@ -204,6 +204,8 @@ solstone-linux status
 ```
 
 ## Desktop notes
+
+On Wayland, the first time the solstone app starts, your desktop asks which screens to share. Nothing from the screen is taken in until you answer, and your choice is kept for later starts.
 
 Activity detection uses screen-lock and power-save signals to notice when you step away. GNOME provides both signals; KDE Wayland provides screen lock; X11 can also provide DPMS power save. Where neither signal is available, the solstone app on linux still takes in what you share and that material goes into your journal, but activity-based segment boundaries do not trigger.
 
