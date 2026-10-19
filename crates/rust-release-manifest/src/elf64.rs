@@ -1039,6 +1039,9 @@ mod tests {
         );
     }
 
+    // The parser accepts only x86_64 (EM_X86_64 = 62), the one shipped target, and
+    // this test parses its own executable, so it can only hold on an x86_64 host.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn parses_the_real_rustc_test_pie() {
         let bytes = fs::read(std::env::current_exe().unwrap()).unwrap();
