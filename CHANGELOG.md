@@ -9,6 +9,7 @@ and this project adheres to Semantic Versioning.
 ### Fixed
 
 - desktop activity settings no longer show the web-address switch while that information is unavailable.
+- in settings, the lists of apps and window titles to leave out now say they apply to desktop activity.
 
 ## [2.0.25] - 2026-10-20
 
