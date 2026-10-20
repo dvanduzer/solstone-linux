@@ -10,7 +10,7 @@ and this project adheres to Semantic Versioning.
 
 ### Added
 
-- you can now share desktop activity with the solstone app: which app is in front, and whether you're active or idle, or your screen is locked. all of it goes into your journal. window titles and web addresses from Firefox each have their own switch. it all stays off until you turn it on in the window's settings tab, where you can also leave out apps and window titles.
+- you can now share desktop activity with the solstone app: which app is in front, and whether you're active or idle, or your screen is locked. all of it goes into your journal. window titles have their own switch. it all stays off until you turn it on in the window's settings tab, where you can also leave out apps and window titles.
 
 ### Fixed
 
