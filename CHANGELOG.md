@@ -6,13 +6,16 @@ and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+## [2.0.25] - 2026-10-20
+
 ### Added
 
-- you can now share app names, window titles, and active, idle, and locked intervals with the solstone app, and all of it goes into your journal.
+- you can now share desktop activity with the solstone app: which app is in front, and whether you're active or idle, or your screen is locked. all of it goes into your journal. window titles and web addresses from Firefox each have their own switch. it all stays off until you turn it on in the window's settings tab, where you can also leave out apps and window titles.
 
 ### Fixed
 
 - on a computer with no microphone, the solstone app no longer quits unexpectedly after a few minutes while it keeps checking for one.
+- if you build from source, an update that stops on a missing development package now leaves your installed app as it was. before, it could leave the app half-updated.
 
 ## [2.0.24] - 2026-10-19
 
