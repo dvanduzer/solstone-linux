@@ -6,6 +6,10 @@ and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- desktop activity settings no longer show the web-address switch while that information is unavailable.
+
 ## [2.0.25] - 2026-10-20
 
 ### Added

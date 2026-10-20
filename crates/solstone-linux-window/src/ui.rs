@@ -1208,8 +1208,8 @@ fn create_settings_page(
     form_box.append(&activity_source_switch);
     form_box.append(&activity_titles_label);
     form_box.append(&activity_titles_switch);
-    form_box.append(&activity_urls_label);
-    form_box.append(&activity_urls_switch);
+    // Native browser URLs are not qualified yet. Keep the saved preference,
+    // but do not offer a control until the production reader can supply URLs.
     form_box.append(&activity_exclude_apps_label);
     form_box.append(&activity_exclude_apps_entry);
     form_box.append(&activity_exclude_titles_label);
