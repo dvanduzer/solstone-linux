@@ -131,7 +131,7 @@ pub const SETTINGS_RELOAD: &str = "read settings again";
 pub const ACTIVITY_WRITE_FAILED: &str = "couldn't save activity intake. try again.";
 pub const SETTINGS_ACTIVITY_SOURCE: &str = "desktop activity";
 pub const SETTINGS_ACTIVITY_TITLES: &str = "window titles";
-pub const SETTINGS_ACTIVITY_URLS: &str = "web addresses";
+pub const SETTINGS_ACTIVITY_URLS: &str = "web addresses (turns on desktop accessibility)";
 pub const SETTINGS_ACTIVITY_ONLY: &str = "activity only";
 pub const SETTINGS_ACTIVITY_ONLY_HELP: &str =
     "desktop activity only, with screen and audio intake off.";
@@ -139,7 +139,7 @@ pub const SETTINGS_ACTIVITY_PRIVATE_WINDOWS_NOTE: &str = "linux does not classif
 pub const SETTINGS_ACTIVITY_EXCLUDE_APPS: &str = "apps left out of desktop activity";
 pub const SETTINGS_ACTIVITY_EXCLUDE_TITLES: &str = "window titles left out of desktop activity";
 pub const SETTINGS_ACTIVITY_ROUTE: &str = "activity route";
-pub const SETTINGS_ACTIVITY_EXPLAIN: &str = "the solstone app takes in the app, window title, and active or idle time you share with it, and all of it goes into your journal.";
+pub const SETTINGS_ACTIVITY_EXPLAIN: &str = "the solstone app takes in the app, window title, web addresses, and active or idle time you share with it, and all of it goes into your journal.";
 pub const HELP_HEADING: &str = "get help";
 pub const HELP_INTRO: &str = "need a hand? reach a human. we're happy to help.";
 pub const HELP_OPEN: &str = "get help";

@@ -1129,6 +1129,7 @@ fn create_settings_page(
     activity_urls_switch.set_halign(gtk::Align::Start);
     let activity_urls_label = gtk::Label::new(Some(CopyKey::SettingsActivityUrls.as_str()));
     activity_urls_label.set_halign(gtk::Align::Start);
+    activity_urls_label.set_wrap(true);
     activity_urls_label.set_mnemonic_widget(Some(&activity_urls_switch));
     let activity_exclude_apps_entry = exclusion_text_view();
     let activity_exclude_apps_label =
@@ -1208,8 +1209,8 @@ fn create_settings_page(
     form_box.append(&activity_source_switch);
     form_box.append(&activity_titles_label);
     form_box.append(&activity_titles_switch);
-    // Native browser URLs are not qualified yet. Keep the saved preference,
-    // but do not offer a control until the production reader can supply URLs.
+    form_box.append(&activity_urls_label);
+    form_box.append(&activity_urls_switch);
     form_box.append(&activity_exclude_apps_label);
     form_box.append(&activity_exclude_apps_entry);
     form_box.append(&activity_exclude_titles_label);

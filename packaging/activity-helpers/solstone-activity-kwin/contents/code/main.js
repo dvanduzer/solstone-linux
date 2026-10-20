@@ -93,7 +93,7 @@ workspace.windowActivated.connect(function (win) {
 });
 
 var refresh = new QTimer();
-refresh.interval = 2000;
+refresh.interval = 250;
 refresh.timeout.connect(checkActiveWindow);
 refresh.start();
 checkActiveWindow();

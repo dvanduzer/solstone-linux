@@ -303,6 +303,8 @@ pub struct NativeActivitySources {
     follower: Option<SessionFollower>,
     last_kind: Option<crate::desktop_session::DesktopKind>,
     last_display: Option<String>,
+    last_desktop_token: String,
+    last_sway_socket: Option<String>,
 }
 
 impl NativeActivitySources {
@@ -336,7 +338,7 @@ impl NativeActivitySources {
         let system_connection = runtime.block_on(Connection::system()).ok();
         let (signals_tx, signals_rx) = mpsc::channel();
         Self {
-            desktop,
+            desktop: desktop.clone(),
             session_type,
             session: NativeSessionBus {
                 runtime: Arc::clone(&runtime),
@@ -364,6 +366,8 @@ impl NativeActivitySources {
             follower,
             last_kind: None,
             last_display: None,
+            last_desktop_token: desktop.clone(),
+            last_sway_socket: None,
         }
     }
 }
@@ -374,6 +378,14 @@ impl ActivityOps for NativeActivitySources {
         if let Some(target) = &target {
             self.last_kind = target.kind;
             self.last_display = target.display.clone();
+            if let (Some(follower), Some(session_id)) = (&mut self.follower, &target.session_id) {
+                let route_env = follower.route_environment(session_id);
+                self.last_desktop_token = route_env.desktop.unwrap_or_default();
+                self.last_sway_socket = route_env.sway_socket;
+            } else {
+                self.last_desktop_token = self.desktop.clone();
+                self.last_sway_socket = None;
+            }
             match target.kind {
                 Some(DesktopKind::X11) => self.session_type = "x11".into(),
                 Some(DesktopKind::Wayland) => self.session_type = "wayland".into(),
@@ -388,6 +400,8 @@ impl ActivityOps for NativeActivitySources {
         } else {
             self.last_kind = None;
             self.last_display = None;
+            self.last_desktop_token = self.desktop.clone();
+            self.last_sway_socket = None;
         }
         if !self.probed_inventory {
             self.probed_inventory = true;
@@ -432,6 +446,13 @@ impl ActivityOps for NativeActivitySources {
 
     fn desktop_facts(&self) -> (Option<crate::desktop_session::DesktopKind>, Option<String>) {
         (self.last_kind, self.last_display.clone())
+    }
+
+    fn route_facts(&self) -> (String, Option<String>) {
+        (
+            self.last_desktop_token.clone(),
+            self.last_sway_socket.clone(),
+        )
     }
 }
 

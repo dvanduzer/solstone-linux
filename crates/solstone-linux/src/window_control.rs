@@ -4337,6 +4337,7 @@ mod tests {
                         title: Some("SENTINEL_TITLE".into()),
                         pid: Some(9),
                         window_id: 7,
+                        window_token: String::new(),
                     },
                 );
             }
@@ -4347,6 +4348,7 @@ mod tests {
                     title: None,
                     pid: Some(9),
                     window_id: 7,
+                    window_token: String::new(),
                 },
             )
         }
@@ -4404,7 +4406,7 @@ mod tests {
             },
             &mut provider,
             &crate::activity::ActivityFacts::default(),
-            &|| true,
+            &mut || true,
         );
         sampler.seal(2_000);
         assert_eq!(provider.title_reads.get(), 0);
@@ -4455,7 +4457,7 @@ mod tests {
             },
             &mut provider,
             &crate::activity::ActivityFacts::default(),
-            &|| true,
+            &mut || true,
         );
         sampler.seal(2_000);
         assert_eq!(provider.title_reads.get(), 0);

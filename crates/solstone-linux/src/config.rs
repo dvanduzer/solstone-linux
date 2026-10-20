@@ -257,7 +257,10 @@ fn apply_loaded_activity_policy(
     {
         config.activity_source = source;
         config.activity_titles = titles;
-        config.activity_urls = urls;
+        // Older releases saved this preference but could not read addresses.
+        // That unused choice did not authorize enabling OS accessibility.
+        config.activity_urls =
+            urls && values.get("activity_urls_consent").and_then(Value::as_u64) == Some(1);
         config.activity_exclude_apps = apps;
         config.activity_exclude_titles = title_list;
         return;
@@ -553,6 +556,7 @@ fn write_config_merge(
 
     match overlay {
         ConfigOverlay::Settings(snapshot) => {
+            map.insert("activity_urls_consent".into(), Value::from(1));
             capture_framerate = snapshot.capture_framerate.clamp(1, 10);
             draw_cursor = snapshot.draw_cursor;
             start_paused = snapshot.start_paused;
@@ -633,6 +637,7 @@ fn write_config_merge(
                         io::Error::new(io::ErrorKind::InvalidInput, "invalid activity_urls")
                     })?;
                     activity_urls = b;
+                    map.insert("activity_urls_consent".into(), Value::from(1));
                     Value::Bool(b)
                 }
                 "activity_only" => {
@@ -752,6 +757,7 @@ fn write_config_merge(
                     activity_source = src;
                     activity_titles = tit;
                     activity_urls = url;
+                    map.insert("activity_urls_consent".into(), Value::from(1));
                     activity_exclude_apps = apps;
                     activity_exclude_titles = titles;
 
@@ -805,7 +811,21 @@ fn write_config_merge(
     let mut bytes = if is_guided_field {
         serde_json::to_vec_pretty(&map).map_err(io::Error::other)?
     } else if merge_basis.is_none() {
-        serde_json::to_vec_pretty(&returned_config).map_err(io::Error::other)?
+        if let Some(consent) = map.get("activity_urls_consent") {
+            #[derive(Serialize)]
+            struct Consented<'a> {
+                #[serde(flatten)]
+                config: &'a Config,
+                activity_urls_consent: &'a Value,
+            }
+            serde_json::to_vec_pretty(&Consented {
+                config: &returned_config,
+                activity_urls_consent: consent,
+            })
+            .map_err(io::Error::other)?
+        } else {
+            serde_json::to_vec_pretty(&returned_config).map_err(io::Error::other)?
+        }
     } else {
         map.insert("stream".into(), Value::String(stream));
         map.insert(
@@ -1014,6 +1034,28 @@ mod tests {
         thread,
         time::Duration,
     };
+
+    #[test]
+    fn first_settings_save_preserves_explicit_address_consent() {
+        let root = tempfile::tempdir().unwrap();
+        let config = Config {
+            config_dir: root.path().join("config"),
+            base_dir: root.path().join("data"),
+            activity_source: true,
+            activity_titles: true,
+            activity_urls: true,
+            activity_exclude_apps: vec!["Excluded".into()],
+            ..Config::default()
+        };
+        save_config(&config).unwrap();
+        let loaded = load_config(ConfigPaths {
+            base_dir: Some(config.base_dir),
+            config_dir: Some(config.config_dir),
+        })
+        .config;
+        assert!(loaded.activity_urls && loaded.activity_source && loaded.activity_titles);
+        assert_eq!(loaded.activity_exclude_apps, ["Excluded"]);
+    }
 
     struct FailStage(DurableWriteStage);
 

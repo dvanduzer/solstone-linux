@@ -16,113 +16,59 @@ use crate::activity_helpers::{
     GnomeSnapshotRequest, WindowSnapshot, check_age, current_unix_ms, parse_gnome_reply,
     parse_kwin_snapshot,
 };
-use crate::activity_writer::{MAX_BODY_BYTES, MAX_STRING_BYTES};
-
-const ROLE_FRAME: u32 = 23;
-const ROLE_DOCUMENT_FRAME: u32 = 82;
-const ROLE_DOCUMENT_WEB: u32 = 95;
-const STATE_ACTIVE: u32 = 1;
-const STATE_SHOWING: u32 = 25;
-const MAX_NODES: usize = 64;
-const MAX_DEPTH: usize = 6;
-
-pub trait A11yNode {
-    fn role(&self) -> u32;
-    fn states(&self) -> u64;
-    fn children(&self) -> Vec<Box<dyn A11yNode + '_>>;
-    /// Document attribute `DocURL`. Call this only after the tree has exactly one showing document.
-    fn doc_url(&self) -> Option<String>;
-}
-
-fn state_bit(states: u64, bit: u32) -> bool {
-    states & (1u64 << bit) != 0
-}
-
-fn is_active_frame(node: &(dyn A11yNode + '_)) -> bool {
-    node.role() == ROLE_FRAME
-        && state_bit(node.states(), STATE_ACTIVE)
-        && state_bit(node.states(), STATE_SHOWING)
-}
-
-fn is_showing_document(node: &(dyn A11yNode + '_)) -> bool {
-    let role = node.role();
-    (role == ROLE_DOCUMENT_FRAME || role == ROLE_DOCUMENT_WEB)
-        && state_bit(node.states(), STATE_SHOWING)
-}
-
-struct DocScan {
-    nodes: usize,
-    frames: usize,
-    docs: usize,
-}
-
-/// One showing document under the one active frame. `doc_url` runs only then.
-/// The daemon does not call this. Production does not open an accessibility connection.
-pub fn prove_firefox_document(root: &(dyn A11yNode + '_)) -> Option<String> {
-    let mut scan = DocScan {
-        nodes: 0,
-        frames: 0,
-        docs: 0,
-    };
-    count_documents(root, 0, false, &mut scan);
-    if scan.frames != 1 || scan.docs != 1 || scan.nodes > MAX_NODES {
-        return None;
-    }
-    let mut nodes = 0usize;
-    let mut url = None;
-    read_single_document(root, 0, false, &mut nodes, &mut url);
-    url.filter(|value| value.len() <= MAX_STRING_BYTES)
-}
-
-fn count_documents(node: &(dyn A11yNode + '_), depth: usize, in_frame: bool, scan: &mut DocScan) {
-    if depth > MAX_DEPTH || scan.nodes >= MAX_NODES || scan.frames > 1 || scan.docs > 1 {
-        return;
-    }
-    scan.nodes += 1;
-    if !in_frame && is_active_frame(node) {
-        scan.frames += 1;
-        for child in node.children() {
-            count_documents(child.as_ref(), depth + 1, true, scan);
-        }
-        return;
-    }
-    if in_frame && is_showing_document(node) {
-        scan.docs += 1;
-        return;
-    }
-    for child in node.children() {
-        count_documents(child.as_ref(), depth + 1, in_frame, scan);
-    }
-}
-
-fn read_single_document(
-    node: &(dyn A11yNode + '_),
-    depth: usize,
-    in_frame: bool,
-    nodes: &mut usize,
-    url: &mut Option<String>,
-) {
-    if url.is_some() || depth > MAX_DEPTH || *nodes >= MAX_NODES {
-        return;
-    }
-    *nodes += 1;
-    if !in_frame && is_active_frame(node) {
-        for child in node.children() {
-            read_single_document(child.as_ref(), depth + 1, true, nodes, url);
-        }
-        return;
-    }
-    if in_frame && is_showing_document(node) {
-        *url = node.doc_url();
-        return;
-    }
-    for child in node.children() {
-        read_single_document(child.as_ref(), depth + 1, in_frame, nodes, url);
-    }
-}
+use crate::activity_writer::MAX_BODY_BYTES;
 
 pub trait HelperBus: Send {
     fn exchange(&mut self, request: &str) -> Result<String, &'static str>;
+}
+
+pub trait SwayBus: Send {
+    fn tree(&mut self, path: &str) -> Result<String, &'static str>;
+}
+
+pub struct NativeSwayBus;
+
+impl SwayBus for NativeSwayBus {
+    fn tree(&mut self, path: &str) -> Result<String, &'static str> {
+        use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+        let deadline = Instant::now() + Duration::from_millis(500);
+        // A full listen backlog must fail unavailable rather than block connect.
+        let fd = rustix::net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+            None,
+        )
+        .map_err(|_| "unavailable")?;
+        let address = SocketAddrUnix::new(path).map_err(|_| "unavailable")?;
+        rustix::net::connect(&fd, &address).map_err(|_| "unavailable")?;
+        let mut stream = UnixStream::from(fd);
+        stream.set_nonblocking(false).map_err(|_| "unavailable")?;
+        crate::activity_helpers::verify_socket_and_peer(
+            std::path::Path::new(path),
+            &stream,
+            rustix::process::getuid().as_raw(),
+        )
+        .map_err(|_| "unavailable")?;
+        arm_deadline(&stream, deadline)?;
+        stream
+            .write_all(&crate::activity_helpers::encode_sway_command(4, &[]))
+            .map_err(|_| "unavailable")?;
+        struct Bounded<'a>(&'a mut UnixStream, Instant);
+        impl Read for Bounded<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                arm_deadline(self.0, self.1)
+                    .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?;
+                self.0.read(buf)
+            }
+        }
+        let (kind, payload) =
+            crate::activity_helpers::read_sway_frame(&mut Bounded(&mut stream, deadline))?;
+        if kind != 4 || Instant::now() >= deadline {
+            return Err("unavailable");
+        }
+        String::from_utf8(payload).map_err(|_| "invalid-json")
+    }
 }
 
 pub struct GnomeEndpoint {
@@ -289,9 +235,8 @@ impl Drop for GnomeEndpoint {
 
 #[derive(Clone, Default)]
 pub struct KwinInterest {
-    // Only the in-module parser tests opt in. Production construction uses
-    // Default=false; no setting or installation can qualify this route.
-    qualified: bool,
+    pub pending: bool,
+    pub epoch: u64,
     pub prefs: Option<std::sync::Arc<crate::activity_prefs::ActivityPrefs>>,
     pub paused: bool,
     pub session_live: bool,
@@ -312,9 +257,7 @@ impl KwinInterest {
             .prefs
             .as_ref()
             .is_some_and(|prefs| prefs.snapshot().source);
-        // No producer/helper qualification has been completed for KWin. Neither
-        // installing its assets nor saving source=true grants it authorization.
-        self.qualified && source && !self.paused && self.session_live
+        source && !self.paused && self.session_live
     }
 
     pub fn refresh_admission(&mut self) {
@@ -324,6 +267,8 @@ impl KwinInterest {
             .map(|prefs| prefs.snapshot().generation)
             .unwrap_or(0);
         if !self.admitted() || generation != self.seen_generation {
+            self.pending = false;
+            self.generation = self.generation.wrapping_add(1);
             self.latest = None;
             self.want_title = false;
             self.expected_window.clear();
@@ -337,7 +282,7 @@ impl KwinInterest {
     /// `expectedWindow` is KWin `internalId`. An empty id never asks for a caption.
     pub fn authorize(&mut self) -> (bool, u64, bool, String, u32, String) {
         self.refresh_admission();
-        if !self.admitted() {
+        if !self.admitted() || !self.pending {
             return (
                 false,
                 self.generation,
@@ -359,8 +304,7 @@ impl KwinInterest {
 
     pub fn submit(&mut self, generation: u64, json: &str) -> Result<(), &'static str> {
         self.refresh_admission();
-        if !self.admitted() || generation != self.generation {
-            self.latest = None;
+        if !self.admitted() || !self.pending || generation != self.generation {
             return Err("stale-generation");
         }
         let snapshot = match parse_kwin_snapshot(json, generation, current_unix_ms()) {
@@ -371,7 +315,11 @@ impl KwinInterest {
             }
         };
         if self.want_title {
-            if self.expected_window.is_empty() || snapshot.window_token != self.expected_window {
+            if self.expected_window.is_empty()
+                || snapshot.window_token != self.expected_window
+                || snapshot.pid != Some(self.expected_pid)
+                || snapshot.wm_class != self.expected_class
+            {
                 self.latest = None;
                 return Err("focus-changed");
             }
@@ -384,6 +332,7 @@ impl KwinInterest {
             return Err("snapshot-expired");
         }
         self.latest = Some(snapshot);
+        self.pending = false;
         Ok(())
     }
 }
@@ -405,7 +354,7 @@ impl LiveDesktop {
     }
 
     #[cfg(test)]
-    fn with_helper(helper: Box<dyn HelperBus>) -> Self {
+    pub(crate) fn with_helper(helper: Box<dyn HelperBus>) -> Self {
         Self {
             helper,
             kwin: Arc::new(Mutex::new(KwinInterest::default())),
@@ -436,13 +385,15 @@ impl LiveDesktop {
             return;
         };
         let admit = route == "kwin" && live;
-        if !admit || epoch != gate.generation {
+        if !admit || epoch != gate.epoch {
+            gate.pending = false;
+            gate.generation = gate.generation.wrapping_add(1);
             gate.latest = None;
             gate.want_title = false;
             gate.expected_window.clear();
         }
         gate.session_live = admit;
-        gate.generation = epoch;
+        gate.epoch = epoch;
     }
 
     pub fn set_enabled(&self, enabled: bool) {
@@ -453,10 +404,58 @@ impl LiveDesktop {
             return;
         };
         gate.want_title = false;
+        gate.pending = false;
+        gate.generation = gate.generation.wrapping_add(1);
         gate.expected_window.clear();
         gate.expected_class.clear();
         gate.expected_pid = 0;
         gate.latest = None;
+    }
+
+    pub fn kwin_snapshot(
+        &self,
+        want_title: bool,
+        expected: Option<(String, String, u32)>,
+    ) -> Result<WindowSnapshot, &'static str> {
+        let request;
+        {
+            let mut gate = self.kwin.lock().map_err(|_| "unavailable")?;
+            gate.refresh_admission();
+            if !gate.admitted() {
+                return Err("unavailable");
+            }
+            let (window, class, pid) = expected.unwrap_or_default();
+            if want_title && window.is_empty() {
+                return Err("focus-changed");
+            }
+            gate.generation = gate.generation.wrapping_add(1);
+            request = gate.generation;
+            gate.latest = None;
+            gate.want_title = want_title;
+            gate.expected_window = window;
+            gate.expected_class = class;
+            gate.expected_pid = pid;
+            gate.pending = true;
+        }
+        let deadline = Instant::now() + Duration::from_millis(750);
+        loop {
+            {
+                let mut gate = self.kwin.lock().map_err(|_| "unavailable")?;
+                gate.refresh_admission();
+                if gate.generation != request || !gate.admitted() {
+                    return Err("unavailable");
+                }
+                if let Some(snapshot) = gate.latest.take() {
+                    return Ok(snapshot);
+                }
+                if Instant::now() >= deadline {
+                    gate.pending = false;
+                    gate.generation = gate.generation.wrapping_add(1);
+                    return Err("unavailable");
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     pub fn gnome_snapshot(
@@ -539,129 +538,6 @@ impl KwinService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
-    use std::rc::Rc;
-
-    use crate::activity_writer::sanitize_url;
-
-    struct Node {
-        role: u32,
-        states: u64,
-        children: Vec<Node>,
-        url: Option<String>,
-        reads: Rc<Cell<usize>>,
-    }
-
-    impl A11yNode for Node {
-        fn role(&self) -> u32 {
-            self.role
-        }
-        fn states(&self) -> u64 {
-            self.states
-        }
-        fn children(&self) -> Vec<Box<dyn A11yNode + '_>> {
-            self.children
-                .iter()
-                .map(|child| {
-                    Box::new(Node {
-                        role: child.role,
-                        states: child.states,
-                        children: child.children.clone(),
-                        url: child.url.clone(),
-                        reads: Rc::clone(&child.reads),
-                    }) as Box<dyn A11yNode>
-                })
-                .collect()
-        }
-        fn doc_url(&self) -> Option<String> {
-            self.reads.set(self.reads.get() + 1);
-            self.url.clone()
-        }
-    }
-
-    impl Clone for Node {
-        fn clone(&self) -> Self {
-            Self {
-                role: self.role,
-                states: self.states,
-                children: self.children.clone(),
-                url: self.url.clone(),
-                reads: Rc::clone(&self.reads),
-            }
-        }
-    }
-
-    fn showing(active: bool) -> u64 {
-        let mut bits = 1u64 << STATE_SHOWING;
-        if active {
-            bits |= 1u64 << STATE_ACTIVE;
-        }
-        bits
-    }
-
-    #[test]
-    fn firefox_doc_url_reads_only_the_showing_document() {
-        let entry_reads = Rc::new(Cell::new(0));
-        let doc_reads = Rc::new(Cell::new(0));
-        let root = Node {
-            role: 75,
-            states: showing(false),
-            reads: Rc::new(Cell::new(0)),
-            url: None,
-            children: vec![Node {
-                role: ROLE_FRAME,
-                states: showing(true),
-                reads: Rc::new(Cell::new(0)),
-                url: None,
-                children: vec![
-                    Node {
-                        role: 79,
-                        states: showing(true) | (1u64 << 12),
-                        reads: Rc::clone(&entry_reads),
-                        url: Some("https://typed.example/draft".into()),
-                        children: vec![],
-                    },
-                    Node {
-                        role: ROLE_DOCUMENT_WEB,
-                        states: showing(false),
-                        reads: Rc::clone(&doc_reads),
-                        url: Some("https://user:pass@example.com/path?q=1#f".into()),
-                        children: vec![],
-                    },
-                ],
-            }],
-        };
-        let raw = prove_firefox_document(&root).unwrap();
-        assert_eq!(raw, "https://user:pass@example.com/path?q=1#f");
-        assert_eq!(entry_reads.get(), 0);
-        assert_eq!(doc_reads.get(), 1);
-        assert_eq!(
-            sanitize_url(&raw).as_deref(),
-            Some("https://example.com/path")
-        );
-    }
-
-    #[test]
-    fn two_showing_documents_do_not_read_a_value() {
-        let reads = Rc::new(Cell::new(0));
-        let doc = |reads: &Rc<Cell<usize>>| Node {
-            role: ROLE_DOCUMENT_WEB,
-            states: showing(false),
-            reads: Rc::clone(reads),
-            url: Some("https://example.com/a".into()),
-            children: vec![],
-        };
-        let root = Node {
-            role: ROLE_FRAME,
-            states: showing(true),
-            reads: Rc::new(Cell::new(0)),
-            url: None,
-            children: vec![doc(&reads), doc(&reads)],
-        };
-        assert!(prove_firefox_document(&root).is_none());
-        assert_eq!(reads.get(), 0);
-    }
-
     fn admitted_kwin() -> (
         KwinInterest,
         std::sync::Arc<crate::activity_prefs::ActivityPrefs>,
@@ -673,7 +549,8 @@ mod tests {
             },
         ));
         let gate = KwinInterest {
-            qualified: true,
+            pending: true,
+            epoch: 4,
             prefs: Some(std::sync::Arc::clone(&prefs)),
             paused: false,
             session_live: true,
@@ -689,9 +566,9 @@ mod tests {
     }
 
     #[test]
-    fn unqualified_kwin_never_authorizes_or_accepts_content() {
+    fn inactive_kwin_never_authorizes_or_accepts_content() {
         let (mut gate, _prefs) = admitted_kwin();
-        gate.qualified = false;
+        gate.session_live = false;
         assert!(!gate.authorize().0);
         assert!(!gate.want_title);
         assert!(gate.submit(4, r#"{"caption":"SECRET"}"#).is_err());

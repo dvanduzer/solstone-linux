@@ -525,6 +525,8 @@ pub struct ActivityFacts {
     pub display: Option<String>,
     /// Copied from the same probe as `ActivityState.session_epoch`. A mismatch refuses X11.
     pub session_epoch: u64,
+    pub desktop_token: String,
+    pub sway_socket: Option<String>,
 }
 
 pub trait ActivityOps: Send + 'static {
@@ -532,6 +534,10 @@ pub trait ActivityOps: Send + 'static {
 
     fn desktop_facts(&self) -> (Option<DesktopKind>, Option<String>) {
         (None, None)
+    }
+
+    fn route_facts(&self) -> (String, Option<String>) {
+        (String::new(), None)
     }
 }
 
@@ -621,11 +627,14 @@ fn run_worker(mut ops: impl ActivityOps, latest: Arc<Mutex<(ActivityState, Activ
     loop {
         let (next, bound) = ops.probe_once();
         let (kind, display) = ops.desktop_facts();
+        let (desktop_token, sway_socket) = ops.route_facts();
         let published_facts = ActivityFacts {
             bound,
             kind,
             display,
             session_epoch: next.session_epoch,
+            desktop_token,
+            sway_socket,
         };
         *latest.lock().expect("activity snapshot lock") = (next, published_facts);
         if !reported {

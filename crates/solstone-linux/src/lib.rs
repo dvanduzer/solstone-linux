@@ -3,6 +3,7 @@
 
 pub mod about;
 pub mod activity;
+pub mod activity_address;
 pub mod activity_helper_install;
 pub mod activity_helpers;
 pub mod activity_live;

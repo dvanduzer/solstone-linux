@@ -1161,6 +1161,7 @@ mod tests {
                     title,
                     pid: Some(4),
                     window_id: 9,
+                    window_token: String::new(),
                 })
             }
 
@@ -1182,7 +1183,7 @@ mod tests {
                 },
                 provider,
                 &ActivityFacts::default(),
-                &|| true,
+                &mut || true,
             );
         }
 

@@ -463,16 +463,13 @@ fn run_capture(
             .map(std::path::PathBuf::from)
             .collect(),
     ));
+    let foreground = crate::activity_source::ProductionForeground::start(config.state_dir());
     let mut observer = Observer::with_starting_pause(config, backends, zone, starting_pause);
-    let desktop = env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
     observer.install_activity(
         activity_prefs,
         activity_fault,
         activity_capability,
-        Box::new(crate::activity_source::ProductionForeground::start(
-            desktop.clone(),
-        )),
-        desktop,
+        Box::new(foreground),
     );
     let initialized = !stopped.load(Ordering::Acquire);
     let mut run_result = if initialized {

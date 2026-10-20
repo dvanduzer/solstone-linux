@@ -355,7 +355,6 @@ where
         fault: std::sync::Arc<ActivityFault>,
         capability: std::sync::Arc<std::sync::Mutex<CapabilityStatus>>,
         foreground: Box<dyn ForegroundProvider>,
-        desktop: String,
     ) {
         self.foreground = foreground;
         self.foreground.bind_prefs(std::sync::Arc::clone(&prefs));
@@ -365,7 +364,6 @@ where
             writer: None,
             fault,
             capability,
-            desktop,
         });
     }
 
@@ -885,13 +883,12 @@ where
         // span before the enable and disabling cannot extend the old span.
         let (snap, now_ms) =
             prefs.take_policy_snapshot(|| wall_millis(self.backends.clock.wall_seconds()));
-        let desktop = activity.desktop.clone();
         let has_open = activity.sampler.has_open();
         if !snap.source && !has_open {
             return;
         }
         let facts = self.backends.activity.activity_facts();
-        let route = route_name(facts.kind, &desktop);
+        let route = route_name(facts.kind, &facts.desktop_token);
         let input = PollInput {
             now_ms,
             prefs: snap.clone(),
@@ -913,11 +910,20 @@ where
             Some(activity) => std::mem::take(&mut activity.sampler),
             None => return,
         };
-        sampler.poll(&input, foreground.as_mut(), &facts, &|| {
-            prefs.generation() == start_generation
-                && !state.paused
-                && backends.activity.current_session_epoch() == start_epoch
-        });
+        let mut still_ok = || {
+            if prefs.generation() != start_generation
+                || state.paused
+                || backends.activity.current_session_epoch() != start_epoch
+            {
+                return false;
+            }
+            backends.activity.probe().is_ok_and(|probe_state| {
+                !probe_state.screen_locked
+                    && probe_state.session.is_live()
+                    && probe_state.session_epoch == start_epoch
+            })
+        };
+        sampler.poll(&input, foreground.as_mut(), &facts, &mut still_ok);
         let status = sampler.status();
         let Some(activity) = activity.as_mut() else {
             return;
@@ -2901,6 +2907,7 @@ pub(crate) mod tests {
                     title: None,
                     pid: None,
                     window_id: 0,
+                    window_token: String::new(),
                 },
             )
         }
@@ -2930,7 +2937,6 @@ pub(crate) mod tests {
                 title_reads: Rc::new(Cell::new(0)),
                 app: "Notes".into(),
             }),
-            String::new(),
         );
         f.observer.config.activity_only = true;
         (fault, reads)

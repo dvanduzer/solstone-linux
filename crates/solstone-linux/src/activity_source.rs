@@ -72,6 +72,7 @@ pub struct ForegroundWindow {
     pub pid: Option<u32>,
     /// X11 window id or GNOME window id. Zero means the window cannot be told apart.
     pub window_id: u64,
+    pub window_token: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,10 +91,8 @@ pub trait ForegroundProvider {
         None
     }
 
-    /// Helpers stop their own reads when this is false.
     fn set_reading(&mut self, _enabled: bool) {}
 
-    /// A second look that must not replace the window token stored by `read_foreground`.
     fn confirm_window(&mut self, _facts: &ActivityFacts) -> ForegroundRead {
         ForegroundRead::Unavailable
     }
@@ -173,7 +172,6 @@ pub struct ActivityRuntime {
     pub writer: Option<(std::path::PathBuf, crate::activity_writer::ActivityWriter)>,
     pub fault: std::sync::Arc<ActivityFault>,
     pub capability: std::sync::Arc<Mutex<CapabilityStatus>>,
-    pub desktop: String,
 }
 
 pub struct ActivitySampler {
@@ -222,7 +220,7 @@ impl ActivitySampler {
         input: &PollInput,
         provider: &mut dyn ForegroundProvider,
         facts: &ActivityFacts,
-        still_ok: &dyn Fn() -> bool,
+        still_ok: &mut dyn FnMut() -> bool,
     ) {
         provider.note_session(
             input.route,
@@ -340,7 +338,7 @@ impl ActivitySampler {
         input: &PollInput,
         provider: &mut dyn ForegroundProvider,
         facts: &ActivityFacts,
-        still_ok: &dyn Fn() -> bool,
+        still_ok: &mut dyn FnMut() -> bool,
     ) {
         let suppressed = !input.prefs.source
             || input.paused
@@ -395,7 +393,9 @@ impl ActivitySampler {
                     if still_ok()
                         && second.app == window.app
                         && second.app_id == window.app_id
-                        && second.pid == window.pid =>
+                        && second.pid == window.pid
+                        && second.window_id == window.window_id
+                        && second.window_token == window.window_token =>
                 {
                     title = second.title;
                 }
@@ -414,7 +414,7 @@ impl ActivitySampler {
             self.close_slot(SlotKind::Foreground, input.now_ms);
             return;
         }
-        let stored_title = if input.prefs.titles { title } else { None };
+        let mut stored_title = if input.prefs.titles { title } else { None };
         let stored_url = match self.committed_url(input, provider, facts, &window, still_ok) {
             UrlCheck::Moved => {
                 self.close_slot(SlotKind::Foreground, input.now_ms);
@@ -422,6 +422,46 @@ impl ActivitySampler {
             }
             UrlCheck::Ready(url) => url,
         };
+
+        if !input.prefs.exclude_titles.is_empty() {
+            if !still_ok() {
+                provider.set_reading(false);
+                self.close_slot(SlotKind::Foreground, input.now_ms);
+                return;
+            }
+            match provider.read_foreground(true, facts) {
+                ForegroundRead::Window(fresh)
+                    if still_ok()
+                        && fresh.app == window.app
+                        && fresh.app_id == window.app_id
+                        && fresh.pid == window.pid
+                        && fresh.window_id == window.window_id
+                        && fresh.window_token == window.window_token =>
+                {
+                    let fresh_title = fresh.title.filter(|t| t.len() <= 4096);
+                    let Some(ref t) = fresh_title else {
+                        self.close_slot(SlotKind::Foreground, input.now_ms);
+                        return;
+                    };
+                    if title_excluded(&input.prefs, t) {
+                        self.close_slot(SlotKind::Foreground, input.now_ms);
+                        return;
+                    }
+                    if input.prefs.titles {
+                        stored_title = fresh_title;
+                    }
+                }
+                _ => {
+                    self.close_slot(SlotKind::Foreground, input.now_ms);
+                    return;
+                }
+            }
+        }
+        if !still_ok() {
+            provider.set_reading(false);
+            self.close_slot(SlotKind::Foreground, input.now_ms);
+            return;
+        }
         if stored_url.is_none() && input.prefs.urls {
             self.status.url = "unavailable".into();
         } else if stored_url.is_some() {
@@ -457,7 +497,7 @@ impl ActivitySampler {
         provider: &mut dyn ForegroundProvider,
         facts: &ActivityFacts,
         window: &ForegroundWindow,
-        still_ok: &dyn Fn() -> bool,
+        still_ok: &mut dyn FnMut() -> bool,
     ) -> UrlCheck {
         if !input.prefs.urls || !still_ok() {
             return UrlCheck::Ready(None);
@@ -470,7 +510,7 @@ impl ActivitySampler {
         let Some(pid) = window.pid else {
             return UrlCheck::Ready(None);
         };
-        if window.window_id == 0 {
+        if window.window_id == 0 && window.window_token.is_empty() {
             return UrlCheck::Ready(None);
         }
         let Some(raw) = provider.read_committed_url(pid) else {
@@ -482,7 +522,10 @@ impl ActivitySampler {
         let ForegroundRead::Window(again) = provider.confirm_window(facts) else {
             return UrlCheck::Ready(None);
         };
-        if again.window_id != window.window_id || again.pid != Some(pid) {
+        if again.window_id != window.window_id
+            || again.window_token != window.window_token
+            || again.pid != Some(pid)
+        {
             return UrlCheck::Moved;
         }
         UrlCheck::Ready(crate::activity_writer::sanitize_url(&raw))
@@ -587,7 +630,10 @@ fn app_excluded(prefs: &ActivityPrefsSnapshot, app: &str, app_id: Option<&str>) 
 fn is_firefox(app: &str, app_id: Option<&str>) -> bool {
     fn token(value: &str) -> bool {
         let lower = value.to_ascii_lowercase();
-        lower == "firefox" || lower.strip_suffix(".desktop") == Some("firefox")
+        matches!(
+            lower.strip_suffix(".desktop").unwrap_or(&lower),
+            "firefox" | "firefox_firefox"
+        )
     }
     token(app) || app_id.is_some_and(token)
 }
@@ -769,13 +815,17 @@ fn window_from_snapshot(
         title: if want_title { snapshot.title } else { None },
         pid: snapshot.pid,
         window_id: u64::from(snapshot.window_id),
+        window_token: snapshot.window_token,
     })
 }
 
-/// Live foreground. Missing helpers report unavailable. Sway has no live client
-/// and stays unavailable. URL is a Firefox document address only.
+/// Compositor-selected foreground and committed document addresses.
 pub struct ProductionForeground {
-    desktop: String,
+    state_dir: Option<std::path::PathBuf>,
+    prefs: Option<std::sync::Arc<crate::activity_prefs::ActivityPrefs>>,
+    addresses: Box<dyn crate::activity_address::AddressReader>,
+    sway: Box<dyn crate::activity_live::SwayBus>,
+    sway_expected: Option<(String, String, Option<u32>)>,
     live: crate::activity_live::LiveDesktop,
     x11_expected: Option<(u32, String)>,
     gnome_expected: Option<(u64, String, u32)>,
@@ -785,9 +835,13 @@ pub struct ProductionForeground {
 
 impl ProductionForeground {
     /// Opens the helper socket and KWin bus name. Tests do not call this.
-    pub fn start(desktop: String) -> Self {
+    pub fn start(state_dir: std::path::PathBuf) -> Self {
         Self {
-            desktop,
+            state_dir: Some(state_dir),
+            prefs: None,
+            addresses: Box::new(crate::activity_address::NativeAddressReader::start()),
+            sway: Box::new(crate::activity_live::NativeSwayBus),
+            sway_expected: None,
             live: crate::activity_live::LiveDesktop::start(),
             x11_expected: None,
             gnome_expected: None,
@@ -852,110 +906,90 @@ impl ProductionForeground {
         }
     }
 
-    fn read_kwin(&mut self, want_title: bool, facts: &ActivityFacts) -> ForegroundRead {
-        let Ok(mut gate) = self.live.kwin.lock() else {
+    fn read_kwin(&mut self, want_title: bool, _facts: &ActivityFacts) -> ForegroundRead {
+        let expected = match stored_title_token(want_title, &self.kwin_expected) {
+            Ok(expected) => expected,
+            Err(_) => return ForegroundRead::Unavailable,
+        };
+        match self.live.kwin_snapshot(want_title, expected) {
+            Ok(snapshot) if !snapshot.window_token.is_empty() => {
+                self.kwin_expected = Some((
+                    snapshot.window_token.clone(),
+                    snapshot.wm_class.clone(),
+                    snapshot.pid.unwrap_or(0),
+                ));
+                window_from_snapshot(snapshot, want_title)
+            }
+            _ => {
+                self.kwin_expected = None;
+                ForegroundRead::Unavailable
+            }
+        }
+    }
+
+    fn read_sway(&mut self, want_title: bool, facts: &ActivityFacts) -> ForegroundRead {
+        let Some(path) = facts.sway_socket.as_deref() else {
             return ForegroundRead::Unavailable;
         };
-        gate.refresh_admission();
-        if !gate.admitted() {
-            gate.latest = None;
-            return ForegroundRead::Unavailable;
-        }
-        gate.generation = facts.session_epoch;
-        if want_title {
-            let Some((window, class, pid)) = self.kwin_expected.clone() else {
-                gate.want_title = false;
-                return ForegroundRead::Unavailable;
-            };
-            if window.is_empty() {
-                gate.want_title = false;
-                return ForegroundRead::Unavailable;
-            }
-            gate.want_title = true;
-            gate.expected_window = window.clone();
-            gate.expected_class = class;
-            gate.expected_pid = pid;
-            let snapshot = gate.latest.clone();
-            drop(gate);
-            let Some(snapshot) = snapshot else {
-                return ForegroundRead::Unavailable;
-            };
-            if !crate::activity_helpers::check_age(
-                snapshot.captured_unix_ms,
+        let read = self.sway.tree(path).and_then(|json| {
+            crate::activity_helpers::parse_sway_tree_response(
+                &json,
+                facts.session_epoch,
                 crate::activity_helpers::current_unix_ms(),
-            ) {
-                if let Ok(mut gate) = self.live.kwin.lock() {
-                    gate.latest = None;
+            )
+        });
+        match read {
+            Ok(snapshot) => {
+                let token = (
+                    snapshot.window_token.clone(),
+                    snapshot.app.clone(),
+                    snapshot.pid,
+                );
+                if want_title && self.sway_expected.as_ref() != Some(&token) {
+                    self.sway_expected = None;
+                    return ForegroundRead::Unavailable;
                 }
-                return ForegroundRead::Unavailable;
+                self.sway_expected = Some(token);
+                window_from_snapshot(snapshot, want_title)
             }
-            if snapshot.title.is_none() || snapshot.window_token != window {
-                return ForegroundRead::Unavailable;
+            Err(_) => {
+                self.sway_expected = None;
+                ForegroundRead::Unavailable
             }
-            return window_from_snapshot(snapshot, true);
         }
-        gate.want_title = false;
-        gate.expected_window.clear();
-        gate.expected_class.clear();
-        gate.expected_pid = 0;
-        let snapshot = gate.latest.clone();
-        drop(gate);
-        let Some(snapshot) = snapshot else {
-            return ForegroundRead::Unavailable;
-        };
-        if !crate::activity_helpers::check_age(
-            snapshot.captured_unix_ms,
-            crate::activity_helpers::current_unix_ms(),
-        ) {
-            if let Ok(mut gate) = self.live.kwin.lock() {
-                gate.latest = None;
-            }
-            return ForegroundRead::Unavailable;
-        }
-        let class = if snapshot.wm_class.is_empty() {
-            snapshot.app.clone()
-        } else {
-            snapshot.wm_class.clone()
-        };
-        if !snapshot.window_token.is_empty() && !class.is_empty() {
-            self.kwin_expected = Some((
-                snapshot.window_token.clone(),
-                class,
-                snapshot.pid.unwrap_or(0),
-            ));
-        } else {
-            self.kwin_expected = None;
-        }
-        window_from_snapshot(snapshot, false)
     }
 }
 
 impl ForegroundProvider for ProductionForeground {
     fn read_foreground(&mut self, want_title: bool, facts: &ActivityFacts) -> ForegroundRead {
-        match route_name(facts.kind, &self.desktop) {
+        match route_name(facts.kind, &facts.desktop_token) {
             "x11-ewmh" => self.read_x11(want_title, facts),
             "gnome-shell" => self.read_gnome(want_title, facts),
             "kwin" => self.read_kwin(want_title, facts),
-            // Sway and any other session stay unavailable. Do not open an X display.
+            "sway-ipc" => self.read_sway(want_title, facts),
             _ => ForegroundRead::Unavailable,
         }
     }
 
-    fn read_committed_url(&mut self, _pid: u32) -> Option<String> {
-        // No committed document property is qualified. An address value can
-        // remain unsubmitted after blur, so production does not read one and
-        // does not open an accessibility connection.
-        None
+    fn read_committed_url(&mut self, pid: u32) -> Option<String> {
+        let prefs = self.prefs.as_ref()?.clone();
+        let policy = prefs.snapshot();
+        if !policy.source || !policy.urls {
+            return None;
+        }
+        self.addresses.read(pid, prefs)
     }
 
     fn confirm_window(&mut self, facts: &ActivityFacts) -> ForegroundRead {
         let x11 = self.x11_expected.clone();
         let gnome = self.gnome_expected.clone();
         let kwin = self.kwin_expected.clone();
+        let sway = self.sway_expected.clone();
         let read = self.read_foreground(false, facts);
         self.x11_expected = x11;
         self.gnome_expected = gnome;
         self.kwin_expected = kwin;
+        self.sway_expected = sway;
         read
     }
 
@@ -965,10 +999,15 @@ impl ForegroundProvider for ProductionForeground {
             self.x11_expected = None;
             self.gnome_expected = None;
             self.kwin_expected = None;
+            self.sway_expected = None;
         }
     }
 
     fn bind_prefs(&mut self, prefs: std::sync::Arc<crate::activity_prefs::ActivityPrefs>) {
+        if let Some(state_dir) = self.state_dir.take() {
+            crate::activity_address::follow_permission(prefs.clone(), state_dir);
+        }
+        self.prefs = Some(prefs.clone());
         self.live.bind_prefs(prefs);
     }
 
@@ -978,6 +1017,7 @@ impl ForegroundProvider for ProductionForeground {
             self.x11_expected = None;
             self.gnome_expected = None;
             self.kwin_expected = None;
+            self.sway_expected = None;
         }
     }
 
@@ -993,6 +1033,151 @@ mod tests {
     use std::collections::VecDeque;
 
     use crate::desktop_session::SessionPresence;
+
+    #[test]
+    fn firefox_identity_includes_the_native_snap_class() {
+        assert!(is_firefox("firefox_firefox", None));
+        assert!(is_firefox("firefox_firefox.desktop", None));
+        assert!(is_firefox("Firefox", None));
+        assert!(!is_firefox("not-firefox", None));
+        assert!(!is_firefox("firefox-helper", None));
+    }
+
+    #[test]
+    fn settings_to_production_adapter_and_sanitized_rows() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        struct Helper(Arc<AtomicBool>);
+        impl crate::activity_live::HelperBus for Helper {
+            fn exchange(&mut self, request: &str) -> Result<String, &'static str> {
+                let request: crate::activity_helpers::GnomeSnapshotRequest =
+                    serde_json::from_str(request).unwrap();
+                Ok(
+                    serde_json::to_string(&crate::activity_helpers::GnomeSnapshotReply {
+                        v: 1,
+                        generation: request.generation,
+                        captured_unix_ms: crate::activity_helpers::current_unix_ms(),
+                        app: "firefox".into(),
+                        app_id: Some("firefox".into()),
+                        title: request.want_title.then(|| {
+                            if self.0.load(Ordering::SeqCst) {
+                                "blocked".into()
+                            } else {
+                                "page".into()
+                            }
+                        }),
+                        wm_class: Some("firefox".into()),
+                        pid: Some(9),
+                        window_id: Some(7),
+                    })
+                    .unwrap(),
+                )
+            }
+        }
+        struct Addresses {
+            reads: Arc<AtomicUsize>,
+            changed: Arc<AtomicBool>,
+            mutate: bool,
+        }
+        impl crate::activity_address::AddressReader for Addresses {
+            fn read(
+                &mut self,
+                pid: u32,
+                prefs: Arc<crate::activity_prefs::ActivityPrefs>,
+            ) -> Option<String> {
+                assert_eq!(pid, 9);
+                assert!(prefs.snapshot().source && prefs.snapshot().urls);
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                self.changed.store(self.mutate, Ordering::SeqCst);
+                Some("https://user:secret@example.com/page?unsubmitted=never#fragment".into())
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let paths = crate::config::ConfigPaths {
+            base_dir: Some(temp.path().join("data")),
+            config_dir: Some(temp.path().join("config")),
+        };
+        std::fs::create_dir_all(paths.config_dir.as_ref().unwrap()).unwrap();
+        std::fs::write(paths.config_dir.as_ref().unwrap().join("config.json"),
+            r#"{"activity_source":true,"activity_titles":true,"activity_urls":true,"activity_exclude_apps":["other"],"activity_exclude_titles":["other"]}"#).unwrap();
+        let legacy = crate::config::load_config(paths.clone()).config;
+        assert!(!legacy.activity_urls);
+        assert!(legacy.activity_source && legacy.activity_titles);
+        assert_eq!(legacy.activity_exclude_apps, ["other"]);
+        for (source, urls, app_excluded, title_excluded, mutate, expected_reads, expected_url) in [
+            (true, true, false, false, false, 1, true),
+            (true, false, false, false, false, 0, false),
+            (false, true, false, false, false, 0, false),
+            (true, true, true, false, false, 0, false),
+            (true, true, false, true, false, 0, false),
+            (true, true, false, true, true, 1, false),
+        ] {
+            let policy = serde_json::json!({"activity_source":source,"activity_titles":true,
+                "activity_urls":urls,"activity_exclude_apps":if app_excluded {vec!["firefox"]} else {vec![]},
+                "activity_exclude_titles":if title_excluded {vec!["blocked"]} else {vec![]}});
+            let config =
+                crate::config::set_guided_field(&paths, "activity_policy", policy).unwrap();
+            assert_eq!(
+                crate::config::load_config(paths.clone())
+                    .config
+                    .activity_urls,
+                urls
+            );
+            let prefs = Arc::new(crate::activity_prefs::ActivityPrefs::new(&config));
+            let reads = Arc::new(AtomicUsize::new(0));
+            let changed = Arc::new(AtomicBool::new(title_excluded && !mutate));
+            let mut provider = ProductionForeground {
+                state_dir: None,
+                prefs: None,
+                addresses: Box::new(Addresses {
+                    reads: reads.clone(),
+                    changed: changed.clone(),
+                    mutate,
+                }),
+                sway: Box::new(crate::activity_live::NativeSwayBus),
+                sway_expected: None,
+                live: crate::activity_live::LiveDesktop::with_helper(Box::new(Helper(changed))),
+                x11_expected: None,
+                gnome_expected: None,
+                kwin_expected: None,
+            };
+            provider.bind_prefs(prefs.clone());
+            let mut sampler = ActivitySampler::new();
+            let facts = ActivityFacts {
+                kind: Some(DesktopKind::Wayland),
+                desktop_token: "GNOME".into(),
+                ..ActivityFacts::default()
+            };
+            sampler.poll(
+                &PollInput {
+                    now_ms: 1000,
+                    prefs: prefs.snapshot(),
+                    activity: live_state(),
+                    bound: BoundBackends::default(),
+                    paused: false,
+                    route: "gnome-shell",
+                },
+                &mut provider,
+                &facts,
+                &mut || true,
+            );
+            sampler.seal(2000);
+            let rows = sampler.take_pending();
+            assert_eq!(reads.load(Ordering::SeqCst), expected_reads);
+            let blob = serde_json::to_string(&rows).unwrap();
+            assert_eq!(blob.contains("https://example.com/page"), expected_url);
+            assert!(
+                !blob.contains("secret")
+                    && !blob.contains("unsubmitted")
+                    && !blob.contains("fragment")
+            );
+            if app_excluded || title_excluded || !source {
+                assert!(foreground_apps(&rows).is_empty());
+            }
+        }
+    }
 
     fn prefs(
         source: bool,
@@ -1019,6 +1204,72 @@ mod tests {
         }
     }
 
+    #[test]
+    fn revocation_during_url_or_confirmation_discards_the_whole_sample() {
+        use std::rc::Rc;
+        struct Revoking {
+            allowed: Rc<Cell<bool>>,
+            confirm: bool,
+            value: Option<String>,
+        }
+        impl ForegroundProvider for Revoking {
+            fn read_foreground(&mut self, want_title: bool, _: &ActivityFacts) -> ForegroundRead {
+                ForegroundRead::Window(ForegroundWindow {
+                    app: "firefox".into(),
+                    app_id: Some("firefox".into()),
+                    title: want_title.then(|| "PRIVATE_TITLE".into()),
+                    pid: Some(9),
+                    window_id: 7,
+                    window_token: String::new(),
+                })
+            }
+            fn read_committed_url(&mut self, _: u32) -> Option<String> {
+                if !self.confirm {
+                    self.allowed.set(false);
+                }
+                self.value.clone()
+            }
+            fn confirm_window(&mut self, facts: &ActivityFacts) -> ForegroundRead {
+                self.allowed.set(false);
+                self.read_foreground(false, facts)
+            }
+        }
+        for (confirm, value) in [
+            (false, None),
+            (false, Some("https://private.example/".into())),
+            (true, Some("https://private.example/".into())),
+        ] {
+            let allowed = Rc::new(Cell::new(true));
+            let mut provider = Revoking {
+                allowed: allowed.clone(),
+                confirm,
+                value,
+            };
+            let mut sampler = ActivitySampler::new();
+            sampler.poll(
+                &PollInput {
+                    now_ms: 1000,
+                    prefs: prefs(true, true, true, &[], &[]),
+                    activity: live_state(),
+                    bound: BoundBackends::default(),
+                    paused: false,
+                    route: "x11-ewmh",
+                },
+                &mut provider,
+                &ActivityFacts::default(),
+                &mut || allowed.get(),
+            );
+            sampler.seal(2000);
+            let rows = sampler.take_pending();
+            assert!(foreground_apps(&rows).is_empty());
+            assert!(
+                !serde_json::to_string(&rows)
+                    .unwrap()
+                    .contains("PRIVATE_TITLE")
+            );
+        }
+    }
+
     struct Scripted {
         identity: VecDeque<ForegroundRead>,
         titled: VecDeque<ForegroundRead>,
@@ -1036,6 +1287,7 @@ mod tests {
                 title: title.map(str::to_string),
                 pid: None,
                 window_id: 0,
+                window_token: String::new(),
             })
         }
     }
@@ -1086,7 +1338,7 @@ mod tests {
             },
             provider,
             &ActivityFacts::default(),
-            &|| true,
+            &mut || true,
         );
     }
 
@@ -1192,6 +1444,7 @@ mod tests {
                 title: title.map(str::to_string),
                 pid: Some(4),
                 window_id: 9,
+                window_token: String::new(),
             })
         };
         let mut sampler = ActivitySampler::new();
@@ -1423,7 +1676,7 @@ mod tests {
             },
             &mut provider,
             &facts,
-            &|| true,
+            &mut || true,
         );
         assert_eq!(provider.identity.len(), 1);
         assert_eq!(provider.title_reads.get(), 0);
@@ -1456,7 +1709,7 @@ mod tests {
             },
             &mut provider,
             &ActivityFacts::default(),
-            &|| {
+            &mut || {
                 let seen = checks.get();
                 checks.set(seen + 1);
                 seen < 3
@@ -1595,6 +1848,7 @@ mod tests {
                     title: None,
                     pid: Some(42),
                     window_id: 7,
+                    window_token: String::new(),
                 }),
                 ForegroundRead::Window(ForegroundWindow {
                     app: "POISON_APP".into(),
@@ -1602,6 +1856,7 @@ mod tests {
                     title: Some("POISON_TITLE".into()),
                     pid: Some(42),
                     window_id: 99,
+                    window_token: String::new(),
                 }),
             ]),
             titled: VecDeque::new(),
@@ -1612,6 +1867,7 @@ mod tests {
                 title: Some("EXCLUDED_TITLE".into()),
                 pid: Some(42),
                 window_id: 8,
+                window_token: String::new(),
             })]),
             url: Some(secret.into()),
             url_reads: Cell::new(0),

@@ -79,6 +79,7 @@ pub struct LoginSession {
     pub remote: bool,
     pub seat: String,
     pub display: String,
+    pub desktop: String,
     pub state: String,
 }
 
@@ -136,6 +137,7 @@ pub struct CaptureTarget {
     pub session_id: Option<String>,
     pub session_path: Option<String>,
     pub kind: Option<DesktopKind>,
+    pub desktop: String,
     /// The X display: the session's own on X11, Xwayland's (when one is found) on Wayland.
     pub display: Option<String>,
     /// Changes whenever the session, its kind, its display or its presence changes.
@@ -154,12 +156,14 @@ impl CaptureTarget {
         Option<&str>,
         Option<DesktopKind>,
         Option<&str>,
+        &str,
     ) {
         (
             self.presence,
             self.session_id.as_deref(),
             self.kind,
             self.display.as_deref(),
+            &self.desktop,
         )
     }
 }
@@ -171,10 +175,21 @@ pub trait LoginSessions {
     fn list(&mut self, uid: u32) -> Result<Vec<LoginSession>, String>;
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionRouteEnv {
+    pub desktop: Option<String>,
+    pub sway_socket: Option<String>,
+}
+
 pub trait SessionProcesses {
     /// The `DISPLAY`, `XAUTHORITY` and `WAYLAND_DISPLAY` of each of this user's
     /// processes inside the session's scope.
     fn environments(&mut self, session_id: &str) -> Vec<HashMap<String, String>>;
+
+    fn route_environment(&mut self, session_id: &str) -> SessionRouteEnv {
+        let _ = session_id;
+        SessionRouteEnv::default()
+    }
 }
 
 /// An X11 authorization: protocol name and data. Empty is "no credential".
@@ -358,6 +373,31 @@ impl<L: LoginSessions, P: SessionProcesses, X: XServer> Resolver<L, P, X> {
         &self.current
     }
 
+    pub fn route_environment(&mut self, session_id: &str) -> SessionRouteEnv {
+        if self.current.session_id.as_deref() != Some(session_id)
+            || !self.current.presence.is_live()
+        {
+            return SessionRouteEnv::default();
+        }
+        let mut env = self.processes.route_environment(session_id);
+        // Desktop and eligibility come from the same logind selection. A second
+        // selection here could describe a different seat/session snapshot.
+        {
+            let desktop = if self.current.desktop.eq_ignore_ascii_case("plasma") {
+                "KDE"
+            } else {
+                &self.current.desktop
+            };
+            if ["KDE", "GNOME", "sway"]
+                .iter()
+                .any(|token| crate::activity::desktop_has_token(desktop, token))
+            {
+                env.desktop = Some(desktop.to_owned());
+            }
+        }
+        env
+    }
+
     pub fn resolve(&mut self, now: Instant) -> CaptureTarget {
         let next = match self.logind.list(self.uid) {
             Ok(sessions) => {
@@ -471,6 +511,7 @@ impl<L: LoginSessions, P: SessionProcesses, X: XServer> Resolver<L, P, X> {
             session_id: Some(session.id.clone()),
             session_path: Some(session.path.clone()),
             kind: Some(kind),
+            desktop: session.desktop.clone(),
             display: None,
             epoch: 0,
             local_desktops,
@@ -769,6 +810,7 @@ async fn list_sessions(connection: &zbus::Connection, uid: u32) -> zbus::Result<
             remote: flag("Remote"),
             seat: seat_id,
             display: text("Display"),
+            desktop: text("Desktop"),
             state: text("State"),
         });
     }
@@ -838,6 +880,97 @@ impl SessionProcesses for ProcSessionProcesses {
             }
         }
         found
+    }
+
+    fn route_environment(&mut self, session_id: &str) -> SessionRouteEnv {
+        let scope = format!("/session-{session_id}.scope");
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return SessionRouteEnv::default();
+        };
+        let mut seen_desktop: Option<String> = None;
+        let mut desktop_disagree = false;
+        let mut seen_sway_socket: Option<String> = None;
+        let mut sway_disagree = false;
+        let mut compositor_sockets = Vec::new();
+
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if !name.to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            let directory = entry.path();
+            if fs::metadata(&directory).map(|m| m.uid()).ok() != Some(self.uid) {
+                continue;
+            }
+            let in_scope = fs::read_to_string(directory.join("cgroup")).is_ok_and(|cgroup| {
+                cgroup.lines().any(|line| {
+                    line.rsplit(':')
+                        .next()
+                        .is_some_and(|path| path.split('/').any(|part| format!("/{part}") == scope))
+                })
+            });
+            if !in_scope {
+                continue;
+            }
+            let Ok(environ) = fs::read(directory.join("environ")) else {
+                continue;
+            };
+            let mut runtime_dir = format!("/run/user/{}", self.uid);
+            for pair in environ.split(|byte| *byte == 0) {
+                let Ok(pair) = std::str::from_utf8(pair) else {
+                    continue;
+                };
+                let Some((key, value)) = pair.split_once('=') else {
+                    continue;
+                };
+                if key == "XDG_RUNTIME_DIR" && value.starts_with('/') {
+                    runtime_dir = value.to_owned();
+                } else if key == "XDG_CURRENT_DESKTOP" && !value.is_empty() {
+                    if let Some(existing) = &seen_desktop {
+                        if existing != value {
+                            desktop_disagree = true;
+                        }
+                    } else {
+                        seen_desktop = Some(value.to_owned());
+                    }
+                } else if key == "SWAYSOCK" && !value.is_empty() {
+                    if let Some(existing) = &seen_sway_socket {
+                        if existing != value {
+                            sway_disagree = true;
+                        }
+                    } else {
+                        seen_sway_socket = Some(value.to_owned());
+                    }
+                }
+            }
+            if fs::read_to_string(directory.join("comm")).is_ok_and(|comm| comm.trim() == "sway") {
+                // Sway sets SWAYSOCK after exec, so /proc/<pid>/environ may
+                // never expose it. Its socket name includes this proven
+                // in-session compositor's uid and pid; the client also proves
+                // socket ownership and peer credentials before using it.
+                compositor_sockets.push(format!(
+                    "{runtime_dir}/sway-ipc.{}.{}.sock",
+                    self.uid,
+                    name.to_string_lossy()
+                ));
+                if seen_desktop.is_none() {
+                    seen_desktop = Some("sway".into());
+                }
+            }
+        }
+
+        if seen_sway_socket.is_none() && compositor_sockets.len() == 1 {
+            seen_sway_socket = compositor_sockets.pop();
+        }
+
+        SessionRouteEnv {
+            desktop: if desktop_disagree { None } else { seen_desktop },
+            sway_socket: if sway_disagree {
+                None
+            } else {
+                seen_sway_socket
+            },
+        }
     }
 }
 
@@ -948,6 +1081,10 @@ impl SessionFollower {
         *self.shared.lock().expect("capture target lock") = target.clone();
         target
     }
+
+    pub fn route_environment(&mut self, session_id: &str) -> SessionRouteEnv {
+        self.resolver.route_environment(session_id)
+    }
 }
 
 /// The production resolver, reading the startup environment kept by `cmd_run`.
@@ -985,6 +1122,7 @@ mod tests {
                 String::new()
             },
             state: if active { "active" } else { "online" }.into(),
+            desktop: String::new(),
         }
     }
 
@@ -1132,6 +1270,81 @@ mod tests {
             probes,
             resolver,
         }
+    }
+
+    #[test]
+    fn route_and_eligibility_share_one_selection_including_app_slice_desktops() {
+        for next in [
+            vec![LoginSession {
+                desktop: "plasma".into(),
+                ..session("2", "wayland", true)
+            }],
+            vec![],
+        ] {
+            let mut bed = bed(None);
+            let first = LoginSession {
+                desktop: "GNOME".into(),
+                ..session("1", "wayland", true)
+            };
+            bed.script.borrow_mut().extend([Ok(vec![first]), Ok(next)]);
+            let now = Instant::now();
+            let target = bed.resolver.resolve(now);
+            assert_eq!(target.desktop, "GNOME");
+            assert_eq!(
+                bed.resolver.route_environment("1").desktop.as_deref(),
+                Some("GNOME")
+            );
+            assert_eq!(
+                bed.script.borrow().len(),
+                1,
+                "route lookup must not select a second session"
+            );
+            let next = bed.resolver.resolve(now + Duration::from_secs(1));
+            assert!(next.epoch > target.epoch);
+            assert_eq!(
+                bed.resolver.route_environment("1"),
+                SessionRouteEnv::default()
+            );
+            if next.presence.is_live() {
+                assert_eq!(
+                    bed.resolver.route_environment("2").desktop.as_deref(),
+                    Some("KDE")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sway_socket_can_come_from_the_in_scope_compositor_without_startup_socket() {
+        let root = tempfile::tempdir().unwrap();
+        let uid = rustix::process::getuid().as_raw();
+        for (pid, scope, env, comm) in [
+            (
+                "21",
+                "session-3.scope",
+                "XDG_CURRENT_DESKTOP=sway\0XDG_RUNTIME_DIR=/synthetic/runtime\0",
+                "sway\n",
+            ),
+            (
+                "22",
+                "user@1000.service",
+                "XDG_CURRENT_DESKTOP=GNOME\0SWAYSOCK=/wrong/startup.sock\0",
+                "bash\n",
+            ),
+        ] {
+            let dir = root.path().join(pid);
+            fs::create_dir(&dir).unwrap();
+            fs::write(dir.join("cgroup"), format!("0::/user.slice/{scope}\n")).unwrap();
+            fs::write(dir.join("environ"), env).unwrap();
+            fs::write(dir.join("comm"), comm).unwrap();
+        }
+        let mut processes = ProcSessionProcesses::with_root(root.path(), uid);
+        let env = processes.route_environment("3");
+        assert_eq!(env.desktop.as_deref(), Some("sway"));
+        assert_eq!(
+            env.sway_socket,
+            Some(format!("/synthetic/runtime/sway-ipc.{uid}.21.sock"))
+        );
     }
 
     fn cookie_file(bed: &Bed, name: &str, number: &str, cookie: &[u8]) -> String {
@@ -1451,6 +1664,54 @@ mod tests {
             ProcSessionProcesses::with_root(temp.path(), uid + 1)
                 .environments("2")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_proc_session_route_environment() {
+        let temp = tempfile::tempdir().unwrap();
+        let uid = rustix::process::getuid().as_raw();
+        for (pid, cgroup, environ) in [
+            (
+                "21",
+                "0::/user.slice/user-1000.slice/session-3.scope\n",
+                "XDG_CURRENT_DESKTOP=sway\0SWAYSOCK=/run/user/1000/sway.sock\0",
+            ),
+            (
+                "22",
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice\n",
+                "XDG_CURRENT_DESKTOP=GNOME\0SWAYSOCK=/run/user/1000/other.sock\0",
+            ),
+        ] {
+            let directory = temp.path().join(pid);
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join("cgroup"), cgroup).unwrap();
+            fs::write(directory.join("environ"), environ).unwrap();
+        }
+
+        let mut scan = ProcSessionProcesses::with_root(temp.path(), uid);
+        let route_env = scan.route_environment("3");
+        assert_eq!(route_env.desktop.as_deref(), Some("sway"));
+        assert_eq!(
+            route_env.sway_socket.as_deref(),
+            Some("/run/user/1000/sway.sock")
+        );
+
+        // Add a disagreeing process in scope for desktop only
+        let dir23 = temp.path().join("23");
+        fs::create_dir(&dir23).unwrap();
+        fs::write(
+            dir23.join("cgroup"),
+            "0::/user.slice/user-1000.slice/session-3.scope\n",
+        )
+        .unwrap();
+        fs::write(dir23.join("environ"), "XDG_CURRENT_DESKTOP=GNOME\0").unwrap();
+
+        let route_env2 = scan.route_environment("3");
+        assert_eq!(route_env2.desktop, None);
+        assert_eq!(
+            route_env2.sway_socket.as_deref(),
+            Some("/run/user/1000/sway.sock")
         );
     }
 }

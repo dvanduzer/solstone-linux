@@ -257,9 +257,56 @@ pub fn verify_caller_uid(caller_uid: u32, expected_uid: u32) -> Result<(), &'sta
     }
 }
 
+pub const SWAY_IPC_MAGIC: &[u8; 6] = b"i3-ipc";
+pub const SWAY_MAX_PAYLOAD: usize = 1_048_576;
+pub const SWAY_GET_TREE_TYPE: u32 = 4;
+
+pub fn encode_sway_command(msg_type: u32, payload: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(14 + payload.len());
+    buf.extend_from_slice(SWAY_IPC_MAGIC);
+    buf.extend_from_slice(&(payload.len() as u32).to_ne_bytes());
+    buf.extend_from_slice(&msg_type.to_ne_bytes());
+    buf.extend_from_slice(payload);
+    buf
+}
+
+pub fn read_sway_frame<R: std::io::Read>(reader: &mut R) -> Result<(u32, Vec<u8>), &'static str> {
+    let mut header = [0u8; 14];
+    reader
+        .read_exact(&mut header)
+        .map_err(|_| "truncated-header")?;
+    if &header[0..6] != SWAY_IPC_MAGIC {
+        return Err("bad-magic");
+    }
+    let length = u32::from_ne_bytes(header[6..10].try_into().unwrap()) as usize;
+    let msg_type = u32::from_ne_bytes(header[10..14].try_into().unwrap());
+    if length > SWAY_MAX_PAYLOAD {
+        return Err("payload-too-large");
+    }
+    let mut payload = vec![0u8; length];
+    reader
+        .read_exact(&mut payload)
+        .map_err(|_| "truncated-payload")?;
+    Ok((msg_type, payload))
+}
+
+#[derive(Deserialize, Debug)]
+pub struct SwayWindowProperties {
+    #[serde(default)]
+    pub class: Option<String>,
+    #[serde(default)]
+    pub instance: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
 // Sway IPC tree parsing
 #[derive(Deserialize, Debug)]
 pub struct SwayNode {
+    #[serde(default)]
+    pub id: Option<i64>,
+    #[serde(default)]
+    pub shell: Option<String>,
     #[serde(default)]
     pub focused: bool,
     #[serde(default)]
@@ -269,26 +316,23 @@ pub struct SwayNode {
     #[serde(default)]
     pub pid: Option<u32>,
     #[serde(default)]
+    pub window_properties: Option<SwayWindowProperties>,
+    #[serde(default)]
     pub nodes: Vec<SwayNode>,
     #[serde(default)]
     pub floating_nodes: Vec<SwayNode>,
 }
 
-pub fn find_focused_sway_node(root: &SwayNode) -> Option<&SwayNode> {
-    if root.focused {
-        return Some(root);
+fn collect_focused_sway_nodes<'a>(node: &'a SwayNode, acc: &mut Vec<&'a SwayNode>) {
+    if node.focused {
+        acc.push(node);
     }
-    for child in &root.nodes {
-        if let Some(f) = find_focused_sway_node(child) {
-            return Some(f);
-        }
+    for child in &node.nodes {
+        collect_focused_sway_nodes(child, acc);
     }
-    for child in &root.floating_nodes {
-        if let Some(f) = find_focused_sway_node(child) {
-            return Some(f);
-        }
+    for child in &node.floating_nodes {
+        collect_focused_sway_nodes(child, acc);
     }
-    None
 }
 
 pub fn parse_sway_tree_response(
@@ -296,20 +340,47 @@ pub fn parse_sway_tree_response(
     generation: u64,
     now_unix_ms: u64,
 ) -> Result<WindowSnapshot, &'static str> {
-    if json.len() > MAX_BODY_BYTES {
+    if json.len() > SWAY_MAX_PAYLOAD {
         return Err("payload-too-large");
     }
     let root: SwayNode = serde_json::from_str(json).map_err(|_| "invalid-json")?;
-    let focused = find_focused_sway_node(&root).ok_or("no-focused-window")?;
-
-    let Some(ref app_id) = focused.app_id else {
-        // focused node with null app_id is foreground unavailable
-        return Err("null-app-id");
-    };
-
-    if app_id.is_empty() || app_id.len() > MAX_STRING_BYTES {
-        return Err("invalid-app");
+    let mut focused_nodes = Vec::new();
+    collect_focused_sway_nodes(&root, &mut focused_nodes);
+    if focused_nodes.is_empty() {
+        return Err("no-focused-window");
     }
+    if focused_nodes.len() > 1 {
+        return Err("ambiguous-focus");
+    }
+    let focused = focused_nodes[0];
+
+    let Some(id) = focused.id.filter(|&id| id != 0) else {
+        return Err("missing-id");
+    };
+    let window_token = id.to_string();
+
+    let (app, app_id, wm_class) = if focused.shell.as_deref() == Some("xwayland") {
+        let Some(class) = focused
+            .window_properties
+            .as_ref()
+            .and_then(|p| p.class.clone())
+            .filter(|c| !c.is_empty())
+        else {
+            return Err("missing-class");
+        };
+        if class.len() > MAX_STRING_BYTES {
+            return Err("app-too-long");
+        }
+        (class.clone(), None, class)
+    } else {
+        let Some(ref raw_app_id) = focused.app_id else {
+            return Err("null-app-id");
+        };
+        if raw_app_id.is_empty() || raw_app_id.len() > MAX_STRING_BYTES {
+            return Err("invalid-app");
+        }
+        (raw_app_id.clone(), Some(raw_app_id.clone()), String::new())
+    };
 
     let title = match focused.name {
         Some(ref t) => {
@@ -322,13 +393,13 @@ pub fn parse_sway_tree_response(
     };
 
     Ok(WindowSnapshot {
-        app: app_id.clone(),
-        app_id: Some(app_id.clone()),
+        app,
+        app_id,
         title,
         pid: focused.pid,
         window_id: 0,
-        wm_class: String::new(),
-        window_token: String::new(),
+        wm_class,
+        window_token,
         captured_unix_ms: now_unix_ms,
         generation,
     })
@@ -808,34 +879,122 @@ mod tests {
     }
 
     #[test]
-    fn test_sway_tree_parsing() {
-        let json = r#"{
-            "focused": false,
-            "nodes": [
-                {
-                    "focused": true,
-                    "app_id": "foot",
-                    "name": "user@box:~",
-                    "pid": 555,
-                    "nodes": []
-                }
-            ]
-        }"#;
-
-        let snap = parse_sway_tree_response(json, 1, 1000).unwrap();
-        assert_eq!(snap.app, "foot");
-        assert_eq!(snap.title, Some("user@box:~".into()));
-
-        // Null app_id rejected
-        let null_app_json = r#"{
-            "focused": true,
-            "app_id": null,
-            "name": "Xwayland app",
-            "nodes": []
-        }"#;
+    fn test_sway_tree_parsing_fixtures() {
+        let native_json = include_str!("fixtures/sway-native.json");
+        let native_snap = parse_sway_tree_response(native_json, 1, 1000).unwrap();
+        assert_eq!(native_snap.app, "org.solpbc.SyntheticSwayFixture");
         assert_eq!(
-            parse_sway_tree_response(null_app_json, 1, 1000),
+            native_snap.app_id,
+            Some("org.solpbc.SyntheticSwayFixture".into())
+        );
+        assert_eq!(native_snap.window_token, "5");
+        assert_eq!(native_snap.window_id, 0);
+        assert_eq!(native_snap.pid, Some(42771));
+        assert_eq!(
+            native_snap.title,
+            Some("synthetic sway native fixture".into())
+        );
+
+        let native_frame = include_bytes!("fixtures/sway-native.frame");
+        let mut reader = &native_frame[..];
+        let (msg_type, payload) = read_sway_frame(&mut reader).unwrap();
+        assert_eq!(msg_type, 4);
+        assert_eq!(payload, native_json.as_bytes());
+
+        let xwayland_json = include_str!("fixtures/sway-xwayland.json");
+        let xwayland_snap = parse_sway_tree_response(xwayland_json, 1, 1000).unwrap();
+        assert_eq!(xwayland_snap.app, "XTerm");
+        assert_eq!(xwayland_snap.app_id, None);
+        assert_eq!(xwayland_snap.window_token, "6");
+        assert_eq!(xwayland_snap.window_id, 0);
+        assert_eq!(xwayland_snap.pid, Some(42832));
+        assert_eq!(
+            xwayland_snap.title,
+            Some("synthetic sway Xwayland fixture".into())
+        );
+
+        let xwayland_frame = include_bytes!("fixtures/sway-xwayland.frame");
+        let mut reader = &xwayland_frame[..];
+        let (msg_type, payload) = read_sway_frame(&mut reader).unwrap();
+        assert_eq!(msg_type, 4);
+        assert_eq!(payload, xwayland_json.as_bytes());
+    }
+
+    #[test]
+    fn test_sway_framing_encode_and_negatives() {
+        let cmd = encode_sway_command(SWAY_GET_TREE_TYPE, &[]);
+        assert_eq!(cmd.len(), 14);
+        assert_eq!(&cmd[0..6], SWAY_IPC_MAGIC);
+        assert_eq!(u32::from_ne_bytes(cmd[6..10].try_into().unwrap()), 0);
+        assert_eq!(u32::from_ne_bytes(cmd[10..14].try_into().unwrap()), 4);
+
+        // Bad magic
+        let mut bad_magic = cmd.clone();
+        bad_magic[0] = b'x';
+        assert_eq!(read_sway_frame(&mut &bad_magic[..]), Err("bad-magic"));
+
+        // Truncated header
+        assert_eq!(read_sway_frame(&mut &cmd[..10]), Err("truncated-header"));
+
+        // Payload cap exceeded
+        let mut overlong_hdr = Vec::new();
+        overlong_hdr.extend_from_slice(SWAY_IPC_MAGIC);
+        overlong_hdr.extend_from_slice(&((SWAY_MAX_PAYLOAD + 1) as u32).to_ne_bytes());
+        overlong_hdr.extend_from_slice(&4u32.to_ne_bytes());
+        assert_eq!(
+            read_sway_frame(&mut &overlong_hdr[..]),
+            Err("payload-too-large")
+        );
+
+        // Truncated payload
+        let mut truncated_frame = Vec::new();
+        truncated_frame.extend_from_slice(SWAY_IPC_MAGIC);
+        truncated_frame.extend_from_slice(&100u32.to_ne_bytes());
+        truncated_frame.extend_from_slice(&4u32.to_ne_bytes());
+        truncated_frame.extend_from_slice(b"short");
+        assert_eq!(
+            read_sway_frame(&mut &truncated_frame[..]),
+            Err("truncated-payload")
+        );
+    }
+
+    #[test]
+    fn test_sway_tree_negative_cases() {
+        let native_json = include_str!("fixtures/sway-native.json");
+
+        // Missing native app_id
+        let without_app_id = native_json.replace("\"org.solpbc.SyntheticSwayFixture\"", "null");
+        assert_eq!(
+            parse_sway_tree_response(&without_app_id, 1, 1000),
             Err("null-app-id")
+        );
+
+        // Missing id
+        let without_id = native_json.replace("\"id\": 5,", "\"id\": 0,");
+        assert_eq!(
+            parse_sway_tree_response(&without_id, 1, 1000),
+            Err("missing-id")
+        );
+
+        // No focused window
+        let no_focus = native_json.replace("\"focused\": true", "\"focused\": false");
+        assert_eq!(
+            parse_sway_tree_response(&no_focus, 1, 1000),
+            Err("no-focused-window")
+        );
+
+        // Ambiguous focus (duplicate focused: true)
+        let dup_focus = native_json.replacen("\"focused\": false", "\"focused\": true", 1);
+        assert_eq!(
+            parse_sway_tree_response(&dup_focus, 1, 1000),
+            Err("ambiguous-focus")
+        );
+
+        // Body over cap
+        let overlong_json = " ".repeat(SWAY_MAX_PAYLOAD + 1);
+        assert_eq!(
+            parse_sway_tree_response(&overlong_json, 1, 1000),
+            Err("payload-too-large")
         );
     }
 
