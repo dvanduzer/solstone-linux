@@ -34,7 +34,7 @@ function checkActiveWindow() {
                     "/org/solpbc/SolstoneLinux/Activity",
                     "org.solpbc.SolstoneLinux.Activity",
                     "SubmitSnapshot",
-                    generation,
+                    String(generation),
                     JSON.stringify({
                         generation: generation,
                         captured_unix_ms: Date.now(),
@@ -64,7 +64,7 @@ function checkActiveWindow() {
                 "/org/solpbc/SolstoneLinux/Activity",
                 "org.solpbc.SolstoneLinux.Activity",
                 "SubmitSnapshot",
-                generation,
+                String(generation),
                 JSON.stringify(payload)
             );
             void expectedClass;

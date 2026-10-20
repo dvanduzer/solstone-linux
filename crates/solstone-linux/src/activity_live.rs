@@ -335,6 +335,10 @@ impl KwinInterest {
         self.pending = false;
         Ok(())
     }
+
+    pub fn submit_wire(&mut self, generation: &str, json: &str) -> Result<(), &'static str> {
+        self.submit(generation.parse().map_err(|_| "invalid-generation")?, json)
+    }
 }
 
 pub struct LiveDesktop {
@@ -528,9 +532,9 @@ impl KwinService {
     }
 
     #[zbus(name = "SubmitSnapshot")]
-    fn submit_snapshot(&mut self, generation: u64, json: String) {
+    fn submit_snapshot(&mut self, generation: String, json: String) {
         if let Ok(mut state) = self.state.lock() {
-            let _ = state.submit(generation, &json);
+            let _ = state.submit_wire(&generation, &json);
         }
     }
 }
@@ -628,6 +632,32 @@ mod tests {
         let (want, _, _, _, _, _) = gate.authorize();
         assert!(!want);
         assert!(gate.expected_window.is_empty());
+    }
+
+    #[test]
+    fn kwin_wire_generation_is_wide_and_cannot_reuse_an_earlier_reply() {
+        let (mut gate, _prefs) = admitted_kwin();
+        gate.generation = i32::MAX as u64 + 10;
+        gate.want_title = false;
+        let generation = gate.generation;
+        let snapshot = format!(
+            r#"{{"resourceClass":"Allowed","pid":9,"internalId":"win-a","captured_unix_ms":{},"generation":{generation}}}"#,
+            current_unix_ms()
+        );
+        assert!(gate.submit_wire(&generation.to_string(), &snapshot).is_ok());
+        assert!(!gate.pending);
+        gate.generation += 1;
+        gate.pending = true;
+        gate.latest = None;
+        assert_eq!(
+            gate.submit_wire(&generation.to_string(), &snapshot),
+            Err("stale-generation")
+        );
+        assert!(gate.pending && gate.latest.is_none());
+        assert_eq!(
+            gate.submit_wire("not-a-number", &snapshot),
+            Err("invalid-generation")
+        );
     }
 
     #[test]
